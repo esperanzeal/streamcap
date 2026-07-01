@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=900">
+  <title>StreamCap · 下载管理</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      font-size: 13px; background: #0d1117; color: #c9d1d9; padding: 20px;
+    }
+    h1 { font-size: 18px; margin-bottom: 16px; color: #e94560; }
+    .toolbar {
+      display: flex; gap: 8px; margin-bottom: 16px; flex-wrap: wrap; align-items: center;
+    }
+    .tab-btn {
+      background: #21262d; color: #8b949e; border: 1px solid #30363d;
+      border-radius: 6px; padding: 6px 14px; cursor: pointer; font-size: 12px;
+    }
+    .tab-btn.active { color: #fff; border-color: #e94560; background: #2a1a22; }
+    .tab-btn:hover { border-color: #e94560; }
+    .spacer { flex: 1; }
+    .btn-sm {
+      background: #21262d; color: #c9d1d9; border: 1px solid #30363d;
+      border-radius: 6px; padding: 6px 12px; cursor: pointer; font-size: 12px;
+    }
+    .btn-sm:hover { background: #30363d; }
+    .btn-sm.danger { color: #f85149; border-color: #f85149; }
+    .stats { font-size: 11px; color: #484f58; }
+    .list { display: flex; flex-direction: column; gap: 8px; }
+    .card {
+      display: flex; gap: 12px; align-items: flex-start;
+      padding: 14px; background: #161b22; border: 1px solid #21262d;
+      border-radius: 10px; transition: border-color 0.2s;
+    }
+    .card:hover { border-color: #30363d; }
+    .card-icon { font-size: 22px; flex-shrink: 0; width: 36px; text-align: center; }
+    .card-body { flex: 1; min-width: 0; }
+    .card-title {
+      display: flex; gap: 8px; align-items: center; margin-bottom: 4px;
+      font-weight: 600;
+    }
+    .badge { font-size: 10px; padding: 1px 8px; border-radius: 4px; font-weight: 600; }
+    .b-queued { background: #1a3a5c; color: #58a6ff; }
+    .b-active { background: #2a1a00; color: #d2991d; }
+    .b-done { background: #1a2a1a; color: #3fb950; }
+    .b-fail { background: #2a0000; color: #f85149; }
+    .b-cxl { background: #1a1a2e; color: #6e7681; }
+    .card-url {
+      font-size: 11px; color: #6e7681; font-family: monospace;
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin-bottom: 8px;
+    }
+    .bar-wrap {
+      height: 6px; background: #21262d; border-radius: 3px; overflow: hidden; margin-bottom: 4px;
+    }
+    .bar-fill { height: 100%; border-radius: 3px; transition: width 0.3s; }
+    .bar-go { background: linear-gradient(90deg, #d2991d, #e94560); }
+    .bar-ok { background: #3fb950; }
+    .bar-err { background: #f85149; }
+    .bar-cxl { background: #484f58; }
+    .bar-q { background: #1a4a8a; }
+    .card-info {
+      display: flex; justify-content: space-between; font-size: 11px; color: #484f58;
+    }
+    .card-err { color: #f85149; font-size: 11px; margin-top: 4px; }
+    .card-actions { display: flex; gap: 4px; flex-shrink: 0; flex-direction: column; }
+    .btn-act {
+      background: #21262d; color: #c9d1d9; border: 1px solid #30363d;
+      border-radius: 5px; padding: 4px 10px; cursor: pointer; font-size: 11px; white-space: nowrap;
+    }
+    .btn-act:hover { background: #30363d; }
+    .btn-act.retry { color: #d2991d; border-color: #d2991d; }
+    .btn-act.danger { color: #f85149; border-color: #f85149; }
+    .empty-state { text-align: center; padding: 60px; color: #484f58; font-size: 14px; }
+    .empty-state span { font-size: 48px; display: block; margin-bottom: 12px; }
+  </style>
+</head>
+<body>
+  <h1>🎬 StreamCap · 下载管理</h1>
+  <div class="toolbar">
+    <button class="tab-btn active" data-filter="all">全部</button>
+    <button class="tab-btn" data-filter="active">下载中</button>
+    <button class="tab-btn" data-filter="completed">已完成</button>
+    <button class="tab-btn" data-filter="failed">失败</button>
+    <label style="color:#8b949e;font-size:12px;">线程:</label>
+    <select id="threads" style="background:#21262d;color:#c9d1d9;border:1px solid #30363d;border-radius:6px;padding:4px 8px;font-size:12px;">
+      <option value="1">1</option><option value="2">2</option><option value="3">3</option>
+      <option value="4" selected>4</option><option value="5">5</option>
+      <option value="6">6</option><option value="7">7</option><option value="8">8</option>
+    </select>
+    <span class="spacer"></span>
+    <span id="stats" class="stats"></span>
+    <button class="btn-sm danger" id="btnClearDone">清空已完成</button>
+    <button class="btn-sm danger" id="btnClearFail">清空失败</button>
+  </div>
+  <div class="list" id="list">
+    <div class="empty-state"><span>📭</span>暂无下载任务</div>
+  </div>
+
+  <script src="manager.js"></script>
+</body>
+</html>

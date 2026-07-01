@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=800">
+  <title>StreamCap · 日志</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: "SF Mono", "Fira Code", "Consolas", monospace;
+      font-size: 12px; background: #0d1117; color: #c9d1d9; padding: 16px;
+    }
+    .header {
+      display: flex; align-items: center; justify-content: space-between;
+      margin-bottom: 12px; padding-bottom: 8px; border-bottom: 1px solid #30363d;
+    }
+    .header h1 { font-size: 16px; font-weight: 600; }
+    .header .actions { display: flex; gap: 8px; }
+    .btn {
+      background: #21262d; color: #c9d1d9; border: 1px solid #30363d;
+      border-radius: 6px; padding: 6px 12px; cursor: pointer; font-size: 12px;
+    }
+    .btn:hover { background: #30363d; }
+    .btn.danger { color: #f85149; border-color: #f85149; }
+    .log-container { max-height: calc(100vh - 80px); overflow-y: auto; }
+    .log-entry {
+      display: flex; gap: 8px; padding: 3px 0; border-bottom: 1px solid #161b22; line-height: 1.5;
+    }
+    .log-time { color: #484f58; flex-shrink: 0; min-width: 120px; }
+    .log-level { flex-shrink: 0; min-width: 50px; font-weight: 600; text-align: center; border-radius: 3px; padding: 0 4px; font-size: 10px; }
+    .level-info  { color: #58a6ff; }
+    .level-warn  { color: #d2991d; background: #2a2200; }
+    .level-error { color: #f85149; background: #2a0000; }
+    .level-success { color: #3fb950; }
+    .log-msg { word-break: break-all; }
+    .empty { text-align: center; color: #484f58; padding: 40px; }
+    .stats { color: #484f58; font-size: 11px; }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <h1>📋 下载日志</h1>
+    <div class="actions">
+      <span id="stats" class="stats"></span>
+      <button class="btn" id="refreshBtn">🔄 刷新</button>
+      <button class="btn" id="autoBtn">📌 自动: 开</button>
+      <button class="btn danger" id="clearBtn">🗑 清空</button>
+    </div>
+  </div>
+  <div id="logContainer" class="log-container">
+    <div class="empty">暂无日志</div>
+  </div>
+
+  <script>
+    const KEY = 'vgp_logs';
+    const $ = s => document.querySelector(s);
+    const container = $('#logContainer');
+    let auto = true;
+
+    function render(logs) {
+      if (!logs || !logs.length) {
+        container.innerHTML = '<div class="empty">暂无日志</div>';
+        $('#stats').textContent = '';
+        return;
+      }
+      const errs = logs.filter(l => l.level === 'error').length;
+      const warns = logs.filter(l => l.level === 'warn').length;
+      $('#stats').textContent = `共 ${logs.length} 条 | ${errs} 错误 | ${warns} 警告`;
+      container.innerHTML = logs.map(e => {
+        const t = e.time ? new Date(e.time).toLocaleTimeString('zh-CN') : '--:--:--';
+        const lvl = { info:'INFO',warn:'WARN',error:'ERROR',success:'OK' }[e.level]||e.level;
+        return `<div class="log-entry"><span class="log-time">${t}</span><span class="log-level level-${e.level}">${lvl}</span><span class="log-msg">${esc(e.msg)}</span></div>`;
+      }).join('');
+      if (auto) container.scrollTop = container.scrollHeight;
+    }
+    function esc(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+    function load() { chrome.storage.local.get([KEY], r => render(r[KEY] || [])); }
+    chrome.storage.onChanged.addListener((c, a) => { if (a === 'local' && c[KEY]) render(c[KEY].newValue || []); });
+    $('#refreshBtn').addEventListener('click', load);
+    $('#autoBtn').addEventListener('click', () => { auto = !auto; $('#autoBtn').textContent = `📌 自动: ${auto?'开':'关'}`; });
+    $('#clearBtn').addEventListener('click', () => { if (confirm('清空？')) chrome.storage.local.set({ [KEY]: [] }, () => render([])); });
+    load();
+  </script>
+</body>
+</html>
