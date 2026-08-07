@@ -1,3 +1,6 @@
 .DS_Store
 Thumbs.db
 *.log
+
+# 孤儿 .git 目录（早前移动产生）
+streamcap/

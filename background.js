@@ -110,6 +110,7 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   }
   delete tabActive[tabId];
   delete tabQueues[tabId];
+  maybeDispatch();
 });
 
 // ============ 持久化 & 广播 ============
@@ -146,7 +147,7 @@ function enqueue(tabId, url, referer, resolution, pageUrl, pageTitle) {
   tabQueues[tabId].push(id);
   persist();
   broadcast({ type: 'DOWNLOAD_UPDATE', download: downloads[id] });
-  if (!tabActive[tabId]) dequeueNext(tabId);
+  maybeDispatch();
   return id;
 }
 
@@ -154,7 +155,7 @@ async function dispatchTab(tabId, downloadId) {
   const d = downloads[downloadId];
   if (!d) return;
   d.status = 'downloading';
-  d.pct = 0;
+  if (!d.done) d.pct = 0; // 续传时保留已有进度
   tabActive[tabId] = downloadId;
   persist();
   broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
@@ -188,19 +189,36 @@ async function dispatchTab(tabId, downloadId) {
       tabActive[tabId] = null;
       persist();
       broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
-      dequeueNext(tabId);
+      maybeDispatch();
     }
   }
 }
 
 function dequeueNext(tabId) {
-  const q = tabQueues[tabId] || [];
-  while (q.length > 0) {
-    const nextId = q.shift();
-    const d = downloads[nextId];
-    if (d && d.status === 'queued') { dispatchTab(tabId, nextId); return; }
+  // 已废弃：改为全局并发调度 maybeDispatch()
+  maybeDispatch();
+}
+
+// 全局并发调度：最多同时跑 maxConcurrent 个任务，每个 tab 至多 1 个
+async function maybeDispatch() {
+  const s = await chrome.storage.local.get('vgp_settings');
+  const max = (s.vgp_settings && s.vgp_settings.maxConcurrent) || 3;
+  const activeCount = Object.keys(tabActive).filter(t => tabActive[t]).length;
+  if (activeCount >= max) return;
+  for (const tid of Object.keys(tabQueues)) {
+    const tabId = Number(tid);
+    if (tabActive[tabId]) continue; // 该 tab 已有活动任务
+    const q = tabQueues[tabId];
+    while (q.length > 0) {
+      const did = q.shift();
+      const d = downloads[did];
+      if (d && d.status === 'queued') {
+        dispatchTab(tabId, did);
+        return; // 每次只派一个，剩余下次再说
+      }
+    }
+    delete tabQueues[tabId];
   }
-  tabActive[tabId] = null;
 }
 
 function cancelDownload(downloadId) {
@@ -216,7 +234,7 @@ function cancelDownload(downloadId) {
     d.status = 'cancelled';
     tabActive[tabId] = null;
     chrome.tabs.sendMessage(tabId, { type: 'CANCEL_DOWNLOAD', downloadId }).catch(() => {});
-    dequeueNext(tabId);
+    maybeDispatch();
   }
   persist();
   broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
@@ -254,7 +272,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       tabQueues[tabId].push(msg.retryId);
       persist();
       broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
-      if (!tabActive[tabId]) dequeueNext(tabId);
+      maybeDispatch();
       sendResponse({ ok: true, downloadId: msg.retryId });
     } else {
       // 新下载：用当前 active tab
@@ -334,9 +352,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       d.status = 'completed';
       d.pct = 100;
       d.fileName = msg.fileName || '';
+      tabActive[d.tabId] = null;
       persist();
       broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
-      dequeueNext(sender.tab?.id);
+      maybeDispatch();
     }
     return;
   }
@@ -344,13 +363,34 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.type === 'DOWNLOAD_ERROR') {
     const d = downloads[msg.downloadId];
     if (d) {
-      d.status = 'failed';
-      d.error = msg.error;
       if (msg.done !== undefined) d.done = msg.done;
       if (msg.total !== undefined) d.total = msg.total;
-      persist();
-      broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
-      dequeueNext(sender.tab?.id);
+
+      // 自动重试：连续失败 ≤3 次才停止
+      const MAX_RETRY = 3;
+      const retries = d.retryCount || 0;
+      if (retries < MAX_RETRY && msg.error !== '已取消') {
+        d.retryCount = retries + 1;
+        d.status = 'retrying';
+        d.error = `第 ${d.retryCount}/${MAX_RETRY} 次重试: ${msg.error}`;
+        persist();
+        broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
+        const delay = d.retryCount * 3000; // 3s / 6s / 9s 退避
+        setTimeout(() => {
+          if (!downloads[d.id]) return; // 已被删除
+          d.status = 'queued';
+          persist();
+          broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
+          dispatchTab(d.tabId, d.id);
+        }, delay);
+      } else {
+        d.status = 'failed';
+        d.error = msg.error;
+        tabActive[d.tabId] = null;
+        persist();
+        broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
+        maybeDispatch();
+      }
     }
     return;
   }
@@ -374,7 +414,7 @@ chrome.runtime.onConnect.addListener(port => {
 chrome.storage.local.get('vgp_downloads', data => {
   const list = data.vgp_downloads || [];
   for (const d of list) {
-    if (d.status === 'downloading') {
+    if (d.status === 'downloading' || d.status === 'retrying') {
       d.status = 'paused';
       d.error = '扩展重启，可重试续传';
     } else if (d.status === 'queued') {

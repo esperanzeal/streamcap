@@ -3,15 +3,21 @@
 (() => {
   'use strict';
 
-  // ============ 日志 ============
-  const LOG_KEY = 'vgp_logs';
+  // ============ 日志（按日期分文件） ============
+  function todayStr() {
+    const d = new Date();
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+  }
+  const LOG_MAX_PER_DAY = 5000; // 单日上限，防止撑爆 storage.local 配额
   function log(level, msg) {
     const entry = { time: new Date().toISOString(), level, msg };
     console[level === 'error' ? 'error' : level === 'warn' ? 'warn' : 'log']('[VGP]', msg);
-    chrome.storage.local.get([LOG_KEY], r => {
-      const logs = (r[LOG_KEY] || []).slice(-400);
+    const key = 'vgp_logs_' + todayStr();
+    chrome.storage.local.get([key], r => {
+      const logs = r[key] || [];
       logs.push(entry);
-      chrome.storage.local.set({ [LOG_KEY]: logs });
+      if (logs.length > LOG_MAX_PER_DAY) logs.splice(0, logs.length - LOG_MAX_PER_DAY);
+      chrome.storage.local.set({ [key]: logs });
     });
   }
 

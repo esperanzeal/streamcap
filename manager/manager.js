@@ -5,13 +5,13 @@ const $$ = s => document.querySelectorAll(s);
 let downloads = {};
 let filter = 'all';
 
-const ICONS = { queued: '⏳', downloading: '⬇️', completed: '✅', failed: '❌', cancelled: '🚫', paused: '⏸️' };
+const ICONS = { queued: '⏳', downloading: '⬇️', retrying: '🔁', completed: '✅', failed: '❌', cancelled: '🚫', paused: '⏸️' };
 const BADGES = {
-  queued: ['队列中', 'b-queued'], downloading: ['下载中', 'b-active'],
+  queued: ['队列中', 'b-queued'], downloading: ['下载中', 'b-active'], retrying: ['重试中', 'b-active'],
   completed: ['已完成', 'b-done'], failed: ['失败', 'b-fail'], cancelled: ['已取消', 'b-cxl'],
   paused: ['已暂停', 'b-queued'],
 };
-const BARS = { queued: 'bar-q', downloading: 'bar-go', completed: 'bar-ok', failed: 'bar-err', cancelled: 'bar-cxl', paused: 'bar-q' };
+const BARS = { queued: 'bar-q', downloading: 'bar-go', retrying: 'bar-go', completed: 'bar-ok', failed: 'bar-err', cancelled: 'bar-cxl', paused: 'bar-q' };
 
 // ============ 操作 ============
 function act(msg) { chrome.runtime.sendMessage(msg).catch(() => {}); }
@@ -43,7 +43,7 @@ function render() {
     const icon = ICONS[d.status] || '❓';
     const [badgeText, badgeCls] = BADGES[d.status] || ['?', 'b-queued'];
     const barCls = BARS[d.status] || 'bar-q';
-    const isActive = d.status === 'downloading' || d.status === 'queued';
+    const isActive = d.status === 'downloading' || d.status === 'queued' || d.status === 'retrying';
     const isDone = d.status === 'completed';
     const isDead = d.status === 'failed' || d.status === 'cancelled' || d.status === 'paused';
     const barW = d.pct || 0;
@@ -104,14 +104,28 @@ $$('.tab-btn').forEach(b => {
 $('#btnClearDone').addEventListener('click', () => {
   Object.values(downloads).forEach(d => { if (d.status === 'completed') act({ type: 'DELETE_DOWNLOAD', downloadId: d.id }); });
 });
-// 线程数设置
+// 线程数设置 + 并发任务数设置
 const threadsSelect = $('#threads');
+const maxConcSelect = $('#maxConcurrent');
 chrome.storage.local.get('vgp_settings', s => {
-  const concurrency = (s.vgp_settings && s.vgp_settings.concurrency) || 4;
-  threadsSelect.value = concurrency;
+  const settings = s.vgp_settings || {};
+  threadsSelect.value = settings.concurrency || 4;
+  maxConcSelect.value = settings.maxConcurrent || 3;
 });
+function saveSettings(patch) {
+  chrome.storage.local.get('vgp_settings', s => {
+    const merged = { ...(s.vgp_settings || {}), ...patch };
+    chrome.storage.local.set({ vgp_settings: merged });
+  });
+}
 threadsSelect.addEventListener('change', () => {
-  chrome.storage.local.set({ vgp_settings: { concurrency: parseInt(threadsSelect.value) } });
+  saveSettings({ concurrency: parseInt(threadsSelect.value) });
+});
+maxConcSelect.addEventListener('change', () => {
+  saveSettings({ maxConcurrent: parseInt(maxConcSelect.value) });
+});
+$('#btnLog').addEventListener('click', () => {
+  chrome.tabs.create({ url: chrome.runtime.getURL('logger/logger.html') });
 });
 
 $('#btnClearFail').addEventListener('click', () => {
