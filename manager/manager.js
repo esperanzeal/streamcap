@@ -114,7 +114,7 @@ chrome.storage.local.get('vgp_settings', s => {
   const settings = s.vgp_settings || {};
   threadsSelect.value = settings.concurrency || 4;
   // 注意：0 = 无上限，必须用 undefined 判断
-  maxConcSelect.value = (settings.maxConcurrent === undefined || settings.maxConcurrent === null) ? 3 : settings.maxConcurrent;
+  maxConcSelect.value = (settings.maxConcurrent === undefined || settings.maxConcurrent === null) ? 4 : settings.maxConcurrent;
 });
 function saveSettings(patch) {
   chrome.storage.local.get('vgp_settings', s => {
@@ -131,13 +131,13 @@ maxConcSelect.addEventListener('change', () => {
   act({ type: 'SET_MAX_CONCURRENT' });
 });
 
-// 全部继续：恢复所有暂停任务
+// 全部暂停：发后台统一处理
+$('#btnPauseAll').addEventListener('click', () => {
+  act({ type: 'PAUSE_ALL' });
+});
+// 全部继续：恢复所有暂停任务（由并发限制决定启动数量）
 $('#btnResumeAll').addEventListener('click', () => {
-  Object.values(downloads).forEach(d => {
-    if (d.status === 'paused') {
-      act({ type: 'ENQUEUE', tabId: d.tabId, url: d.url, referer: d.referer, resolution: d.resolution, pageUrl: d.pageUrl, pageTitle: d.pageTitle, retryId: d.id });
-    }
-  });
+  act({ type: 'RESUME_ALL' });
 });
 // 全部重试：重试所有失败/取消任务
 $('#btnRetryAll').addEventListener('click', () => {
