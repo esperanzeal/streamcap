@@ -248,8 +248,8 @@ function pauseDownload(downloadId) {
   } else if (d.status === 'downloading' || d.status === 'retrying') {
     d.status = 'paused';
     tabActive[tabId] = null;
-    // keepOpfs=true：暂停保留已下载分片，可续传
-    chrome.tabs.sendMessage(tabId, { type: 'CANCEL_DOWNLOAD', downloadId, keepOpfs: true }).catch(() => {});
+    // 暂停：分片保留在 OPFS，可随时续传
+    chrome.tabs.sendMessage(tabId, { type: 'CANCEL_DOWNLOAD', downloadId }).catch(() => {});
     maybeDispatch();
   }
   d.error = '已暂停，点击继续恢复';
@@ -269,8 +269,8 @@ function cancelDownload(downloadId) {
   } else if (d.status === 'downloading' || d.status === 'retrying') {
     d.status = 'cancelled';
     tabActive[tabId] = null;
-    // keepOpfs=false：彻底取消，清理已下载分片
-    chrome.tabs.sendMessage(tabId, { type: 'CANCEL_DOWNLOAD', downloadId, keepOpfs: false }).catch(() => {});
+    // 取消：分片同样保留在 OPFS（浏览器退出时自动清理），可续传
+    chrome.tabs.sendMessage(tabId, { type: 'CANCEL_DOWNLOAD', downloadId }).catch(() => {});
     maybeDispatch();
   }
   persist();

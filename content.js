@@ -44,10 +44,9 @@
     abortControllers.delete(downloadId);
   }
 
-  // 取消时是否保留 OPFS（暂停=true 保留，取消=false 清理）
-  const abortKeepOpfs = new Map();
-
   // 清理某个 downloadId 的所有 OPFS 文件
+  // 注意：当前不主动调用（所有停止流程都保留分片供续传，浏览器退出时自动清理）
+  // 保留备用，未来如需"手动清理残留"功能可复用
   async function cleanupOpfs(downloadId) {
     const root = await navigator.storage.getDirectory();
     const prefix = OPFS_PREFIX + `dl_${downloadId}_`;
@@ -407,21 +406,13 @@
         URL.revokeObjectURL(url);
       }, 60000);
 
-      // 7. 清理 OPFS
-      for (let b = 0; b < totalBatches; b++) {
-        await opfsDelete(`dl_${downloadId}_batch_${b}.blob`);
-      }
-      await deleteMeta(downloadId);
-
+      // 7. 保留 OPFS 分片（浏览器退出时自动清理，便于任何情况续传）
       removeAbortController(downloadId);
       chrome.runtime.sendMessage({ type: 'DOWNLOAD_COMPLETE', downloadId, fileName: filename });
     } catch (err) {
       removeAbortController(downloadId);
       if (err.name === 'AbortError') {
-        log('info', `[${downloadId}] 下载被用户取消`);
-        const keep = abortKeepOpfs.get(downloadId) || false;
-        abortKeepOpfs.delete(downloadId);
-        if (!keep) await cleanupOpfs(downloadId); // 取消则清理 OPFS，暂停则保留
+        log('info', `[${downloadId}] 下载被用户取消，分片已保留可续传`);
         chrome.runtime.sendMessage({ type: 'DOWNLOAD_ERROR', downloadId, error: '已取消', done: totalDone, total });
       } else {
         log('error', `[${downloadId}] 下载失败: ${err.message}`);
@@ -475,7 +466,6 @@
     }
     if (msg.type === 'CANCEL_DOWNLOAD') {
       const ac = abortControllers.get(msg.downloadId);
-      abortKeepOpfs.set(msg.downloadId, !!msg.keepOpfs); // 暂停=保留，取消=清理
       if (ac) {
         ac.abort();
         log('info', `[${msg.downloadId}] 发送中止信号`);
