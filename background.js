@@ -242,7 +242,7 @@ async function maybeDispatch() {
 // 轮询推进：SW 活跃期间每 2 秒检查一次队列（设置变更/空闲排队时保证推进）
 setInterval(() => { maybeDispatch(); }, 2000);
 
-// 降低并发数时：暂停超出的正在运行任务（保留分片可续传），按创建时间保留最早 max 个
+// 降低并发数时：超出的正在运行任务中止并放回队列（保留分片），前置任务完成自动补位
 async function enforceMaxConcurrent() {
   const max = await getMaxConcurrent();
   if (max === 0) return; // 无上限不限制
@@ -250,10 +250,25 @@ async function enforceMaxConcurrent() {
     .filter(d => d.status === 'downloading' || d.status === 'retrying')
     .sort((a, b) => a.createdAt - b.createdAt);
   if (active.length <= max) return;
-  // 暂停多出来的（保留最早创建的 max 个）
+  // 保留最早创建的 max 个，其余中止放回队列
   for (const d of active.slice(max)) {
-    pauseDownload(d.id);
+    requeueTask(d.id);
   }
+}
+
+// 中止任务并放回队列（保留分片，等待自动调度），不设暂停状态
+function requeueTask(downloadId) {
+  const d = downloads[downloadId];
+  if (!d) return;
+  const tabId = d.tabId;
+  d.status = 'queued';
+  d.error = '并发限制，等待自动调度';
+  if (!tabQueues[tabId]) tabQueues[tabId] = [];
+  tabQueues[tabId].push(downloadId);
+  tabActive[tabId] = null;
+  chrome.tabs.sendMessage(tabId, { type: 'CANCEL_DOWNLOAD', downloadId }).catch(() => {});
+  persist();
+  broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
 }
 
 function pauseDownload(downloadId) {
@@ -437,8 +452,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       if (msg.done !== undefined) d.done = msg.done;
       if (msg.total !== undefined) d.total = msg.total;
 
-      // 用户已暂停/取消的任务：保留其状态，不自动重试、不覆盖
-      if (d.status === 'paused' || d.status === 'cancelled') {
+      // 用户操作或调度器中止的任务（已取消/已暂停/已放回队列）：保留状态，不自动重试、不覆盖
+      if (msg.error === '已取消' || d.status === 'paused' || d.status === 'cancelled' || d.status === 'queued') {
         persist();
         broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
         return;

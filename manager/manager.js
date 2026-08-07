@@ -131,6 +131,23 @@ maxConcSelect.addEventListener('change', () => {
   act({ type: 'SET_MAX_CONCURRENT' });
 });
 
+// 全部继续：恢复所有暂停任务
+$('#btnResumeAll').addEventListener('click', () => {
+  Object.values(downloads).forEach(d => {
+    if (d.status === 'paused') {
+      act({ type: 'ENQUEUE', tabId: d.tabId, url: d.url, referer: d.referer, resolution: d.resolution, pageUrl: d.pageUrl, pageTitle: d.pageTitle, retryId: d.id });
+    }
+  });
+});
+// 全部重试：重试所有失败/取消任务
+$('#btnRetryAll').addEventListener('click', () => {
+  Object.values(downloads).forEach(d => {
+    if (d.status === 'failed' || d.status === 'cancelled') {
+      act({ type: 'ENQUEUE', tabId: d.tabId, url: d.url, referer: d.referer, resolution: d.resolution, pageUrl: d.pageUrl, pageTitle: d.pageTitle, retryId: d.id });
+    }
+  });
+});
+
 $('#btnClearFail').addEventListener('click', () => {
   Object.values(downloads).forEach(d => { if (d.status === 'failed' || d.status === 'cancelled') act({ type: 'DELETE_DOWNLOAD', downloadId: d.id }); });
 });
