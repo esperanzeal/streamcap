@@ -155,6 +155,7 @@ async function dispatchTab(tabId, downloadId) {
   const d = downloads[downloadId];
   if (!d) return;
   d.status = 'downloading';
+  d.error = null; // 下载恢复时清除历史错误提示
   if (!d.done) d.pct = 0; // 续传时保留已有进度
   tabActive[tabId] = downloadId;
   persist();
