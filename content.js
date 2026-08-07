@@ -3,22 +3,32 @@
 (() => {
   'use strict';
 
-  // ============ 日志（按日期分文件） ============
+  // ============ 日志（按日期分文件 + 批量写入防竞态） ============
   function todayStr() {
     const d = new Date();
     return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
   }
   const LOG_MAX_PER_DAY = 5000; // 单日上限，防止撑爆 storage.local 配额
-  function log(level, msg) {
-    const entry = { time: new Date().toISOString(), level, msg };
-    console[level === 'error' ? 'error' : level === 'warn' ? 'warn' : 'log']('[VGP]', msg);
+  let logBuffer = [];
+  let logFlushTimer = null;
+  function flushLogs() {
+    logFlushTimer = null;
+    if (logBuffer.length === 0) return;
+    const batch = logBuffer;
+    logBuffer = [];
     const key = 'vgp_logs_' + todayStr();
     chrome.storage.local.get([key], r => {
       const logs = r[key] || [];
-      logs.push(entry);
+      logs.push(...batch);
       if (logs.length > LOG_MAX_PER_DAY) logs.splice(0, logs.length - LOG_MAX_PER_DAY);
       chrome.storage.local.set({ [key]: logs });
     });
+  }
+  function log(level, msg) {
+    const entry = { time: new Date().toISOString(), level, msg };
+    console[level === 'error' ? 'error' : level === 'warn' ? 'warn' : 'log']('[VGP]', msg);
+    logBuffer.push(entry);
+    if (!logFlushTimer) logFlushTimer = setTimeout(flushLogs, 1000); // 1 秒内合并一次写入
   }
 
   // ============ AbortController 管理 ============
@@ -33,6 +43,9 @@
   function removeAbortController(downloadId) {
     abortControllers.delete(downloadId);
   }
+
+  // 取消时是否保留 OPFS（暂停=true 保留，取消=false 清理）
+  const abortKeepOpfs = new Map();
 
   // 清理某个 downloadId 的所有 OPFS 文件
   async function cleanupOpfs(downloadId) {
@@ -406,7 +419,9 @@
       removeAbortController(downloadId);
       if (err.name === 'AbortError') {
         log('info', `[${downloadId}] 下载被用户取消`);
-        await cleanupOpfs(downloadId); // 取消时清理 OPFS，不留垃圾
+        const keep = abortKeepOpfs.get(downloadId) || false;
+        abortKeepOpfs.delete(downloadId);
+        if (!keep) await cleanupOpfs(downloadId); // 取消则清理 OPFS，暂停则保留
         chrome.runtime.sendMessage({ type: 'DOWNLOAD_ERROR', downloadId, error: '已取消', done: totalDone, total });
       } else {
         log('error', `[${downloadId}] 下载失败: ${err.message}`);
@@ -460,6 +475,7 @@
     }
     if (msg.type === 'CANCEL_DOWNLOAD') {
       const ac = abortControllers.get(msg.downloadId);
+      abortKeepOpfs.set(msg.downloadId, !!msg.keepOpfs); // 暂停=保留，取消=清理
       if (ac) {
         ac.abort();
         log('info', `[${msg.downloadId}] 发送中止信号`);

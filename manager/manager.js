@@ -44,8 +44,10 @@ function render() {
     const [badgeText, badgeCls] = BADGES[d.status] || ['?', 'b-queued'];
     const barCls = BARS[d.status] || 'bar-q';
     const isActive = d.status === 'downloading' || d.status === 'queued' || d.status === 'retrying';
+    const isPaused = d.status === 'paused';
     const isDone = d.status === 'completed';
-    const isDead = d.status === 'failed' || d.status === 'cancelled' || d.status === 'paused';
+    const isDead = d.status === 'failed' || d.status === 'cancelled';
+    const isRetryable = isDead || isPaused;
     const barW = d.pct || 0;
     const doneText = d.total ? `${d.done}/${d.total}` : '—';
 
@@ -69,7 +71,8 @@ function render() {
         ${d.fileName ? `<div style="font-size:11px;color:#3fb950;margin-top:4px;">📁 ${esc(d.fileName)}</div>` : ''}
       </div>
       <div class="card-actions">
-        ${isActive ? `<button class="btn-act danger" data-act="cancel" data-id="${d.id}">取消</button>` : ''}
+        ${isActive ? `<button class="btn-act" data-act="pause" data-id="${d.id}">暂停</button>` : ''}
+        ${isPaused ? `<button class="btn-act retry" data-act="resume" data-id="${d.id}">继续</button>` : ''}
         ${isDead ? `<button class="btn-act retry" data-act="retry" data-id="${d.id}">重试·续传</button>` : ''}
         ${!isActive ? `<button class="btn-act danger" data-act="delete" data-id="${d.id}">删除</button>` : ''}
       </div>
@@ -80,10 +83,10 @@ function render() {
   $('#list').querySelectorAll('[data-act]').forEach(btn => {
     btn.addEventListener('click', () => {
       const id = Number(btn.dataset.id);
-      if (btn.dataset.act === 'cancel') act({ type: 'CANCEL', downloadId: id });
+      const d = downloads[id];
+      if (btn.dataset.act === 'pause') act({ type: 'PAUSE', downloadId: id });
       if (btn.dataset.act === 'delete') act({ type: 'DELETE_DOWNLOAD', downloadId: id });
-      if (btn.dataset.act === 'retry') {
-        const d = downloads[id];
+      if (btn.dataset.act === 'resume' || btn.dataset.act === 'retry') {
         if (d) act({ type: 'ENQUEUE', tabId: d.tabId, url: d.url, referer: d.referer, resolution: d.resolution, pageUrl: d.pageUrl, pageTitle: d.pageTitle, retryId: d.id });
       }
     });
@@ -123,6 +126,8 @@ threadsSelect.addEventListener('change', () => {
 });
 maxConcSelect.addEventListener('change', () => {
   saveSettings({ maxConcurrent: parseInt(maxConcSelect.value) });
+  // 通知后台立即重新调度（改大→派发排队任务，改小→停止新派发）
+  act({ type: 'SET_MAX_CONCURRENT' });
 });
 $('#btnLog').addEventListener('click', () => {
   chrome.tabs.create({ url: chrome.runtime.getURL('logger/logger.html') });

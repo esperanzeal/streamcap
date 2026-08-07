@@ -199,26 +199,62 @@ function dequeueNext(tabId) {
   maybeDispatch();
 }
 
-// 全局并发调度：最多同时跑 maxConcurrent 个任务，每个 tab 至多 1 个
+// 全局并发调度：最多同时跑 maxConcurrent 个任务（0=无上限），每个 tab 至多 1 个
+// 按任务创建时间排序推进（FIFO 优先级）
 async function maybeDispatch() {
   const s = await chrome.storage.local.get('vgp_settings');
   const max = (s.vgp_settings && s.vgp_settings.maxConcurrent) || 3;
+  const unlimited = max === 0;
   const activeCount = Object.keys(tabActive).filter(t => tabActive[t]).length;
-  if (activeCount >= max) return;
+  if (!unlimited && activeCount >= max) return;
+
+  // 收集所有可派发的候选（排队中且所在 tab 空闲），按创建时间排序
+  const candidates = [];
   for (const tid of Object.keys(tabQueues)) {
     const tabId = Number(tid);
     if (tabActive[tabId]) continue; // 该 tab 已有活动任务
-    const q = tabQueues[tabId];
-    while (q.length > 0) {
-      const did = q.shift();
+    for (const did of tabQueues[tabId]) {
       const d = downloads[did];
-      if (d && d.status === 'queued') {
-        dispatchTab(tabId, did);
-        return; // 每次只派一个，剩余下次再说
-      }
+      if (d && d.status === 'queued') candidates.push({ tabId, did, createdAt: d.createdAt });
     }
-    delete tabQueues[tabId];
   }
+  candidates.sort((a, b) => a.createdAt - b.createdAt);
+
+  let slots = unlimited ? Infinity : (max - activeCount);
+  for (const c of candidates) {
+    if (slots <= 0) break;
+    if (tabActive[c.tabId]) continue; // 前面派发已占用该 tab
+    const q = tabQueues[c.tabId];
+    const idx = q.indexOf(c.did);
+    if (idx < 0) continue;
+    q.splice(idx, 1);
+    dispatchTab(c.tabId, c.did);
+    slots--;
+  }
+}
+
+// 轮询推进：SW 活跃期间每 2 秒检查一次队列（设置变更/空闲排队时保证推进）
+setInterval(() => { maybeDispatch(); }, 2000);
+
+function pauseDownload(downloadId) {
+  const d = downloads[downloadId];
+  if (!d) return;
+  const tabId = d.tabId;
+  if (d.status === 'queued') {
+    const q = tabQueues[tabId] || [];
+    const i = q.indexOf(downloadId);
+    if (i >= 0) q.splice(i, 1);
+    d.status = 'paused';
+  } else if (d.status === 'downloading' || d.status === 'retrying') {
+    d.status = 'paused';
+    tabActive[tabId] = null;
+    // keepOpfs=true：暂停保留已下载分片，可续传
+    chrome.tabs.sendMessage(tabId, { type: 'CANCEL_DOWNLOAD', downloadId, keepOpfs: true }).catch(() => {});
+    maybeDispatch();
+  }
+  d.error = '已暂停，点击继续恢复';
+  persist();
+  broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
 }
 
 function cancelDownload(downloadId) {
@@ -230,10 +266,11 @@ function cancelDownload(downloadId) {
     const q = tabQueues[tabId] || [];
     const i = q.indexOf(downloadId);
     if (i >= 0) q.splice(i, 1);
-  } else if (d.status === 'downloading') {
+  } else if (d.status === 'downloading' || d.status === 'retrying') {
     d.status = 'cancelled';
     tabActive[tabId] = null;
-    chrome.tabs.sendMessage(tabId, { type: 'CANCEL_DOWNLOAD', downloadId }).catch(() => {});
+    // keepOpfs=false：彻底取消，清理已下载分片
+    chrome.tabs.sendMessage(tabId, { type: 'CANCEL_DOWNLOAD', downloadId, keepOpfs: false }).catch(() => {});
     maybeDispatch();
   }
   persist();
@@ -289,6 +326,20 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   // 取消
   if (msg.type === 'CANCEL') {
     cancelDownload(msg.downloadId);
+    sendResponse({ ok: true });
+    return true;
+  }
+
+  // 暂停（保留进度，可续传）
+  if (msg.type === 'PAUSE') {
+    pauseDownload(msg.downloadId);
+    sendResponse({ ok: true });
+    return true;
+  }
+
+  // 并发任务数设置变更 → 立即重新调度
+  if (msg.type === 'SET_MAX_CONCURRENT') {
+    maybeDispatch();
     sendResponse({ ok: true });
     return true;
   }
@@ -366,7 +417,14 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       if (msg.done !== undefined) d.done = msg.done;
       if (msg.total !== undefined) d.total = msg.total;
 
-      // 自动重试：连续失败 ≤3 次才停止
+      // 用户已暂停/取消的任务：保留其状态，不自动重试、不覆盖
+      if (d.status === 'paused' || d.status === 'cancelled') {
+        persist();
+        broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
+        return;
+      }
+
+      // 自动重试：连续失败 ≤3 次才停止（排除用户操作导致的终止）
       const MAX_RETRY = 3;
       const retries = d.retryCount || 0;
       if (retries < MAX_RETRY && msg.error !== '已取消') {
