@@ -82,6 +82,3 @@ $('#btnClear').addEventListener('click', () => {
 $('#btnMgr').addEventListener('click', () => {
   chrome.runtime.sendMessage({ type: 'OPEN_MANAGER' });
 });
-$('#btnLog').addEventListener('click', () => {
-  chrome.tabs.create({ url: chrome.runtime.getURL('logger/logger.html') });
-});

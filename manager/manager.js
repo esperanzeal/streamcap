@@ -113,7 +113,8 @@ const maxConcSelect = $('#maxConcurrent');
 chrome.storage.local.get('vgp_settings', s => {
   const settings = s.vgp_settings || {};
   threadsSelect.value = settings.concurrency || 4;
-  maxConcSelect.value = settings.maxConcurrent || 3;
+  // 注意：0 = 无上限，必须用 undefined 判断
+  maxConcSelect.value = (settings.maxConcurrent === undefined || settings.maxConcurrent === null) ? 3 : settings.maxConcurrent;
 });
 function saveSettings(patch) {
   chrome.storage.local.get('vgp_settings', s => {
@@ -128,9 +129,6 @@ maxConcSelect.addEventListener('change', () => {
   saveSettings({ maxConcurrent: parseInt(maxConcSelect.value) });
   // 通知后台立即重新调度（改大→派发排队任务，改小→停止新派发）
   act({ type: 'SET_MAX_CONCURRENT' });
-});
-$('#btnLog').addEventListener('click', () => {
-  chrome.tabs.create({ url: chrome.runtime.getURL('logger/logger.html') });
 });
 
 $('#btnClearFail').addEventListener('click', () => {

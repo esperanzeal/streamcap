@@ -3,32 +3,9 @@
 (() => {
   'use strict';
 
-  // ============ 日志（按日期分文件 + 批量写入防竞态） ============
-  function todayStr() {
-    const d = new Date();
-    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
-  }
-  const LOG_MAX_PER_DAY = 5000; // 单日上限，防止撑爆 storage.local 配额
-  let logBuffer = [];
-  let logFlushTimer = null;
-  function flushLogs() {
-    logFlushTimer = null;
-    if (logBuffer.length === 0) return;
-    const batch = logBuffer;
-    logBuffer = [];
-    const key = 'vgp_logs_' + todayStr();
-    chrome.storage.local.get([key], r => {
-      const logs = r[key] || [];
-      logs.push(...batch);
-      if (logs.length > LOG_MAX_PER_DAY) logs.splice(0, logs.length - LOG_MAX_PER_DAY);
-      chrome.storage.local.set({ [key]: logs });
-    });
-  }
+  // ============ 日志（仅 console 输出，不再写 storage） ============
   function log(level, msg) {
-    const entry = { time: new Date().toISOString(), level, msg };
     console[level === 'error' ? 'error' : level === 'warn' ? 'warn' : 'log']('[VGP]', msg);
-    logBuffer.push(entry);
-    if (!logFlushTimer) logFlushTimer = setTimeout(flushLogs, 1000); // 1 秒内合并一次写入
   }
 
   // ============ AbortController 管理 ============

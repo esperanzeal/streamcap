@@ -199,11 +199,17 @@ function dequeueNext(tabId) {
   maybeDispatch();
 }
 
+// 读取并发任务数（0=无上限）。注意：必须用 undefined 判断，不能用 ||（0 会被吞）
+async function getMaxConcurrent() {
+  const s = await chrome.storage.local.get('vgp_settings');
+  const v = s.vgp_settings && s.vgp_settings.maxConcurrent;
+  return (v === undefined || v === null) ? 3 : v;
+}
+
 // 全局并发调度：最多同时跑 maxConcurrent 个任务（0=无上限），每个 tab 至多 1 个
 // 按任务创建时间排序推进（FIFO 优先级）
 async function maybeDispatch() {
-  const s = await chrome.storage.local.get('vgp_settings');
-  const max = (s.vgp_settings && s.vgp_settings.maxConcurrent) || 3;
+  const max = await getMaxConcurrent();
   const unlimited = max === 0;
   const activeCount = Object.keys(tabActive).filter(t => tabActive[t]).length;
   if (!unlimited && activeCount >= max) return;
@@ -235,6 +241,20 @@ async function maybeDispatch() {
 
 // 轮询推进：SW 活跃期间每 2 秒检查一次队列（设置变更/空闲排队时保证推进）
 setInterval(() => { maybeDispatch(); }, 2000);
+
+// 降低并发数时：暂停超出的正在运行任务（保留分片可续传），按创建时间保留最早 max 个
+async function enforceMaxConcurrent() {
+  const max = await getMaxConcurrent();
+  if (max === 0) return; // 无上限不限制
+  const active = Object.values(downloads)
+    .filter(d => d.status === 'downloading' || d.status === 'retrying')
+    .sort((a, b) => a.createdAt - b.createdAt);
+  if (active.length <= max) return;
+  // 暂停多出来的（保留最早创建的 max 个）
+  for (const d of active.slice(max)) {
+    pauseDownload(d.id);
+  }
+}
 
 function pauseDownload(downloadId) {
   const d = downloads[downloadId];
@@ -337,9 +357,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true;
   }
 
-  // 并发任务数设置变更 → 立即重新调度
+  // 并发任务数设置变更 → 立即重新调度（改大→派发排队任务；改小→暂停超出的）
   if (msg.type === 'SET_MAX_CONCURRENT') {
-    maybeDispatch();
+    enforceMaxConcurrent().then(() => maybeDispatch());
     sendResponse({ ok: true });
     return true;
   }
