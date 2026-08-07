@@ -369,19 +369,24 @@
       const finalBlob = new Blob(allBlobs, { type: 'video/mp4' });
       log('success', `[${downloadId}] 合并完成: ${(finalBlob.size / 1024 / 1024).toFixed(1)}MB`);
 
-      // 6. 触发下载
+      // 6. 触发下载：交给 background 用 chrome.downloads 触发（比 a.click() 稳定）
       const url = URL.createObjectURL(finalBlob);
       const filename = guessName(pageTitle || document.title, m3u8Url);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = filename;
-      a.style.display = 'none';
-      (document.body || document.documentElement).appendChild(a);
-      a.click();
-      setTimeout(() => {
-        if (a.parentNode) a.parentNode.removeChild(a);
-        URL.revokeObjectURL(url);
-      }, 60000);
+      chrome.runtime.sendMessage({ type: 'DOWNLOAD_BLOB', downloadId, blobUrl: url, filename }, (resp) => {
+        if (chrome.runtime.lastError || !resp || !resp.ok) {
+          // 消息失败时 fallback 到页面内 a.click()
+          log('warn', `[${downloadId}] chrome.downloads 触发失败，回退 a.click()`);
+          const a = document.createElement('a');
+          a.href = url;
+          a.download = filename;
+          a.style.display = 'none';
+          (document.body || document.documentElement).appendChild(a);
+          a.click();
+          setTimeout(() => { if (a.parentNode) a.parentNode.removeChild(a); }, 60000);
+        }
+      });
+      // 不 revoke blob URL：页面关闭时浏览器自动清理；提前 revoke 会导致下载管理器读取失败
+      // （提示：下载完成前请保持视频页面打开）
 
       // 7. 保留 OPFS 分片（浏览器退出时自动清理，便于任何情况续传）
       removeAbortController(downloadId);

@@ -409,6 +409,19 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true;
   }
 
+  // content script 请求：用 chrome.downloads 触发 blob 下载
+  if (msg.type === 'DOWNLOAD_BLOB') {
+    chrome.downloads.download({
+      url: msg.blobUrl,
+      filename: msg.filename,
+      saveAs: false,
+      conflictAction: 'uniquify',
+    }, () => {
+      sendResponse({ ok: !chrome.runtime.lastError });
+    });
+    return true;
+  }
+
   // ── content script 回报 ──
 
   // content script 报告发现的 <video> 标签 URL
