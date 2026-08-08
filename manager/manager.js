@@ -55,11 +55,12 @@ function render() {
     const speedText = (d.status === 'downloading' || d.status === 'retrying') ? (d.speed || '') : '';
 
     const fname = d.pageTitle ? `${d.pageTitle}.mp4` : (d.fileName || '');
+    const dupTag = d.dupIndex ? ` <span style="color:#d29922;font-weight:600;">(${d.dupIndex})</span>` : '';
     return `
     <div class="card">
       <div class="card-icon">${icon}</div>
       <div class="card-body">
-        ${fname ? `<div style="font-weight:600;color:#58a6ff;margin-bottom:2px;">📄 ${esc(fname)}</div>` : ''}
+        ${fname ? `<div style="font-weight:600;color:#58a6ff;margin-bottom:2px;">📄 ${esc(fname)}${dupTag}</div>` : ''}
         <div class="card-title">
           ${d.resolution || '?'} · ${new Date(d.createdAt).toLocaleTimeString()}
           <span class="badge ${badgeCls}">${badgeText}</span>

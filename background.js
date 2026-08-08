@@ -127,7 +127,7 @@ function persist() {
     id: d.id, url: d.url, referer: d.referer, resolution: d.resolution,
     status: d.status, pct: d.pct, done: d.done, total: d.total,
     speed: d.speed, error: d.error, createdAt: d.createdAt, tabId: d.tabId,
-    fileName: d.fileName, pageTitle: d.pageTitle,
+    fileName: d.fileName, pageTitle: d.pageTitle, dupIndex: d.dupIndex,
   }));
   chrome.storage.local.set({ vgp_downloads: list });
 }
@@ -167,6 +167,8 @@ function clearLogs(dateStr, callback) {
 
 function enqueue(tabId, url, referer, resolution, pageUrl, pageTitle) {
   const id = nextId++;
+  // 重复检测：同一 URL 已在任务列表中 → 新任务加序号（(2)、(3)...），提醒用户任务重复
+  const dupIndex = Object.values(downloads).filter(x => x.url === url).length + 1;
   downloads[id] = {
     id, url, referer, resolution,
     pageUrl: pageUrl || referer || '',
@@ -174,6 +176,7 @@ function enqueue(tabId, url, referer, resolution, pageUrl, pageTitle) {
     status: 'queued', pct: 0, done: 0, total: 0,
     speed: '', error: null, createdAt: Date.now(), tabId,
     fileName: '',
+    dupIndex: dupIndex > 1 ? dupIndex : undefined,
   };
   if (!tabQueues[tabId]) tabQueues[tabId] = [];
   tabQueues[tabId].push(id);
