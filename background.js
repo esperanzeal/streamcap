@@ -698,13 +698,45 @@ function handleDownloadSignal(delta) {
         chrome.storage.session.set({ blob_map: m });
         return;
       }
+      // 记录 Chrome 的中断原因（FILE_FAILED=磁盘/路径，NETWORK_FAILED=blob 读取，ABORTED 等）
+      const errCode = delta.error?.current || 'unknown';
+      const retries = rec.retries || 0;
+      if (retries < 1 && rec.blobUrl) {
+        // blob 还在（页面未关闭、未 revoke）：自动重试一次，瞬时故障直接救回
+        rec.retries = retries + 1;
+        chrome.storage.session.set({ blob_map: m });
+        log('warn', `[下载器] Chrome 下载项 #${delta.id} 中断(${errCode}) → ${taskLabel(rec.downloadId)} 自动重试导出`);
+        chrome.downloads.download({
+          url: rec.blobUrl,
+          filename: rec.filename,
+          saveAs: false,
+          conflictAction: 'uniquify',
+        }, (itemId2) => {
+          if (chrome.runtime.lastError || itemId2 === undefined) {
+            // 重试也失败：blob 可能已失效或页面已关
+            d.status = 'failed';
+            d.error = `Chrome 下载中断(${errCode})，重试失败: ${chrome.runtime.lastError?.message || '未知'}`;
+            d.speed = '';
+            tabActive[rec.tabId] = null;
+            persist();
+            broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
+            log('error', `[下载器] ${taskLabel(rec.downloadId)} 导出重试失败: ${chrome.runtime.lastError?.message || '未知'}`);
+            maybeDispatch();
+          } else {
+            m[itemId2] = rec;
+            chrome.storage.session.set({ blob_map: m });
+            log('info', `[下载器] ${taskLabel(rec.downloadId)} 导出重试 → Chrome 下载项 #${itemId2}`);
+          }
+        });
+        return;
+      }
       d.status = 'failed';
-      d.error = 'Chrome 下载中断，请在下载管理器点击重试';
+      d.error = `Chrome 下载中断(${errCode})，可在下载管理器点重试或点重试重新合并`;
       d.speed = '';
       tabActive[rec.tabId] = null;
       persist();
       broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
-      log('warn', `[下载器] Chrome 下载项 #${delta.id} 中断 → ${taskLabel(rec.downloadId)} 标为失败（blob 保留可重试）`);
+      log('warn', `[下载器] Chrome 下载项 #${delta.id} 中断(${errCode}) → ${taskLabel(rec.downloadId)} 标为失败（blob 保留可重试）`);
       maybeDispatch();
     } else {
       log('debug', `[下载器] Chrome 下载项 #${delta.id} 状态变化: ${delta.state.current}（未处理）`);
