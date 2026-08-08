@@ -160,6 +160,8 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
     d.status = 'paused';
     d.error = '页面刷新/跳转，可点继续续传';
     tabActive[tabId] = null;
+    // 通知 content 停止下载：否则循环可能继续写 OPFS，且点"继续"时新旧循环会共用同一控制器
+    chrome.tabs.sendMessage(tabId, { type: 'CANCEL_DOWNLOAD', downloadId: active }).catch(() => {});
     persist();
     broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
     log('warn', `[页面导航] ${taskLabel(active)} 因页面刷新/跳转暂停（分片已保留）`);
@@ -793,24 +795,33 @@ chrome.storage.local.get('vgp_downloads', data => {
 
     // 心跳兜底：downloading 任务若 content script 已死（页面导航/刷新/冻结后无感知），
     // 会永远卡 downloading 且占着并发槽。这里逐个 ping，无响应 → 标为可续传暂停。
+    // 并行探测 + 每任务超时：冻结的 tab 若消息不返回，不能卡住后续任务的探测。
+    const withTimeout = (p, ms) => new Promise((resolve, reject) => {
+      const t = setTimeout(() => reject(new Error('ping timeout')), ms);
+      p.then(v => { clearTimeout(t); resolve(v); }, e => { clearTimeout(t); reject(e); });
+    });
     (async () => {
-      for (const d of Object.values(downloads)) {
-        if (d.status !== 'downloading') continue;
-        try {
-          await chrome.tabs.sendMessage(d.tabId, { type: 'PING' });
-        } catch {
-          const cur = downloads[d.id];
-          if (cur && cur.status === 'downloading') {
-            cur.status = 'paused';
-            cur.error = '页面已无响应，可点继续续传';
-            tabActive[d.tabId] = null;
-            persist();
-            broadcast({ type: 'DOWNLOAD_UPDATE', download: cur });
-            log('warn', `[心跳] ${taskLabel(d.id)} content 无响应，标为可续传暂停`);
-            maybeDispatch();
+      const pingers = Object.values(downloads)
+        .filter(d => d.status === 'downloading')
+        .map(async d => {
+          try {
+            await withTimeout(chrome.tabs.sendMessage(d.tabId, { type: 'PING' }), 2000);
+          } catch {
+            const cur = downloads[d.id];
+            if (cur && cur.status === 'downloading') {
+              cur.status = 'paused';
+              cur.error = '页面已无响应，可点继续续传';
+              tabActive[d.tabId] = null;
+              // 通知 content 停止下载（与 pauseDownload 对齐，防循环继续写 OPFS）
+              chrome.tabs.sendMessage(d.tabId, { type: 'CANCEL_DOWNLOAD', downloadId: d.id }).catch(() => {});
+              persist();
+              broadcast({ type: 'DOWNLOAD_UPDATE', download: cur });
+              log('warn', `[心跳] ${taskLabel(d.id)} content 无响应，标为可续传暂停`);
+              maybeDispatch();
+            }
           }
-        }
-      }
+        });
+      await Promise.allSettled(pingers);
     })();
 
     // 启动兜底清理：通知所有打开的页面删除孤儿分片（不属于任何活跃任务的分片）
