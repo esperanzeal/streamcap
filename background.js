@@ -402,9 +402,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true;
   }
 
-  // 并发任务数设置变更 → 保存即可，用户手动 全部暂停→全部继续 后生效
+  // 并发任务数设置变更 → 自动 全部暂停 → 全部继续，按新并发数重排任务序列
   if (msg.type === 'SET_MAX_CONCURRENT') {
-    maybeDispatch();
+    pauseAll().then(() => resumeAll());
     sendResponse({ ok: true });
     return true;
   }
