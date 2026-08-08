@@ -526,23 +526,43 @@ chrome.runtime.onConnect.addListener(port => {
 chrome.storage.local.get('vgp_downloads', data => {
   const list = data.vgp_downloads || [];
   for (const d of list) {
-    if (d.status === 'downloading' || d.status === 'retrying') {
-      d.status = 'paused';
-      d.error = '扩展重启，可重试续传';
-    } else if (d.status === 'queued') {
-      d.status = 'queued'; // 保持队列状态
-    }
     downloads[d.id] = d;
   }
   if (list.length > 0) {
     nextId = Math.max(...list.map(d => d.id), Date.now()) + 1;
   }
 
-  // 启动兜底清理：通知所有打开的页面删除孤儿分片（不属于任何活跃任务的分片）
-  const activeIds = list.map(d => d.id);
-  chrome.tabs.query({}, tabs => {
-    for (const t of tabs) {
-      chrome.tabs.sendMessage(t.id, { type: 'CLEANUP_OPFS', activeDownloadIds: activeIds }).catch(() => {});
+  // 区分"浏览器重启"和"SW 空闲重启"：
+  // MV3 service worker 空闲约 30s 会被 Chrome 终止、有事件再唤醒（SW 重启很频繁），
+  // 但下载跑在 content script 里，SW 重启不影响下载，不能把任务误标为暂停。
+  // chrome.storage.session 在浏览器重启时清空、在 SW 空闲重启时保留 → 用 marker 区分。
+  chrome.storage.session.get('sw_marker', s => {
+    if (s.sw_marker) {
+      // SW 空闲重启：任务状态保持不变（content script 可能仍在下载）
+      // 唯一例外：retrying 的退避 setTimeout 已随 SW 销毁，放回队列等待重新调度
+      let needResched = false;
+      for (const d of list) {
+        if (d.status === 'retrying') { d.status = 'queued'; needResched = true; }
+      }
+      if (needResched) { persist(); maybeDispatch(); }
+    } else {
+      // 浏览器重启：下载进程已断开，置为可续传暂停
+      chrome.storage.session.set({ sw_marker: true });
+      for (const d of list) {
+        if (d.status === 'downloading' || d.status === 'retrying') {
+          d.status = 'paused';
+          d.error = '扩展重启，可重试续传';
+        }
+      }
+      persist();
     }
+
+    // 启动兜底清理：通知所有打开的页面删除孤儿分片（不属于任何活跃任务的分片）
+    const activeIds = list.map(d => d.id);
+    chrome.tabs.query({}, tabs => {
+      for (const t of tabs) {
+        chrome.tabs.sendMessage(t.id, { type: 'CLEANUP_OPFS', activeDownloadIds: activeIds }).catch(() => {});
+      }
+    });
   });
 });
