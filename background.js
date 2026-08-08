@@ -30,8 +30,15 @@ let managerPorts = [];      // manager 页的长连接端口
 // ============ 嗅探 ============
 
 function guessResolution(url) {
-  const m = url.match(/\/(\d{3,4}p)\//);
-  return m ? m[1] : '?';
+  // 格式1：1080p / 720p / 2160p
+  const m = url.match(/\/(\d{3,4}p)\//i);
+  if (m) return m[1];
+  // 格式2：宽x高，如 1920x1080 / 1280x720 / 720x1080（竖屏）。
+  // 保留原始 WxH，不做 p 换算——竖屏 720x1080 若显示 1080p 会产生误导。
+  // 用 / ? 或结尾做边界，避免误匹配 UUID/参数里的数字段。
+  const m2 = url.match(/\/(\d{3,4})x(\d{3,4})(?=\/|\?|$)/i);
+  if (m2) return `${m2[1]}x${m2[2]}`;
+  return '?';
 }
 
 function isM3u8(url) {
