@@ -148,6 +148,25 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   maybeDispatch();
 });
 
+// 页面导航/刷新：content script 即将卸载，下载会中断，但任务会永远卡 downloading
+// （onRemoved 只在关闭时触发，刷新/跳转不触发）。这里把进行中任务标为可续传暂停，
+// 释放 tabActive，让调度器能派发其他任务；用户点"继续"即可续传。
+chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
+  if (changeInfo.status !== 'loading') return;
+  const active = tabActive[tabId];
+  if (!active || !downloads[active]) return;
+  const d = downloads[active];
+  if (d.status === 'downloading' || d.status === 'retrying') {
+    d.status = 'paused';
+    d.error = '页面刷新/跳转，可点继续续传';
+    tabActive[tabId] = null;
+    persist();
+    broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
+    log('warn', `[页面导航] ${taskLabel(active)} 因页面刷新/跳转暂停（分片已保留）`);
+    maybeDispatch();
+  }
+});
+
 // ============ 持久化 & 广播 ============
 
 function persist() {

@@ -516,7 +516,8 @@
           }
         }
       }
-      log('info', `[清理] 删除孤儿分片 ${removed} 个`);
+      // 只在实际删了东西时打日志，避免 SW 重启刷屏（每次都广播一次清理）
+      if (removed > 0) log('info', `[清理] 删除孤儿分片 ${removed} 个`);
       sendResponse({ ok: true, removed });
       return;
     }
