@@ -390,6 +390,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       if (d.status === 'downloading') cancelDownload(msg.downloadId);
       delete downloads[msg.downloadId];
       persist();
+      // 通知该任务所在页面清理其分片（任务已删，分片视为孤儿）
+      chrome.tabs.sendMessage(d.tabId, { type: 'CLEANUP_OPFS', activeDownloadIds: Object.values(downloads).map(x => x.id) }).catch(() => {});
       broadcast({ type: 'DOWNLOAD_REMOVED', downloadId: msg.downloadId });
     }
     sendResponse({ ok: true });
@@ -535,4 +537,12 @@ chrome.storage.local.get('vgp_downloads', data => {
   if (list.length > 0) {
     nextId = Math.max(...list.map(d => d.id), Date.now()) + 1;
   }
+
+  // 启动兜底清理：通知所有打开的页面删除孤儿分片（不属于任何活跃任务的分片）
+  const activeIds = list.map(d => d.id);
+  chrome.tabs.query({}, tabs => {
+    for (const t of tabs) {
+      chrome.tabs.sendMessage(t.id, { type: 'CLEANUP_OPFS', activeDownloadIds: activeIds }).catch(() => {});
+    }
+  });
 });

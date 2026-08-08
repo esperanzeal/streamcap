@@ -388,8 +388,9 @@
       // 不 revoke blob URL：页面关闭时浏览器自动清理；提前 revoke 会导致下载管理器读取失败
       // （提示：下载完成前请保持视频页面打开）
 
-      // 7. 保留 OPFS 分片（浏览器退出时自动清理，便于任何情况续传）
+      // 7. 下载完成 → 立即清理本任务分片（OPFS 不会自动清理，避免占用磁盘）
       removeAbortController(downloadId);
+      cleanupOpfs(downloadId); // 不阻塞回报
       chrome.runtime.sendMessage({ type: 'DOWNLOAD_COMPLETE', downloadId, fileName: filename });
     } catch (err) {
       removeAbortController(downloadId);
@@ -440,7 +441,7 @@
   }
 
   // ============ 消息处理 ============
-  chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  chrome.runtime.onMessage.addListener(async (msg, sender, sendResponse) => {
     if (msg.type === 'START_DOWNLOAD') {
       startDownload(msg.downloadId, msg.m3u8Url, msg.resumeFrom || 0, msg.concurrency || 4, msg.referer || '', msg.pageTitle || '');
       sendResponse({ ok: true });
@@ -457,6 +458,29 @@
     }
     if (msg.type === 'SCAN_VIDEOS') {
       sendResponse({ urls: extractVideoSources() });
+      return;
+    }
+    // 清理孤儿分片：删除不属于任何活跃任务的分片（扩展启动时兜底清理）
+    if (msg.type === 'CLEANUP_OPFS') {
+      const active = new Set(msg.activeDownloadIds || []);
+      const root = await navigator.storage.getDirectory();
+      let removed = 0;
+      for await (const [name] of root) {
+        if (!name.startsWith(OPFS_PREFIX)) continue;
+        if (name.startsWith(OPFS_PREFIX + 'dl_')) {
+          const m = name.match(/^vgp_dl_(\d+)_/);
+          if (!m || !active.has(Number(m[1]))) {
+            try { await root.removeEntry(name); removed++; } catch {}
+          }
+        } else if (name.startsWith(OPFS_PREFIX + 'meta_')) {
+          const m = name.match(/^vgp_meta_(\d+)\.json$/);
+          if (!m || !active.has(Number(m[1]))) {
+            try { await root.removeEntry(name); removed++; } catch {}
+          }
+        }
+      }
+      log('info', `[清理] 删除孤儿分片 ${removed} 个`);
+      sendResponse({ ok: true, removed });
       return;
     }
   });
