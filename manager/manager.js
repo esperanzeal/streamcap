@@ -171,23 +171,38 @@ $('#btnClearFail').addEventListener('click', () => {
 });
 
 // ============ 实时更新 ============
-// 用长连接 + storage 双通道
-const port = chrome.runtime.connect({ name: 'manager' });
-port.onMessage.addListener(msg => {
-  if (msg.type === 'INIT') {
-    msg.downloads.forEach(d => downloads[d.id] = d);
-    render();
-  }
-  if (msg.type === 'DOWNLOAD_UPDATE' && msg.download) {
-    downloads[msg.download.id] = msg.download;
-    render();
-  }
-  if (msg.type === 'DOWNLOAD_REMOVED') {
-    delete downloads[msg.downloadId];
-    render();
-  }
-});
-port.onDisconnect.addListener(() => { /* reconnect handled by storage listener */ });
+// 长连接（实时广播）+ storage 兜底双通道。
+// MV3 的 service worker 空闲约 30s 就重启，SW 重启会断开扩展页的长连接 →
+// 若不做自动重连，页面会收不到任何更新（进度条/网速静止，只有 F5 能恢复）。
+// 断线后延迟重连 + 主动拉一次全量，保证断线期间的状态不丢。
+function connectManager() {
+  const port = chrome.runtime.connect({ name: 'manager' });
+  port.onMessage.addListener(msg => {
+    if (msg.type === 'INIT') {
+      msg.downloads.forEach(d => downloads[d.id] = d);
+      render();
+    }
+    if (msg.type === 'DOWNLOAD_UPDATE' && msg.download) {
+      downloads[msg.download.id] = msg.download;
+      render();
+    }
+    if (msg.type === 'DOWNLOAD_REMOVED') {
+      delete downloads[msg.downloadId];
+      render();
+    }
+  });
+  port.onDisconnect.addListener(() => {
+    // SW 重启导致断开 → 延迟重连，并拉一次全量状态兜底
+    setTimeout(() => {
+      connectManager();
+      chrome.runtime.sendMessage({ type: 'GET_DOWNLOADS' }, list => {
+        (list || []).forEach(d => downloads[d.id] = d);
+        render();
+      });
+    }, 500);
+  });
+}
+connectManager();
 
 // 初始加载 + storage 兜底
 chrome.runtime.sendMessage({ type: 'GET_DOWNLOADS' }, list => {
