@@ -47,12 +47,17 @@ function render() {
     const isActive = d.status === 'downloading' || d.status === 'queued' || d.status === 'retrying';
     const isPaused = d.status === 'paused';
     const isDone = d.status === 'completed';
+    const isExporting = d.status === 'exporting';
     const isDead = d.status === 'failed' || d.status === 'cancelled';
     const isRetryable = isDead || isPaused || isDone;
     const barW = d.pct || 0;
     const doneText = d.total ? `${d.done}/${d.total}` : '—';
     // 速度/临时文案只在下载中、重试中显示（已完成/失败等不显示，避免残留"合并中"等）
     const speedText = (d.status === 'downloading' || d.status === 'retrying') ? (d.speed || '') : '';
+    // 导出中提示：与"下载中"视觉区分，提醒别关页面
+    const exportingHint = isExporting
+      ? '<div style="font-size:11px;color:#d29922;margin-top:4px;">📤 文件保存中，请勿关闭此页面</div>'
+      : '';
 
     const fname = d.pageTitle ? `${d.pageTitle}.mp4` : (d.fileName || '');
     const dupTag = d.dupIndex ? ` <span style="color:#d29922;font-weight:600;">(${d.dupIndex})</span>` : '';
@@ -73,11 +78,12 @@ function render() {
         </div>
         ${d.error ? `<div class="card-err">${esc(d.error)}</div>` : ''}
         ${d.fileName ? `<div style="font-size:11px;color:#3fb950;margin-top:4px;">📁 ${esc(d.fileName)}</div>` : ''}
+        ${exportingHint}
       </div>
       <div class="card-actions">
         ${isActive ? `<button class="btn-act" data-act="pause" data-id="${d.id}">暂停</button>` : ''}
         ${isRetryable ? `<button class="btn-act retry" data-act="retry" data-id="${d.id}">${isPaused ? '继续' : '重试'}</button>` : ''}
-        ${!isActive ? `<button class="btn-act danger" data-act="delete" data-id="${d.id}">删除</button>` : ''}
+        ${!isActive && !isExporting ? `<button class="btn-act danger" data-act="delete" data-id="${d.id}">删除</button>` : ''}
       </div>
     </div>`;
   }).join('');
@@ -90,7 +96,12 @@ function render() {
       if (btn.dataset.act === 'pause') act({ type: 'PAUSE', downloadId: id });
       if (btn.dataset.act === 'delete') act({ type: 'DELETE_DOWNLOAD', downloadId: id });
       if (btn.dataset.act === 'resume' || btn.dataset.act === 'retry') {
-        if (d) act({ type: 'ENQUEUE', tabId: d.tabId, url: d.url, referer: d.referer, resolution: d.resolution, pageUrl: d.pageUrl, pageTitle: d.pageTitle, retryId: d.id });
+        if (!d) return;
+        // 已完成任务的重试 = 进度归零从头重新下载（分片已清理），需确认防误触
+        if (d.status === 'completed') {
+          if (!confirm(`该任务已完成，重新下载将清空进度从头开始（约 ${(d.total || 0)} 个分片），确定？`)) return;
+        }
+        act({ type: 'ENQUEUE', tabId: d.tabId, url: d.url, referer: d.referer, resolution: d.resolution, pageUrl: d.pageUrl, pageTitle: d.pageTitle, retryId: d.id });
       }
     });
   });
