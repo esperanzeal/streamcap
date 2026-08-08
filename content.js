@@ -328,7 +328,12 @@
               }
               batchChunks[idx] = segData;
             } catch (err) {
-              log('error', `[${taskLabel}] 分片 ${segStart + idx + 1} 失败: ${err.message}`);
+              if (err.name === 'AbortError') {
+                // 任务被暂停/取消中止，不是失败：降级为 info，避免误读为任务失败
+                log('info', `[${taskLabel}] 分片 ${segStart + idx + 1} 已中止（暂停/取消）`);
+              } else {
+                log('error', `[${taskLabel}] 分片 ${segStart + idx + 1} 失败: ${err.message}`);
+              }
               batchChunks[idx] = null;
             }
           }));
