@@ -407,7 +407,14 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
   // 并发任务数设置变更 → 自动 全部暂停 → 全部继续，按新并发数重排任务序列
   if (msg.type === 'SET_MAX_CONCURRENT') {
-    pauseAll().then(() => resumeAll());
+    const value = msg.value;
+    // 先把新值写入 storage（完成后回调），保证后续 maybeDispatch 读到的一定是新值
+    chrome.storage.local.get('vgp_settings', s => {
+      const merged = { ...(s.vgp_settings || {}), maxConcurrent: value };
+      chrome.storage.local.set({ vgp_settings: merged }, () => {
+        pauseAll().then(() => resumeAll());
+      });
+    });
     sendResponse({ ok: true });
     return true;
   }

@@ -130,8 +130,8 @@ threadsSelect.addEventListener('change', () => {
 });
 maxConcSelect.addEventListener('change', () => {
   saveSettings({ maxConcurrent: parseInt(maxConcSelect.value) });
-  // 通知后台立即重新调度（改大→派发排队任务，改小→停止新派发）
-  act({ type: 'SET_MAX_CONCURRENT' });
+  // 消息携带新值，避免后台读取 storage 时的时序竞态
+  act({ type: 'SET_MAX_CONCURRENT', value: parseInt(maxConcSelect.value) });
 });
 
 // 打开日志页
