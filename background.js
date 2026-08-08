@@ -179,7 +179,7 @@ function enqueue(tabId, url, referer, resolution, pageUrl, pageTitle) {
   tabQueues[tabId].push(id);
   persist();
   broadcast({ type: 'DOWNLOAD_UPDATE', download: downloads[id] });
-  log('info', `[入队] #${id} ${d.url.substring(0, 80)}`);
+  log('info', `[入队] #${id} ${url.substring(0, 80)}`);
   maybeDispatch();
   return id;
 }
