@@ -412,19 +412,48 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
 
   // content script 请求：用 chrome.downloads 触发 blob 下载
+  // 不立即标完成——等 chrome.downloads.onChanged 的 complete/interrupted 信号
   if (msg.type === 'DOWNLOAD_BLOB') {
+    const { downloadId, blobUrl, filename } = msg;
+    const tabId = sender.tab?.id;
     chrome.downloads.download({
-      url: msg.blobUrl,
-      filename: msg.filename,
+      url: blobUrl,
+      filename,
       saveAs: false,
       conflictAction: 'uniquify',
-    }, () => {
-      sendResponse({ ok: !chrome.runtime.lastError });
+    }, (itemId) => {
+      if (chrome.runtime.lastError || itemId === undefined) {
+        // 触发失败：标记失败，不进入 exporting
+        const d = downloads[downloadId];
+        if (d) {
+          d.status = 'failed';
+          d.error = 'Chrome 下载触发失败: ' + (chrome.runtime.lastError?.message || '未知');
+          persist();
+          broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
+        }
+        sendResponse({ ok: false });
+        return;
+      }
+      // 记录映射：Chrome 下载项 id ↔ 扩展任务（存 session，SW 重启不丢）
+      chrome.storage.session.get('blob_map', s => {
+        const m = s.blob_map || {};
+        m[itemId] = { downloadId, tabId, blobUrl, filename };
+        chrome.storage.session.set({ blob_map: m });
+      });
+      // 任务进入"导出中"：等待 Chrome 下载结果信号
+      const d = downloads[downloadId];
+      if (d) {
+        d.status = 'exporting';
+        d.pct = 99;
+        d.error = null;
+        persist();
+        broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
+      }
+      sendResponse({ ok: true });
     });
     return true;
   }
 
-  // ── content script 回报 ──
 
   // content script 报告发现的 <video> 标签 URL
   if (msg.type === 'REPORT_VIDEO') {
@@ -508,6 +537,44 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
 });
 
+// ============ Chrome 下载结果信号 ============
+// DOWNLOAD_BLOB 触发的下载任务，其结果决定扩展任务最终状态：
+// complete → 真正完成（文件已存盘）→ 通知 content revoke blob + 清理分片
+// interrupted → 失败（blob 保留，用户可在下载管理器重试，重试成功后 complete 分支转完成）
+chrome.downloads.onChanged.addListener((delta) => {
+  if (!delta.state) return;
+  chrome.storage.session.get('blob_map', s => {
+    const m = s.blob_map || {};
+    const rec = m[delta.id];
+    if (!rec) return;
+    const d = downloads[rec.downloadId];
+    if (delta.state.current === 'complete') {
+      delete m[delta.id];
+      chrome.storage.session.set({ blob_map: m });
+      if (d) {
+        d.status = 'completed';
+        d.pct = 100;
+        d.fileName = rec.filename;
+        tabActive[rec.tabId] = null;
+        persist();
+        broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
+      }
+      // 通知 content：revoke blob + 清理分片
+      chrome.tabs.sendMessage(rec.tabId, { type: 'FINALIZE_DOWNLOAD', downloadId: rec.downloadId, blobUrl: rec.blobUrl }).catch(() => {});
+      maybeDispatch();
+    } else if (delta.state.current === 'interrupted') {
+      if (d) {
+        d.status = 'failed';
+        d.error = 'Chrome 下载中断，请在下载管理器点击重试';
+        tabActive[rec.tabId] = null;
+        persist();
+        broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
+      }
+      maybeDispatch();
+    }
+  });
+});
+
 // ============ Manager 长连接 ============
 
 chrome.runtime.onConnect.addListener(port => {
@@ -552,6 +619,10 @@ chrome.storage.local.get('vgp_downloads', data => {
         if (d.status === 'downloading' || d.status === 'retrying') {
           d.status = 'paused';
           d.error = '扩展重启，可重试续传';
+        } else if (d.status === 'exporting') {
+          // 导出中：blob 已随页面销毁，Chrome 下载任务也已中断
+          d.status = 'failed';
+          d.error = '浏览器重启，导出未完成，请重新下载';
         }
       }
       persist();

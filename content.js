@@ -385,13 +385,13 @@
           setTimeout(() => { if (a.parentNode) a.parentNode.removeChild(a); }, 60000);
         }
       });
-      // 不 revoke blob URL：页面关闭时浏览器自动清理；提前 revoke 会导致下载管理器读取失败
-      // （提示：下载完成前请保持视频页面打开）
+      // 注意：这里不 revoke blob、不清理分片、不标完成——
+      // 等 background 收到 Chrome 下载结果信号后发 FINALIZE_DOWNLOAD 再收尾，
+      // 避免"扩展显示完成但 Chrome 下载失败"的状态不一致
+      // （提示：下载完成前请保持视频页面打开，blob 数据在页面内存里）
 
-      // 7. 下载完成 → 立即清理本任务分片（OPFS 不会自动清理，避免占用磁盘）
+      // 7. 下载循环结束
       removeAbortController(downloadId);
-      cleanupOpfs(downloadId); // 不阻塞回报
-      chrome.runtime.sendMessage({ type: 'DOWNLOAD_COMPLETE', downloadId, fileName: filename });
     } catch (err) {
       removeAbortController(downloadId);
       if (err.name === 'AbortError') {
@@ -458,6 +458,16 @@
     }
     if (msg.type === 'SCAN_VIDEOS') {
       sendResponse({ urls: extractVideoSources() });
+      return;
+    }
+    // Chrome 下载完成信号：revoke blob + 清理本任务分片（background 在下载 complete 后发送）
+    if (msg.type === 'FINALIZE_DOWNLOAD') {
+      if (msg.blobUrl) {
+        try { URL.revokeObjectURL(msg.blobUrl); } catch {}
+      }
+      cleanupOpfs(msg.downloadId);
+      log('success', `[${msg.downloadId}] Chrome 下载已确认完成，blob 已释放、分片已清理`);
+      sendResponse({ ok: true });
       return;
     }
     // 清理孤儿分片：删除不属于任何活跃任务的分片（扩展启动时兜底清理）

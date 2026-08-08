@@ -5,13 +5,13 @@ const $$ = s => document.querySelectorAll(s);
 let downloads = {};
 let filter = 'all';
 
-const ICONS = { queued: '⏳', downloading: '⬇️', retrying: '🔁', completed: '✅', failed: '❌', cancelled: '🚫', paused: '⏸️' };
+const ICONS = { queued: '⏳', downloading: '⬇️', retrying: '🔁', exporting: '📤', completed: '✅', failed: '❌', cancelled: '🚫', paused: '⏸️' };
 const BADGES = {
   queued: ['队列中', 'b-queued'], downloading: ['下载中', 'b-active'], retrying: ['重试中', 'b-active'],
-  completed: ['已完成', 'b-done'], failed: ['失败', 'b-fail'], cancelled: ['已取消', 'b-cxl'],
+  exporting: ['导出中', 'b-active'], completed: ['已完成', 'b-done'], failed: ['失败', 'b-fail'], cancelled: ['已取消', 'b-cxl'],
   paused: ['已暂停', 'b-queued'],
 };
-const BARS = { queued: 'bar-q', downloading: 'bar-go', retrying: 'bar-go', completed: 'bar-ok', failed: 'bar-err', cancelled: 'bar-cxl', paused: 'bar-q' };
+const BARS = { queued: 'bar-q', downloading: 'bar-go', retrying: 'bar-go', exporting: 'bar-go', completed: 'bar-ok', failed: 'bar-err', cancelled: 'bar-cxl', paused: 'bar-q' };
 
 // ============ 操作 ============
 function act(msg) { chrome.runtime.sendMessage(msg).catch(() => {}); }
@@ -23,6 +23,7 @@ function render() {
 
   $('#stats').textContent = [
     cnt.downloading ? `⬇️${cnt.downloading}` : '',
+    cnt.exporting ? `📤${cnt.exporting}` : '',
     cnt.queued ? `⏳${cnt.queued}` : '',
     cnt.completed ? `✅${cnt.completed}` : '',
     cnt.failed ? `❌${cnt.failed}` : '',
@@ -30,7 +31,7 @@ function render() {
 
   const filtered = all.filter(d => {
     if (filter === 'all') return true;
-    if (filter === 'active') return d.status === 'downloading' || d.status === 'queued';
+    if (filter === 'active') return d.status === 'downloading' || d.status === 'queued' || d.status === 'exporting';
     return d.status === filter;
   });
 
