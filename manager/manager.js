@@ -48,7 +48,7 @@ function render() {
     const isPaused = d.status === 'paused';
     const isDone = d.status === 'completed';
     const isDead = d.status === 'failed' || d.status === 'cancelled';
-    const isRetryable = isDead || isPaused;
+    const isRetryable = isDead || isPaused || isDone;
     const barW = d.pct || 0;
     const doneText = d.total ? `${d.done}/${d.total}` : '—';
 
@@ -73,8 +73,7 @@ function render() {
       </div>
       <div class="card-actions">
         ${isActive ? `<button class="btn-act" data-act="pause" data-id="${d.id}">暂停</button>` : ''}
-        ${isPaused ? `<button class="btn-act retry" data-act="resume" data-id="${d.id}">继续</button>` : ''}
-        ${isDead ? `<button class="btn-act retry" data-act="retry" data-id="${d.id}">重试·续传</button>` : ''}
+        ${isRetryable ? `<button class="btn-act retry" data-act="retry" data-id="${d.id}">${isPaused ? '继续' : '重试'}</button>` : ''}
         ${!isActive ? `<button class="btn-act danger" data-act="delete" data-id="${d.id}">删除</button>` : ''}
       </div>
     </div>`;

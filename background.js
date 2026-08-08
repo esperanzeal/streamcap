@@ -330,6 +330,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       // 重试：优先用 manager 传来的 tabId，fallback 到 active tab
       const d = downloads[msg.retryId];
       const tabId = msg.tabId || d.tabId;
+      if (d.status === 'completed') {
+        // 已完成任务重试 = 重新下载：分片已清理，进度归零
+        d.done = 0; d.pct = 0; d.total = 0; d.fileName = '';
+      }
       d.status = 'queued';
       d.error = null;
       if (!tabQueues[tabId]) tabQueues[tabId] = [];
