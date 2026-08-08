@@ -188,10 +188,17 @@ function broadcast(msg) {
 }
 
 // ============ 日志（按日期分文件，存 storage.local，防爆上限 5000 条/天） ============
+function todayKey() {
+  const d = new Date();
+  return 'vgp_logs_' +
+    d.getFullYear() + '-' +
+    String(d.getMonth() + 1).padStart(2, '0') + '-' +
+    String(d.getDate()).padStart(2, '0'); // 本地日期；toISOString() 是 UTC，东八区凌晨会落前一天
+}
 function log(level, msg) {
   try {
     const now = new Date();
-    const key = 'vgp_logs_' + now.toISOString().slice(0, 10); // vgp_logs_YYYY-MM-DD
+    const key = todayKey();
     chrome.storage.local.get(key, data => {
       const arr = data[key] || [];
       arr.push(`[${now.toLocaleTimeString()}] [${level.toUpperCase()}] ${msg}`);
