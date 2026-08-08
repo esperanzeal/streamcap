@@ -10,7 +10,11 @@
     } catch {}
     try {
       const now = new Date();
-      const key = 'vgp_logs_' + now.toISOString().slice(0, 10); // vgp_logs_YYYY-MM-DD
+      // 用本地时区日期做 key：toISOString() 是 UTC 时间，东八区凌晨 0-8 点会落到前一天
+      const key = 'vgp_logs_' +
+        now.getFullYear() + '-' +
+        String(now.getMonth() + 1).padStart(2, '0') + '-' +
+        String(now.getDate()).padStart(2, '0'); // vgp_logs_YYYY-MM-DD（本地日期）
       chrome.storage.local.get(key, data => {
         const arr = data[key] || [];
         arr.push(`[${now.toLocaleTimeString()}] [${level.toUpperCase()}] [页面] ${msg}`);
