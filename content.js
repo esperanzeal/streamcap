@@ -487,6 +487,11 @@
       sendResponse({ urls: extractVideoSources(), pageUrl: location.href, pageTitle: document.title });
       return;
     }
+    // 心跳探测：background 恢复时确认 content script 是否存活
+    if (msg.type === 'PING') {
+      sendResponse({ ok: true });
+      return;
+    }
     // Chrome 下载完成信号：revoke blob + 清理本任务分片（background 在下载 complete 后发送）
     if (msg.type === 'FINALIZE_DOWNLOAD') {
       if (msg.blobUrl) {

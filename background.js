@@ -791,6 +791,28 @@ chrome.storage.local.get('vgp_downloads', data => {
 
     maybeDispatch();
 
+    // 心跳兜底：downloading 任务若 content script 已死（页面导航/刷新/冻结后无感知），
+    // 会永远卡 downloading 且占着并发槽。这里逐个 ping，无响应 → 标为可续传暂停。
+    (async () => {
+      for (const d of Object.values(downloads)) {
+        if (d.status !== 'downloading') continue;
+        try {
+          await chrome.tabs.sendMessage(d.tabId, { type: 'PING' });
+        } catch {
+          const cur = downloads[d.id];
+          if (cur && cur.status === 'downloading') {
+            cur.status = 'paused';
+            cur.error = '页面已无响应，可点继续续传';
+            tabActive[d.tabId] = null;
+            persist();
+            broadcast({ type: 'DOWNLOAD_UPDATE', download: cur });
+            log('warn', `[心跳] ${taskLabel(d.id)} content 无响应，标为可续传暂停`);
+            maybeDispatch();
+          }
+        }
+      }
+    })();
+
     // 启动兜底清理：通知所有打开的页面删除孤儿分片（不属于任何活跃任务的分片）
     const activeIds = list.map(d => d.id);
     chrome.tabs.query({}, tabs => {
