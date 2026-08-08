@@ -607,6 +607,8 @@ chrome.runtime.onConnect.addListener(port => {
 chrome.storage.local.get('vgp_downloads', data => {
   const list = data.vgp_downloads || [];
   for (const d of list) {
+    // 清历史残留的临时文案（如"合并中..."），只在下载中/重试中保留速度
+    if (d.status !== 'downloading' && d.status !== 'retrying') d.speed = '';
     downloads[d.id] = d;
   }
   if (list.length > 0) {

@@ -51,6 +51,8 @@ function render() {
     const isRetryable = isDead || isPaused || isDone;
     const barW = d.pct || 0;
     const doneText = d.total ? `${d.done}/${d.total}` : '—';
+    // 速度/临时文案只在下载中、重试中显示（已完成/失败等不显示，避免残留"合并中"等）
+    const speedText = (d.status === 'downloading' || d.status === 'retrying') ? (d.speed || '') : '';
 
     const fname = d.pageTitle ? `${d.pageTitle}.mp4` : (d.fileName || '');
     return `
@@ -65,7 +67,7 @@ function render() {
         <div class="card-url" title="${esc(d.url)}">${esc(d.url)}</div>
         <div class="bar-wrap"><div class="bar-fill ${barCls}" style="width:${barW}%"></div></div>
         <div class="card-info">
-          <span>${doneText} 分片 · ${d.speed || ''}</span>
+          <span>${doneText} 分片${speedText ? ` · ${esc(speedText)}` : ''}</span>
           <span>${(d.pct || 0).toFixed(1)}%</span>
         </div>
         ${d.error ? `<div class="card-err">${esc(d.error)}</div>` : ''}
