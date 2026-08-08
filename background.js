@@ -35,6 +35,14 @@ const tabActive = {};       // { tabId → downloadId | null }
 let sniffStore = {};        // { tabId → { m3u8s: [...], pageUrl: '' } }
 let managerPorts = [];      // manager 页的长连接端口
 
+// 日志任务标识：优先任务名（ipzz196.mp4），重复任务带序号，否则回退 id
+function taskLabel(id) {
+  const d = downloads[id];
+  if (!d) return `#${id}`;
+  const name = d.pageTitle ? `${d.pageTitle}.mp4` : `#${id}`;
+  return d.dupIndex ? `${name} (${d.dupIndex})` : name;
+}
+
 // ============ 嗅探 ============
 
 function guessResolution(url) {
@@ -202,7 +210,7 @@ function enqueue(tabId, url, referer, resolution, pageUrl, pageTitle) {
   tabQueues[tabId].push(id);
   persist();
   broadcast({ type: 'DOWNLOAD_UPDATE', download: downloads[id] });
-  log('info', `[入队] #${id} ${url.substring(0, 80)}`);
+  log('info', `[入队] ${taskLabel(id)} ${url.substring(0, 60)}`);
   maybeDispatch();
   return id;
 }
@@ -293,7 +301,7 @@ async function maybeDispatch() {
     q.splice(idx, 1);
     dispatchTab(c.tabId, c.did);
     slots--;
-    log('info', `[调度] 派发 #${c.did} → tab${c.tabId}（并发 ${max}，活跃 ${activeCount + 1}）`);
+    log('info', `[调度] 派发 ${taskLabel(c.did)} → tab${c.tabId}（并发 ${max}，活跃 ${activeCount + 1}）`);
   }
 }
 
@@ -509,7 +517,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           persist();
           broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
         }
-        log('error', `[导出] #${downloadId} chrome.downloads 触发失败: ${chrome.runtime.lastError?.message || '未知'}`);
+        log('error', `[导出] ${taskLabel(downloadId)} chrome.downloads 触发失败: ${chrome.runtime.lastError?.message || '未知'}`);
         sendResponse({ ok: false });
         return;
       }
@@ -529,7 +537,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         persist();
         broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
       }
-      log('info', `[导出] #${downloadId} → Chrome 下载项 #${itemId} 开始，文件名: ${filename}`);
+      log('info', `[导出] ${taskLabel(downloadId)} → Chrome 下载项 #${itemId} 开始，文件名: ${filename}`);
       sendResponse({ ok: true });
     });
     return true;
@@ -659,7 +667,7 @@ function handleDownloadSignal(delta) {
       tabActive[rec.tabId] = null;
       persist();
       broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
-      log('info', `[下载器] Chrome 下载项 #${delta.id} 完成 → #${rec.downloadId} 标为已完成`);
+      log('info', `[下载器] Chrome 下载项 #${delta.id} 完成 → ${taskLabel(rec.downloadId)} 标为已完成`);
       // 通知 content：revoke blob + 清理分片
       chrome.tabs.sendMessage(rec.tabId, { type: 'FINALIZE_DOWNLOAD', downloadId: rec.downloadId, blobUrl: rec.blobUrl }).catch(() => {});
       maybeDispatch();
@@ -675,7 +683,7 @@ function handleDownloadSignal(delta) {
       tabActive[rec.tabId] = null;
       persist();
       broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
-      log('warn', `[下载器] Chrome 下载项 #${delta.id} 中断 → #${rec.downloadId} 标为失败（blob 保留可重试）`);
+      log('warn', `[下载器] Chrome 下载项 #${delta.id} 中断 → ${taskLabel(rec.downloadId)} 标为失败（blob 保留可重试）`);
       maybeDispatch();
     } else {
       log('debug', `[下载器] Chrome 下载项 #${delta.id} 状态变化: ${delta.state.current}（未处理）`);

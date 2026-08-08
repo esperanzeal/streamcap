@@ -214,9 +214,11 @@
   async function startDownload(downloadId, m3u8Url, resumeFrom, concurrency, referer, pageTitle) {
     const ac = getAbortController(downloadId);
     const signal = ac.signal;
+    // 日志任务标识：优先用任务名（如 ipzz196.mp4），没有时才回退到 id
+    const taskLabel = pageTitle ? `${pageTitle}.mp4` : `#${downloadId}`;
 
-    log('info', `[${downloadId}] 开始下载: ${m3u8Url.substring(0, 60)}...`);
-    if (resumeFrom > 0) log('info', `[${downloadId}] 断点续传，跳过前 ${resumeFrom} 段`);
+    log('info', `[${taskLabel}] 开始下载: ${m3u8Url.substring(0, 60)}...`);
+    if (resumeFrom > 0) log('info', `[${taskLabel}] 断点续传，跳过前 ${resumeFrom} 段`);
 
     let total, totalDone = resumeFrom;
 
@@ -226,7 +228,7 @@
       const freeMB = (estimate.quota - estimate.usage) / 1024 / 1024;
       const needEstimate = resumeFrom > 0 ? 500 : 2048; // 续传用保守估计
       if (freeMB < needEstimate) {
-        log('warn', `[${downloadId}] 磁盘剩余 ${freeMB.toFixed(0)}MB，可能不足`);
+        log('warn', `[${taskLabel}] 磁盘剩余 ${freeMB.toFixed(0)}MB，可能不足`);
         reportProgress(downloadId, 0, 0, 0, `磁盘仅剩 ${freeMB.toFixed(0)}MB`);
       }
 
@@ -235,7 +237,7 @@
       // 1. 获取 m3u8 文本
       let resp = await fetchWithRetry(m3u8Url, 3, signal, refHeaders);
       let text = await resp.text();
-      log('info', `[${downloadId}] m3u8 获取成功 (${text.length}B)`);
+      log('info', `[${taskLabel}] m3u8 获取成功 (${text.length}B)`);
 
       // 2. 解析 — textBaseUrl 始终跟踪 text 的来源 URL
       let textBaseUrl = m3u8Url;
@@ -243,7 +245,7 @@
       if (parsed.isMaster && parsed.variantUrls.length > 0) {
         const best = selectBestVariant(text);
         textBaseUrl = best ? resolveUrl(best, m3u8Url) : parsed.variantUrls[parsed.variantUrls.length - 1];
-        log('info', `[${downloadId}] 选择子清单: ${textBaseUrl.substring(0, 60)}...`);
+        log('info', `[${taskLabel}] 选择子清单: ${textBaseUrl.substring(0, 60)}...`);
         resp = await fetchWithRetry(textBaseUrl, 3, signal, refHeaders);
         text = await resp.text();
         parsed = parseM3u8(text, textBaseUrl);
@@ -254,14 +256,14 @@
       const keyInfo = parseKeyInfo(text, textBaseUrl);
       let cryptoKey = null;
       if (keyInfo) {
-        log('info', `[${downloadId}] AES-128 加密，获取密钥...`);
+        log('info', `[${taskLabel}] AES-128 加密，获取密钥...`);
         const keyBytes = await fetchDecryptKey(keyInfo.keyUrl, signal);
         cryptoKey = await crypto.subtle.importKey('raw', keyBytes, { name: 'AES-CBC' }, false, ['decrypt']);
-        log('success', `[${downloadId}] 密钥就绪`);
+        log('success', `[${taskLabel}] 密钥就绪`);
       }
 
       total = parsed.segments.length;
-      log('info', `[${downloadId}] 共 ${total} 个分片`);
+      log('info', `[${taskLabel}] 共 ${total} 个分片`);
 
       // 3. 读取/创建断点元数据
       let meta = await loadMeta(downloadId);
@@ -293,11 +295,11 @@
           const buf = await opfsRead(`dl_${downloadId}_batch_${batchIdx}.blob`);
           if (buf) {
             totalBytes += buf.byteLength;
-            log('info', `[${downloadId}] 批次 ${batchIdx + 1}/${totalBatches} 已缓存，跳过`);
+            log('info', `[${taskLabel}] 批次 ${batchIdx + 1}/${totalBatches} 已缓存，跳过`);
           } else {
             // 缓存丢失，重新下载
             completed.delete(batchIdx);
-            log('warn', `[${downloadId}] 批次 ${batchIdx + 1} 缓存丢失，重新下载`);
+            log('warn', `[${taskLabel}] 批次 ${batchIdx + 1} 缓存丢失，重新下载`);
           }
         }
 
@@ -326,7 +328,7 @@
               }
               batchChunks[idx] = segData;
             } catch (err) {
-              log('error', `[${downloadId}] 分片 ${segStart + idx + 1} 失败: ${err.message}`);
+              log('error', `[${taskLabel}] 分片 ${segStart + idx + 1} 失败: ${err.message}`);
               batchChunks[idx] = null;
             }
           }));
@@ -342,7 +344,7 @@
         for (let i = 0; i < batchCount; i++) {
           if (batchChunks[i] !== null) continue;
           try {
-            log('info', `[${downloadId}] 重试分片 ${segStart + i + 1}`);
+            log('info', `[${taskLabel}] 重试分片 ${segStart + i + 1}`);
             const r = await fetchWithRetry(batchUrls[i], 5, signal, refHeaders);
             const rawBuf = await r.arrayBuffer();
             networkBytes += rawBuf.byteLength;
@@ -372,11 +374,11 @@
         // 释放内存
         batchChunks.length = 0;
 
-        log('info', `[${downloadId}] 批次 ${batchIdx + 1}/${totalBatches} 完成 (${(batchBlob.size / 1024 / 1024).toFixed(1)}MB)`);
+        log('info', `[${taskLabel}] 批次 ${batchIdx + 1}/${totalBatches} 完成 (${(batchBlob.size / 1024 / 1024).toFixed(1)}MB)`);
       }
 
       // 5. 全部完成 → 合并导出
-      log('info', `[${downloadId}] 下载完成，总大小 ${(totalBytes / 1024 / 1024).toFixed(1)}MB，开始合并...`);
+      log('info', `[${taskLabel}] 下载完成，总大小 ${(totalBytes / 1024 / 1024).toFixed(1)}MB，开始合并...`);
       reportProgress(downloadId, 98, total, total, '合并中...');
 
       const allBlobs = [];
@@ -387,7 +389,7 @@
       }
 
       const finalBlob = new Blob(allBlobs, { type: 'video/mp4' });
-      log('success', `[${downloadId}] 合并完成: ${(finalBlob.size / 1024 / 1024).toFixed(1)}MB`);
+      log('success', `[${taskLabel}] 合并完成: ${(finalBlob.size / 1024 / 1024).toFixed(1)}MB`);
 
       // 6. 触发下载：交给 background 用 chrome.downloads 触发（比 a.click() 稳定）
       const url = URL.createObjectURL(finalBlob);
@@ -395,7 +397,7 @@
       chrome.runtime.sendMessage({ type: 'DOWNLOAD_BLOB', downloadId, blobUrl: url, filename }, (resp) => {
         if (chrome.runtime.lastError || !resp || !resp.ok) {
           // 消息失败时 fallback 到页面内 a.click()
-          log('warn', `[${downloadId}] chrome.downloads 触发失败，回退 a.click()`);
+          log('warn', `[${taskLabel}] chrome.downloads 触发失败，回退 a.click()`);
           const a = document.createElement('a');
           a.href = url;
           a.download = filename;
@@ -415,10 +417,10 @@
     } catch (err) {
       removeAbortController(downloadId);
       if (err.name === 'AbortError') {
-        log('info', `[${downloadId}] 下载被用户取消，分片已保留可续传`);
+        log('info', `[${taskLabel}] 下载被用户取消，分片已保留可续传`);
         chrome.runtime.sendMessage({ type: 'DOWNLOAD_ERROR', downloadId, error: '已取消', done: totalDone, total });
       } else {
-        log('error', `[${downloadId}] 下载失败: ${err.message}`);
+        log('error', `[${taskLabel}] 下载失败: ${err.message}`);
         // 失败时保留 OPFS（下次可续传）
         chrome.runtime.sendMessage({
           type: 'DOWNLOAD_ERROR', downloadId, error: err.message,
