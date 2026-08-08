@@ -12,12 +12,20 @@ chrome.runtime.onInstalled.addListener(() => {
 
 chrome.contextMenus.onClicked.addListener((info, tab) => {
   if (info.menuItemId === 'vgp_sniff' && tab?.id) {
-    chrome.tabs.sendMessage(tab.id, { type: 'SCAN_VIDEOS' }, () => {
-      if (chrome.runtime.lastError) return;
+    chrome.tabs.sendMessage(tab.id, { type: 'SCAN_VIDEOS' }, (resp) => {
+      if (chrome.runtime.lastError || !resp?.urls) return;
+      // 扫描结果写入 sniffStore（之前被丢弃 → 右键嗅探/popup 刷新无效）
+      if (!sniffStore[tab.id]) sniffStore[tab.id] = { m3u8s: [], pageUrl: '', pageTitle: '' };
+      sniffStore[tab.id].pageUrl = sniffStore[tab.id].pageUrl || tab.url || '';
+      storeVideos(tab.id, resp.urls, resp.pageTitle || '');
     });
     openManager();
   }
 });
+
+function openManager() {
+  chrome.tabs.create({ url: chrome.runtime.getURL('manager/manager.html') });
+}
 
 // ============ 状态 ============
 let nextId = Date.now();
@@ -30,8 +38,8 @@ let managerPorts = [];      // manager 页的长连接端口
 // ============ 嗅探 ============
 
 function guessResolution(url) {
-  // 格式1：1080p / 720p / 2160p
-  const m = url.match(/\/(\d{3,4}p)\//i);
+  // 格式1：/1080p/、_1080p、-1080P、1080p.m3u8 等常见变体
+  const m = url.match(/(?:\/|_|-|\.)(\d{3,4}p)(?=\/|\.|_|-|\?|$)/i);
   if (m) return m[1];
   // 格式2：宽x高，如 1920x1080 / 1280x720 / 720x1080（竖屏）。
   // 保留原始 WxH，不做 p 换算——竖屏 720x1080 若显示 1080p 会产生误导。
@@ -43,6 +51,18 @@ function guessResolution(url) {
 
 function isM3u8(url) {
   return /\.m3u8(\?|$)/i.test(url.split('#')[0]);
+}
+
+// 把扫描/上报的 URL 去重写入 sniffStore（只收 m3u8）
+function storeVideos(tabId, urls, pageTitle) {
+  if (!sniffStore[tabId]) sniffStore[tabId] = { m3u8s: [], pageUrl: '', pageTitle: '' };
+  if (pageTitle) sniffStore[tabId].pageTitle = pageTitle;
+  for (const url of urls) {
+    if (!isM3u8(url)) continue; // 跳过非 m3u8 直链（MP4 等）
+    if (!sniffStore[tabId].m3u8s.some(e => e.url === url)) {
+      sniffStore[tabId].m3u8s.unshift({ url, referer: sniffStore[tabId].pageUrl, resolution: guessResolution(url), timestamp: Date.now() });
+    }
+  }
 }
 
 chrome.webRequest.onBeforeSendHeaders.addListener(
@@ -520,15 +540,24 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.type === 'REPORT_VIDEO') {
     const tabId = sender.tab?.id;
     if (!tabId) return;
-    if (!sniffStore[tabId]) sniffStore[tabId] = { m3u8s: [], pageUrl: '', pageTitle: '' };
-    if (msg.pageTitle) sniffStore[tabId].pageTitle = msg.pageTitle;
-    for (const url of msg.urls) {
-      if (!isM3u8(url)) continue; // 跳过非 m3u8 直链（MP4 等）
-      if (!sniffStore[tabId].m3u8s.some(e => e.url === url)) {
-        sniffStore[tabId].m3u8s.unshift({ url, referer: sniffStore[tabId].pageUrl, resolution: guessResolution(url), timestamp: Date.now() });
-      }
-    }
+    storeVideos(tabId, msg.urls, msg.pageTitle || '');
     return;
+  }
+
+  // popup/右键触发强制扫描：结果写入 sniffStore（供 popup GET_M3U8S 读取）
+  if (msg.type === 'SCAN_VIDEOS') {
+    const tabId = msg.tabId ?? sender.tab?.id;
+    if (!tabId) { sendResponse({ ok: false }); return; }
+    chrome.tabs.sendMessage(tabId, { type: 'SCAN_VIDEOS' }, (resp) => {
+      if (!chrome.runtime.lastError && resp?.urls) {
+        if (!sniffStore[tabId]) sniffStore[tabId] = { m3u8s: [], pageUrl: '', pageTitle: '' };
+        if (!sniffStore[tabId].pageUrl && resp.pageUrl) sniffStore[tabId].pageUrl = resp.pageUrl;
+        storeVideos(tabId, resp.urls, resp.pageTitle || '');
+      }
+      // 等扫描结果写入后再响应，popup 才不会读到旧数据
+      sendResponse({ ok: true });
+    });
+    return true;
   }
 
   if (msg.type === 'PROGRESS') {
@@ -562,7 +591,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       if (msg.total !== undefined) d.total = msg.total;
 
       // 用户操作或调度器中止的任务（已取消/已暂停/已放回队列）：保留状态，不自动重试、不覆盖
-      if (msg.error === '已取消' || d.status === 'paused' || d.status === 'cancelled' || d.status === 'queued') {
+      if (msg.error === '已取消' || (msg.error || '').includes('已取消') || d.status === 'paused' || d.status === 'cancelled' || d.status === 'queued') {
         persist();
         broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
         return;
@@ -602,44 +631,65 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 // DOWNLOAD_BLOB 触发的下载任务，其结果决定扩展任务最终状态：
 // complete → 真正完成（文件已存盘）→ 通知 content revoke blob + 清理分片
 // interrupted → 失败（blob 保留，用户可在下载管理器重试，重试成功后 complete 分支转完成）
-chrome.downloads.onChanged.addListener((delta) => {
-  if (!delta.state) return;
+// 注意：SW 空闲重启后 downloads 对象是异步加载的，信号可能先于加载到达。
+// 若加载未完成就处理 complete 会因 d 不存在而丢信号（任务永远卡 exporting → 重下）。
+// 因此：未加载完成时先把信号缓存起来，加载完成后重放。
+let loaded = false;
+const pendingDownloadSignals = [];
+
+function handleDownloadSignal(delta) {
   chrome.storage.session.get('blob_map', s => {
     const m = s.blob_map || {};
     const rec = m[delta.id];
     if (!rec) return;
     const d = downloads[rec.downloadId];
     if (delta.state.current === 'complete') {
+      if (!d) {
+        // 加载完成后仍找不到任务 = 任务已被用户删除，丢弃映射
+        delete m[delta.id];
+        chrome.storage.session.set({ blob_map: m });
+        return;
+      }
       delete m[delta.id];
       chrome.storage.session.set({ blob_map: m });
-      if (d) {
-        d.status = 'completed';
-        d.pct = 100;
-        d.fileName = rec.filename;
-        d.speed = '';
-        tabActive[rec.tabId] = null;
-        persist();
-        broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
-      }
+      d.status = 'completed';
+      d.pct = 100;
+      d.fileName = rec.filename;
+      d.speed = '';
+      tabActive[rec.tabId] = null;
+      persist();
+      broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
       log('info', `[下载器] Chrome 下载项 #${delta.id} 完成 → #${rec.downloadId} 标为已完成`);
       // 通知 content：revoke blob + 清理分片
       chrome.tabs.sendMessage(rec.tabId, { type: 'FINALIZE_DOWNLOAD', downloadId: rec.downloadId, blobUrl: rec.blobUrl }).catch(() => {});
       maybeDispatch();
     } else if (delta.state.current === 'interrupted') {
-      if (d) {
-        d.status = 'failed';
-        d.error = 'Chrome 下载中断，请在下载管理器点击重试';
-        d.speed = '';
-        tabActive[rec.tabId] = null;
-        persist();
-        broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
+      if (!d) {
+        delete m[delta.id];
+        chrome.storage.session.set({ blob_map: m });
+        return;
       }
+      d.status = 'failed';
+      d.error = 'Chrome 下载中断，请在下载管理器点击重试';
+      d.speed = '';
+      tabActive[rec.tabId] = null;
+      persist();
+      broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
       log('warn', `[下载器] Chrome 下载项 #${delta.id} 中断 → #${rec.downloadId} 标为失败（blob 保留可重试）`);
       maybeDispatch();
     } else {
       log('debug', `[下载器] Chrome 下载项 #${delta.id} 状态变化: ${delta.state.current}（未处理）`);
     }
   });
+}
+
+chrome.downloads.onChanged.addListener((delta) => {
+  if (!delta.state) return;
+  if (!loaded) {
+    pendingDownloadSignals.push(delta);
+    return;
+  }
+  handleDownloadSignal(delta);
 });
 
 // ============ Manager 长连接 ============
@@ -688,8 +738,9 @@ chrome.storage.local.get('vgp_downloads', data => {
           d.error = '扩展重启，可重试续传';
         } else if (d.status === 'exporting') {
           // 导出中：blob 已随页面销毁，Chrome 下载任务也已中断
+          // （文件可能已部分/完整保存到下载目录，请先检查再决定是否重下）
           d.status = 'failed';
-          d.error = '浏览器重启，导出未完成，请重新下载';
+          d.error = '浏览器重启，请检查下载目录是否已保存，未完成再重新下载';
         }
       }
     }
@@ -706,6 +757,11 @@ chrome.storage.local.get('vgp_downloads', data => {
     }
     persist();
     log('info', `[恢复] ${s.sw_marker ? 'SW 空闲重启' : '浏览器重启'}，重建队列 queued=${list.filter(d => d.status === 'queued').length}，活跃=${Object.keys(tabActive).length}`);
+
+    // downloads 加载完成：重放 SW 休眠期间缓存的下载信号（防止 complete 信号丢失）
+    loaded = true;
+    for (const sig of pendingDownloadSignals.splice(0)) handleDownloadSignal(sig);
+
     maybeDispatch();
 
     // 启动兜底清理：通知所有打开的页面删除孤儿分片（不属于任何活跃任务的分片）

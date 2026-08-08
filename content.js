@@ -96,16 +96,22 @@
     await opfsDelete(`meta_${downloadId}.json`);
   }
 
-  // ============ 重试 fetch ============
+  // ============ 重试 fetch（含 20s 超时，防 TCP 挂起卡死批次） ============
   async function fetchWithRetry(url, retries = 3, signal = null, extraHeaders = {}) {
     for (let attempt = 1; attempt <= retries; attempt++) {
       if (signal?.aborted) throw new DOMException('已取消', 'AbortError');
+      const timeoutSignal = AbortSignal.timeout(20000); // 20s 无响应 → 超时按失败重试
+      const sig = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
       try {
-        const resp = await fetch(url, { signal, headers: extraHeaders });
+        const resp = await fetch(url, { signal: sig, headers: extraHeaders });
         if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
         return resp;
       } catch (err) {
-        if (err.name === 'AbortError') throw err;
+        if (err.name === 'AbortError' && signal?.aborted) throw err; // 用户取消，直接抛
+        if (err.name === 'AbortError') {
+          // 超时（signal 未取消）：包装成普通错误按失败重试，不能被误判为用户取消
+          err = new Error('下载超时（20s 无响应）');
+        }
         if (attempt === retries) throw err;
         const delay = Math.min(1000 * Math.pow(2, attempt - 1), 8000);
         log('warn', `重试 ${attempt}/${retries}，等待 ${delay}ms`);
@@ -347,6 +353,8 @@
             }
             batchChunks[i] = segData;
           } catch (err) {
+            // 取消信号（AbortError）直接上抛，不能被包成普通错误 → 否则 background 无法识别"已取消"，会误触发自动重试
+            if (err.name === 'AbortError') throw err;
             throw new Error(`分片 ${segStart + i + 1}/${total} 多次重试失败: ${err.message}`);
           }
         }
@@ -383,7 +391,7 @@
 
       // 6. 触发下载：交给 background 用 chrome.downloads 触发（比 a.click() 稳定）
       const url = URL.createObjectURL(finalBlob);
-      const filename = guessName(pageTitle || document.title, m3u8Url);
+      const filename = guessName(pageTitle || document.title);
       chrome.runtime.sendMessage({ type: 'DOWNLOAD_BLOB', downloadId, blobUrl: url, filename }, (resp) => {
         if (chrome.runtime.lastError || !resp || !resp.ok) {
           // 消息失败时 fallback 到页面内 a.click()
@@ -427,7 +435,7 @@
     return bytesPerSec.toFixed(0) + ' B/s';
   }
 
-  function guessName(pageTitle, url) {
+  function guessName(pageTitle) {
     if (pageTitle) {
       const cleaned = pageTitle.replace(/[\\/:*?"<>|]/g, '_').substring(0, 120).trim();
       if (cleaned) return cleaned + '.mp4';
@@ -469,7 +477,7 @@
       return;
     }
     if (msg.type === 'SCAN_VIDEOS') {
-      sendResponse({ urls: extractVideoSources() });
+      sendResponse({ urls: extractVideoSources(), pageUrl: location.href, pageTitle: document.title });
       return;
     }
     // Chrome 下载完成信号：revoke blob + 清理本任务分片（background 在下载 complete 后发送）

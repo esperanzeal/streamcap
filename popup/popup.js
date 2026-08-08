@@ -72,8 +72,14 @@ $('#btnRefresh').addEventListener('click', () => {
   chrome.tabs.query({ active: true, currentWindow: true }, tabs => {
     currentPageUrl = tabs[0]?.url || '';
     currentPageTitle = tabs[0]?.title || '';
-    chrome.runtime.sendMessage({ type: 'GET_M3U8S' }, data => renderList(data || {}));
-    if (tabs[0]?.id) chrome.tabs.sendMessage(tabs[0].id, { type: 'SCAN_VIDEOS' }, () => {});
+    const tid = tabs[0]?.id;
+    const refresh = () => chrome.runtime.sendMessage({ type: 'GET_M3U8S' }, data => renderList(data || {}));
+    if (tid) {
+      // 走 background 的 SCAN_VIDEOS：结果写入 sniffStore 后再读取，刷新才真正生效
+      chrome.runtime.sendMessage({ type: 'SCAN_VIDEOS', tabId: tid }, refresh);
+    } else {
+      refresh();
+    }
   });
 });
 $('#btnClear').addEventListener('click', () => {
