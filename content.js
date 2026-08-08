@@ -552,4 +552,125 @@
   new MutationObserver(debouncedScan).observe(document.body || document.documentElement, {
     childList: true, subtree: true,
   });
+
+  // ============ 合并导出浮层按钮 ============
+  // OPFS 按 origin 隔离：分片存在"下载该视频的网站页面"的 OPFS 里，
+  // 扩展页面读不到 → 必须在视频网站页面里触发合并（本页 content script 可读本页 OPFS）。
+  // 点击后 showSaveFilePicker 选保存位置，流式逐批写盘：不占内存、不经过 Chrome 下载器。
+  function injectMergeButton() {
+    if (document.getElementById('vgp-merge-btn')) return;
+    const btn = document.createElement('button');
+    btn.id = 'vgp-merge-btn';
+    btn.textContent = '🗜️ 合并导出';
+    btn.title = 'StreamCap：把本网站缓存的下载分片直接合并保存到磁盘（不占内存）';
+    btn.style.cssText = 'position:fixed;right:16px;bottom:60px;z-index:2147483647;background:#3b82f6;color:#fff;border:0;border-radius:8px;padding:10px 14px;font:13px system-ui,sans-serif;cursor:pointer;box-shadow:0 2px 10px rgba(0,0,0,.45)';
+    btn.addEventListener('click', onMergeClick);
+    (document.body || document.documentElement).appendChild(btn);
+  }
+
+  function taskDisplayName(d) {
+    try {
+      const base = d.url.split('/').pop().split('?')[0];
+      if (base) return decodeURIComponent(base);
+    } catch {}
+    return '任务#' + d.id;
+  }
+
+  async function onMergeClick() {
+    const root = await navigator.storage.getDirectory();
+    const metaIds = new Set();
+    for await (const [name] of root) {
+      const m = name.match(/^vgp_meta_(\d+)\.json$/);
+      if (m) metaIds.add(Number(m[1]));
+    }
+    if (!metaIds.size) {
+      alert('本网站没有分片缓存。分片存在下载该视频的网站页面里（OPFS 按网站隔离），请到对应网站页面再试。');
+      return;
+    }
+    const list = await new Promise(res => chrome.runtime.sendMessage({ type: 'GET_DOWNLOADS' }, r => res(r || [])));
+    const tasks = (list || []).filter(d => metaIds.has(d.id));
+    if (!tasks.length) {
+      alert('找到分片但匹配不到任务（任务可能已被删除，分片将随清理回收）。');
+      return;
+    }
+    let target = tasks[0];
+    if (tasks.length > 1) {
+      const pick = prompt('选择要合并的任务：\n' + tasks.map((d, i) => `${i + 1}. ${taskDisplayName(d)}`).join('\n'));
+      const idx = parseInt(pick, 10) - 1;
+      if (isNaN(idx) || !tasks[idx]) return;
+      target = tasks[idx];
+    }
+    await mergeFromOpfs(target);
+  }
+
+  async function mergeFromOpfs(d) {
+    const root = await navigator.storage.getDirectory();
+    let meta;
+    try {
+      meta = JSON.parse(await (await (await root.getFileHandle(OPFS_PREFIX + `meta_${d.id}.json`)).getFile()).text());
+    } catch {
+      alert('读取分片元数据失败，分片可能已被清理。');
+      return;
+    }
+    const totalBatches = Math.ceil(meta.totalSegments / (meta.batchSize || 80));
+
+    let handle;
+    try {
+      handle = await showSaveFilePicker({
+        suggestedName: taskDisplayName(d),
+        types: [{ description: '视频文件', accept: { 'video/mp4': ['.mp4'], 'video/x-matroska': ['.mkv'] } }],
+      });
+    } catch (e) {
+      if (e.name === 'AbortError') return;
+      alert('选择保存位置失败: ' + e.message);
+      return;
+    }
+
+    // 扫描批次，确认完整 + 总大小
+    const sizes = new Array(totalBatches);
+    let totalBytes = 0;
+    for (let i = 0; i < totalBatches; i++) {
+      try {
+        const f = await (await root.getFileHandle(OPFS_PREFIX + `dl_${d.id}_batch_${i}.blob`)).getFile();
+        sizes[i] = f.size;
+        totalBytes += f.size;
+      } catch { sizes[i] = -1; }
+    }
+    const missing = sizes.map((s, i) => s < 0 ? i : -1).filter(i => i >= 0);
+    if (missing.length) {
+      alert(`缺少 ${missing.length} 个批次（如 ${missing[0] + 1} 等）。先到下载管理对该任务点"继续/重试"补齐分片后再合并。`);
+      return;
+    }
+
+    const writable = await handle.createWritable();
+    let wrote = 0;
+    const t0 = Date.now();
+    const fmt = b => (b / 1024 / 1024 / 1024).toFixed(1) + 'GB';
+    try {
+      for (let i = 0; i < totalBatches; i++) {
+        const buf = await (await (await root.getFileHandle(OPFS_PREFIX + `dl_${d.id}_batch_${i}.blob`)).getFile()).arrayBuffer();
+        await writable.write(buf);
+        wrote += buf.byteLength;
+        if (i % 10 === 0 || i === totalBatches - 1) {
+          const secs = Math.max(1, (Date.now() - t0) / 1000);
+          log('info', `[合并] ${taskDisplayName(d)} ${fmt(wrote)}/${fmt(totalBytes)} 批次 ${i + 1}/${totalBatches} (${(wrote / 1024 / 1024 / secs).toFixed(0)}MB/s)`);
+        }
+      }
+      await writable.close();
+      const secs = ((Date.now() - t0) / 1000).toFixed(0);
+      log('success', `[合并] ${taskDisplayName(d)} 合并完成 ${fmt(wrote)}，用时 ${secs} 秒`);
+      alert(`✅ 合并完成：${fmt(wrote)}，用时 ${secs} 秒。分片保留在缓存中，确认文件无误后可到下载管理删除该任务以清理。`);
+    } catch (e) {
+      log('error', `[合并] ${taskDisplayName(d)} 失败: ${e.message}`);
+      alert('合并失败: ' + e.message + '（分片未动，可重新选择位置再来）');
+      try { await writable.abort(); } catch {}
+    }
+  }
+
+  // 页面就绪后注入按钮
+  const tryInject = () => {
+    if (document.body) { injectMergeButton(); return; }
+    setTimeout(tryInject, 500);
+  };
+  tryInject();
 })();

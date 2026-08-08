@@ -40,7 +40,7 @@ async function loadTasks() {
 function render() {
   const box = $('#tasks');
   if (!downloads.length) {
-    box.innerHTML = '<p class="empty">没有找到分片缓存。分片存在的前提：任务还在下载管理列表里（删除任务会清掉分片）。</p>';
+    box.innerHTML = '<p class="empty">这里无法直接读取网站页面的分片缓存（浏览器按网站隔离存储）。<br>👉 请打开下载该视频的网站（如 missav.ws），页面右下角点 <b>🗜️ 合并导出</b> 按钮操作。</p>';
     return;
   }
   box.innerHTML = downloads.map(d => `
