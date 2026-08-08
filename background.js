@@ -457,6 +457,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         d.status = 'exporting';
         d.pct = 99;
         d.error = null;
+        d.speed = ''; // 清除"合并中..."等临时文案
         persist();
         broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
       }
@@ -566,6 +567,7 @@ chrome.downloads.onChanged.addListener((delta) => {
         d.status = 'completed';
         d.pct = 100;
         d.fileName = rec.filename;
+        d.speed = '';
         tabActive[rec.tabId] = null;
         persist();
         broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
@@ -577,6 +579,7 @@ chrome.downloads.onChanged.addListener((delta) => {
       if (d) {
         d.status = 'failed';
         d.error = 'Chrome 下载中断，请在下载管理器点击重试';
+        d.speed = '';
         tabActive[rec.tabId] = null;
         persist();
         broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
