@@ -2,6 +2,7 @@
   "manifest_version": 3,
   "name": "StreamCap",
   "version": "3.0.0",
+  "minimum_chrome_version": "116",
   "description": "解决 NDM 无法下载的鉴权 m3u8：利用浏览器 Cookie/Origin/Referer 自动携带，支持 AES-128 解密，4 路并行分片 + 断点续传",
   "permissions": ["webRequest", "storage", "tabs", "scripting", "contextMenus", "downloads"],
   "host_permissions": ["<all_urls>"],
