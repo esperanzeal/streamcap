@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>StreamCap 日志</title>
+<style>
+  body { background:#0d1117; color:#c9d1d9; font:13px/1.5 "Segoe UI",system-ui,sans-serif; margin:0; padding:16px 20px; }
+  h1 { font-size:16px; color:#e6edf3; margin:0 0 12px; }
+  .toolbar { display:flex; align-items:center; gap:8px; margin-bottom:12px; flex-wrap:wrap; }
+  .toolbar input[type="date"] { background:#21262d; color:#c9d1d9; border:1px solid #30363d; border-radius:6px; padding:5px 8px; font-size:13px; }
+  .toolbar button { background:#21262d; color:#c9d1d9; border:1px solid #30363d; border-radius:6px; padding:5px 12px; font-size:13px; cursor:pointer; }
+  .toolbar button:hover { background:#30363d; }
+  .toolbar button.danger { color:#f85149; border-color:#f8514940; }
+  .toolbar .count { color:#8b949e; font-size:12px; margin-left:auto; }
+  #lines { background:#161b22; border:1px solid #30363d; border-radius:8px; padding:10px 12px; font-family:Consolas,"Courier New",monospace; font-size:12px; white-space:pre-wrap; word-break:break-all; min-height:300px; max-height:70vh; overflow-y:auto; }
+  .l-info { color:#c9d1d9; } .l-warn { color:#d29922; } .l-error { color:#f85149; } .l-success { color:#3fb950; } .l-debug { color:#8b949e; }
+  .empty { color:#8b949e; text-align:center; padding:40px 0; }
+</style>
+</head>
+<body>
+  <h1>📋 StreamCap 日志</h1>
+  <div class="toolbar">
+    <input type="date" id="date">
+    <button id="btnPrev">← 前一天</button>
+    <button id="btnNext">后一天 →</button>
+    <button id="btnToday">今天</button>
+    <button id="btnExport">⬇️ 导出当天日志</button>
+    <button class="danger" id="btnClear">🗑 清空当天</button>
+    <span class="count" id="count"></span>
+  </div>
+  <div id="lines"><div class="empty">加载中...</div></div>
+<script src="logger.js"></script>
+</body>
+</html>

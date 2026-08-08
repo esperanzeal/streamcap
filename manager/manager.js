@@ -133,6 +133,10 @@ maxConcSelect.addEventListener('change', () => {
   act({ type: 'SET_MAX_CONCURRENT' });
 });
 
+// 打开日志页
+$('#btnLog').addEventListener('click', () => {
+  chrome.tabs.create({ url: chrome.runtime.getURL('logger/logger.html') });
+});
 // 全部暂停：发后台统一处理
 $('#btnPauseAll').addEventListener('click', () => {
   act({ type: 'PAUSE_ALL' });

@@ -3,9 +3,21 @@
 (() => {
   'use strict';
 
-  // ============ 日志（仅 console 输出，不再写 storage） ============
+  // ============ 日志（console + 按日期写入 storage.local） ============
   function log(level, msg) {
-    console[level === 'error' ? 'error' : level === 'warn' ? 'warn' : 'log']('[VGP]', msg);
+    try {
+      console[level === 'error' ? 'error' : level === 'warn' ? 'warn' : 'log']('[VGP]', msg);
+    } catch {}
+    try {
+      const now = new Date();
+      const key = 'vgp_logs_' + now.toISOString().slice(0, 10); // vgp_logs_YYYY-MM-DD
+      chrome.storage.local.get(key, data => {
+        const arr = data[key] || [];
+        arr.push(`[${now.toLocaleTimeString()}] [${level.toUpperCase()}] [页面] ${msg}`);
+        if (arr.length > 5000) arr.splice(0, arr.length - 5000);
+        chrome.storage.local.set({ [key]: arr });
+      });
+    } catch { /* 日志失败不影响主流程 */ }
   }
 
   // ============ AbortController 管理 ============

@@ -138,6 +138,31 @@ function broadcast(msg) {
   chrome.runtime.sendMessage(msg).catch(() => {});
 }
 
+// ============ 日志（按日期分文件，存 storage.local，防爆上限 5000 条/天） ============
+function log(level, msg) {
+  try {
+    const now = new Date();
+    const key = 'vgp_logs_' + now.toISOString().slice(0, 10); // vgp_logs_YYYY-MM-DD
+    chrome.storage.local.get(key, data => {
+      const arr = data[key] || [];
+      arr.push(`[${now.toLocaleTimeString()}] [${level.toUpperCase()}] ${msg}`);
+      if (arr.length > 5000) arr.splice(0, arr.length - 5000);
+      chrome.storage.local.set({ [key]: arr });
+    });
+  } catch { /* 日志失败不影响主流程 */ }
+}
+
+// 读取某天的日志（manager/logger 页用）
+function getLogs(dateStr, callback) {
+  const key = 'vgp_logs_' + dateStr;
+  chrome.storage.local.get(key, data => callback(data[key] || []));
+}
+
+// 清空某天的日志
+function clearLogs(dateStr, callback) {
+  chrome.storage.local.remove('vgp_logs_' + dateStr, () => callback && callback());
+}
+
 // ============ 队列管理 ============
 
 function enqueue(tabId, url, referer, resolution, pageUrl, pageTitle) {
@@ -154,6 +179,7 @@ function enqueue(tabId, url, referer, resolution, pageUrl, pageTitle) {
   tabQueues[tabId].push(id);
   persist();
   broadcast({ type: 'DOWNLOAD_UPDATE', download: downloads[id] });
+  log('info', `[入队] #${id} ${d.url.substring(0, 80)}`);
   maybeDispatch();
   return id;
 }
@@ -244,6 +270,7 @@ async function maybeDispatch() {
     q.splice(idx, 1);
     dispatchTab(c.tabId, c.did);
     slots--;
+    log('info', `[调度] 派发 #${c.did} → tab${c.tabId}（并发 ${max}，活跃 ${activeCount + 1}）`);
   }
 }
 
@@ -422,6 +449,16 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true;
   }
 
+  // 日志查询 / 清空（logger 页用）
+  if (msg.type === 'GET_LOGS') {
+    getLogs(msg.date, lines => sendResponse({ lines }));
+    return true;
+  }
+  if (msg.type === 'CLEAR_LOGS') {
+    clearLogs(msg.date, () => sendResponse({ ok: true }));
+    return true;
+  }
+
   // content script 请求：用 chrome.downloads 触发 blob 下载
   // 不立即标完成——等 chrome.downloads.onChanged 的 complete/interrupted 信号
   if (msg.type === 'DOWNLOAD_BLOB') {
@@ -442,6 +479,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           persist();
           broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
         }
+        log('error', `[导出] #${downloadId} chrome.downloads 触发失败: ${chrome.runtime.lastError?.message || '未知'}`);
         sendResponse({ ok: false });
         return;
       }
@@ -461,6 +499,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         persist();
         broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
       }
+      log('info', `[导出] #${downloadId} → Chrome 下载项 #${itemId} 开始，文件名: ${filename}`);
       sendResponse({ ok: true });
     });
     return true;
@@ -572,6 +611,7 @@ chrome.downloads.onChanged.addListener((delta) => {
         persist();
         broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
       }
+      log('info', `[下载器] Chrome 下载项 #${delta.id} 完成 → #${rec.downloadId} 标为已完成`);
       // 通知 content：revoke blob + 清理分片
       chrome.tabs.sendMessage(rec.tabId, { type: 'FINALIZE_DOWNLOAD', downloadId: rec.downloadId, blobUrl: rec.blobUrl }).catch(() => {});
       maybeDispatch();
@@ -584,7 +624,10 @@ chrome.downloads.onChanged.addListener((delta) => {
         persist();
         broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
       }
+      log('warn', `[下载器] Chrome 下载项 #${delta.id} 中断 → #${rec.downloadId} 标为失败（blob 保留可重试）`);
       maybeDispatch();
+    } else {
+      log('debug', `[下载器] Chrome 下载项 #${delta.id} 状态变化: ${delta.state.current}（未处理）`);
     }
   });
 });
@@ -623,11 +666,9 @@ chrome.storage.local.get('vgp_downloads', data => {
     if (s.sw_marker) {
       // SW 空闲重启：任务状态保持不变（content script 可能仍在下载）
       // 唯一例外：retrying 的退避 setTimeout 已随 SW 销毁，放回队列等待重新调度
-      let needResched = false;
       for (const d of list) {
-        if (d.status === 'retrying') { d.status = 'queued'; needResched = true; }
+        if (d.status === 'retrying') { d.status = 'queued'; d.error = null; }
       }
-      if (needResched) { persist(); maybeDispatch(); }
     } else {
       // 浏览器重启：下载进程已断开，置为可续传暂停
       chrome.storage.session.set({ sw_marker: true });
@@ -641,8 +682,21 @@ chrome.storage.local.get('vgp_downloads', data => {
           d.error = '浏览器重启，导出未完成，请重新下载';
         }
       }
-      persist();
     }
+
+    // ★ 重建内存队列/活跃表：SW 重启后全局 tabQueues/tabActive 已清空，
+    //   若不重建，queued 任务永远不会被 maybeDispatch 派发（任务卡死等待队列）
+    for (const d of list) {
+      if (d.status === 'queued') {
+        if (!tabQueues[d.tabId]) tabQueues[d.tabId] = [];
+        if (!tabQueues[d.tabId].includes(d.id)) tabQueues[d.tabId].push(d.id);
+      } else if (d.status === 'downloading' || d.status === 'exporting' || d.status === 'retrying') {
+        tabActive[d.tabId] = d.id;
+      }
+    }
+    persist();
+    log('info', `[恢复] ${s.sw_marker ? 'SW 空闲重启' : '浏览器重启'}，重建队列 queued=${list.filter(d => d.status === 'queued').length}，活跃=${Object.keys(tabActive).length}`);
+    maybeDispatch();
 
     // 启动兜底清理：通知所有打开的页面删除孤儿分片（不属于任何活跃任务的分片）
     const activeIds = list.map(d => d.id);
