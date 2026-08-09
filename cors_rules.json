@@ -1,0 +1,18 @@
+[
+  {
+    "id": 1,
+    "priority": 1,
+    "action": {
+      "type": "modifyHeaders",
+      "responseHeaders": [
+        { "header": "Access-Control-Allow-Origin", "operation": "set", "value": "*" },
+        { "header": "Access-Control-Allow-Methods", "operation": "set", "value": "GET, HEAD, OPTIONS" },
+        { "header": "Access-Control-Allow-Headers", "operation": "set", "value": "*" }
+      ]
+    },
+    "condition": {
+      "urlFilter": "||v.imgcaches.cc",
+      "resourceTypes": ["xmlhttprequest", "media", "other"]
+    }
+  }
+]
