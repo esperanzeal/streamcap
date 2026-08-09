@@ -621,6 +621,13 @@
   }
 
   async function mergeFromOpfs(d) {
+    // 0. 任务若还在下载，下载循环会持续改写分片文件 → 合并必冲突，先提示
+    const fresh = await new Promise(res => chrome.runtime.sendMessage({ type: 'GET_DOWNLOADS' }, r => res(r || [])));
+    const cur = (fresh || []).find(x => x.id === d.id);
+    if (cur && ['downloading', 'queued', 'retrying'].includes(cur.status)) {
+      if (!confirm(`任务「${taskDisplayName(d)}」正在下载中（${cur.status}），下载会持续改写分片文件，合并可能失败。\n\n建议：先到下载管理暂停该任务再回来合并。\n\n仍然继续合并吗？`)) return;
+    }
+
     const root = await navigator.storage.getDirectory();
     let meta;
     try {
@@ -634,7 +641,7 @@
     let handle;
     try {
       handle = await showSaveFilePicker({
-        suggestedName: taskDisplayName(d),
+        suggestedName: taskDisplayName(d).replace(/\.m3u8$/i, '.mp4'),
         types: [{ description: '视频文件', accept: { 'video/mp4': ['.mp4'], 'video/x-matroska': ['.mkv'] } }],
       });
     } catch (e) {
@@ -643,14 +650,28 @@
       return;
     }
 
+    // 读批次文件，带重试：InvalidStateError（句柄快照失效/文件被并发改写）多为瞬时
+    async function readBatch(i) {
+      let lastErr;
+      for (let attempt = 0; attempt < 3; attempt++) {
+        try {
+          const f = await (await root.getFileHandle(OPFS_PREFIX + `dl_${d.id}_batch_${i}.blob`)).getFile();
+          return await f.arrayBuffer();
+        } catch (e) {
+          lastErr = e;
+          await new Promise(r => setTimeout(r, 300 * (attempt + 1)));
+        }
+      }
+      throw lastErr;
+    }
+
     // 扫描批次，确认完整 + 总大小
     const sizes = new Array(totalBatches);
     let totalBytes = 0;
     for (let i = 0; i < totalBatches; i++) {
       try {
-        const f = await (await root.getFileHandle(OPFS_PREFIX + `dl_${d.id}_batch_${i}.blob`)).getFile();
-        sizes[i] = f.size;
-        totalBytes += f.size;
+        sizes[i] = (await readBatch(i)).byteLength;
+        totalBytes += sizes[i];
       } catch { sizes[i] = -1; }
     }
     const missing = sizes.map((s, i) => s < 0 ? i : -1).filter(i => i >= 0);
@@ -661,11 +682,13 @@
 
     const writable = await handle.createWritable();
     let wrote = 0;
+    let currentBatch = 0;
     const t0 = Date.now();
     const fmt = b => (b / 1024 / 1024 / 1024).toFixed(1) + 'GB';
     try {
       for (let i = 0; i < totalBatches; i++) {
-        const buf = await (await (await root.getFileHandle(OPFS_PREFIX + `dl_${d.id}_batch_${i}.blob`)).getFile()).arrayBuffer();
+        currentBatch = i;
+        const buf = await readBatch(i);
         await writable.write(buf);
         wrote += buf.byteLength;
         if (i % 10 === 0 || i === totalBatches - 1) {
@@ -678,8 +701,8 @@
       log('success', `[合并] ${taskDisplayName(d)} 合并完成 ${fmt(wrote)}，用时 ${secs} 秒`);
       alert(`✅ 合并完成：${fmt(wrote)}，用时 ${secs} 秒。分片保留在缓存中，确认文件无误后可到下载管理删除该任务以清理。`);
     } catch (e) {
-      log('error', `[合并] ${taskDisplayName(d)} 失败: ${e.message}`);
-      alert('合并失败: ' + e.message + '（分片未动，可重新选择位置再来）');
+      log('error', `[合并] ${taskDisplayName(d)} 失败（批次 ${currentBatch + 1}/${totalBatches}）: ${e.message}`);
+      alert(`合并失败（批次 ${currentBatch + 1}/${totalBatches}）: ${e.message}\n\n分片未动，可重新选择位置再来。若任务正在下载，请先暂停它再合并。`);
       try { await writable.abort(); } catch {}
     }
   }
