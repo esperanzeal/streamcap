@@ -557,16 +557,33 @@
   // OPFS 按 origin 隔离：分片存在"下载该视频的网站页面"的 OPFS 里，
   // 扩展页面读不到 → 必须在视频网站页面里触发合并（本页 content script 可读本页 OPFS）。
   // 点击后 showSaveFilePicker 选保存位置，流式逐批写盘：不占内存、不经过 Chrome 下载器。
-  function injectMergeButton() {
-    if (document.getElementById('vgp-merge-btn')) return;
-    const btn = document.createElement('button');
-    btn.id = 'vgp-merge-btn';
-    btn.textContent = '🗜️ 合并导出';
-    btn.title = 'StreamCap：把本网站缓存的下载分片直接合并保存到磁盘（不占内存）';
-    btn.style.cssText = 'position:fixed;right:16px;bottom:60px;z-index:2147483647;background:#3b82f6;color:#fff;border:0;border-radius:8px;padding:10px 14px;font:13px system-ui,sans-serif;cursor:pointer;box-shadow:0 2px 10px rgba(0,0,0,.45)';
-    btn.addEventListener('click', onMergeClick);
-    (document.body || document.documentElement).appendChild(btn);
+  // 显示与否由 vgp_settings.mergeButton 开关控制（默认开）。
+  function ensureMergeButton(show) {
+    const existing = document.getElementById('vgp-merge-btn');
+    if (show && !existing) {
+      const btn = document.createElement('button');
+      btn.id = 'vgp-merge-btn';
+      btn.textContent = '🗜️ 合并导出';
+      btn.title = 'StreamCap：把本网站缓存的下载分片直接合并保存到磁盘（不占内存）';
+      btn.style.cssText = 'position:fixed;right:16px;bottom:60px;z-index:2147483647;background:#3b82f6;color:#fff;border:0;border-radius:8px;padding:10px 14px;font:13px system-ui,sans-serif;cursor:pointer;box-shadow:0 2px 10px rgba(0,0,0,.45)';
+      btn.addEventListener('click', onMergeClick);
+      (document.body || document.documentElement).appendChild(btn);
+    } else if (!show && existing) {
+      existing.remove();
+    }
   }
+
+  async function initMergeButton() {
+    const s = await chrome.storage.local.get('vgp_settings');
+    ensureMergeButton((s.vgp_settings || {}).mergeButton !== false);
+  }
+
+  // 开关变化 → 已打开的页面实时显示/隐藏按钮
+  chrome.storage.onChanged.addListener((changes, area) => {
+    if (area === 'local' && changes.vgp_settings && changes.vgp_settings.newValue) {
+      ensureMergeButton(changes.vgp_settings.newValue.mergeButton !== false);
+    }
+  });
 
   function taskDisplayName(d) {
     try {
@@ -667,9 +684,9 @@
     }
   }
 
-  // 页面就绪后注入按钮
+  // 页面就绪后注入按钮（受开关控制）
   const tryInject = () => {
-    if (document.body) { injectMergeButton(); return; }
+    if (document.body) { initMergeButton(); return; }
     setTimeout(tryInject, 500);
   };
   tryInject();

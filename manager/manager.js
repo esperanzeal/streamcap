@@ -129,6 +129,8 @@ chrome.storage.local.get('vgp_settings', s => {
   threadsSelect.value = settings.concurrency || 4;
   // 注意：0 = 无上限，必须用 undefined 判断
   maxConcSelect.value = (settings.maxConcurrent === undefined || settings.maxConcurrent === null) ? 4 : settings.maxConcurrent;
+  // 页面合并按钮开关：默认开（undefined 视为 true）
+  $('#mergeBtnToggle').checked = settings.mergeButton !== false;
 });
 function saveSettings(patch) {
   chrome.storage.local.get('vgp_settings', s => {
@@ -143,6 +145,10 @@ maxConcSelect.addEventListener('change', () => {
   saveSettings({ maxConcurrent: parseInt(maxConcSelect.value) });
   // 消息携带新值，避免后台读取 storage 时的时序竞态
   act({ type: 'SET_MAX_CONCURRENT', value: parseInt(maxConcSelect.value) });
+});
+// 页面合并按钮开关：只写 settings，content script 监听 storage 变化实时显示/隐藏
+$('#mergeBtnToggle').addEventListener('change', () => {
+  saveSettings({ mergeButton: $('#mergeBtnToggle').checked });
 });
 
 // 打开日志页
