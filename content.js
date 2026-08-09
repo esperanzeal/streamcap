@@ -702,7 +702,12 @@
       alert(`✅ 合并完成：${fmt(wrote)}，用时 ${secs} 秒。分片保留在缓存中，确认文件无误后可到下载管理删除该任务以清理。`);
     } catch (e) {
       log('error', `[合并] ${taskDisplayName(d)} 失败（批次 ${currentBatch + 1}/${totalBatches}）: ${e.message}`);
-      alert(`合并失败（批次 ${currentBatch + 1}/${totalBatches}）: ${e.message}\n\n分片未动，可重新选择位置再来。若任务正在下载，请先暂停它再合并。`);
+      // 数据已基本写完但落盘确认失败：临时文件(.crswap)里可能就是完整成品
+      if (totalBytes > 0 && wrote / totalBytes > 0.999) {
+        alert(`⚠️ 合并数据已基本写满（${fmt(wrote)}/${fmt(totalBytes)}）但最后落盘确认失败：${e.message}\n\n目标文件夹里通常有一个 <文件名>.crswap 临时文件——检查它的大小，若接近 ${fmt(totalBytes)} 就直接改后缀为 .mp4 即可播放，无需重新合并。`);
+      } else {
+        alert(`合并失败（批次 ${currentBatch + 1}/${totalBatches}）: ${e.message}\n\n分片未动，可重新选择位置再来。若任务正在下载，请先暂停它再合并。`);
+      }
       try { await writable.abort(); } catch {}
     }
   }
