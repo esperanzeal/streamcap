@@ -155,10 +155,6 @@ $('#mergeBtnToggle').addEventListener('change', () => {
 $('#btnLog').addEventListener('click', () => {
   chrome.tabs.create({ url: chrome.runtime.getURL('logger/logger.html') });
 });
-// 打开分片合并导出工具页
-$('#btnMerge').addEventListener('click', () => {
-  chrome.tabs.create({ url: chrome.runtime.getURL('merge/merge.html') });
-});
 // 全部暂停：发后台统一处理
 $('#btnPauseAll').addEventListener('click', () => {
   act({ type: 'PAUSE_ALL' });
