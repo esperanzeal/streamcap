@@ -214,8 +214,60 @@
     chrome.runtime.sendMessage({ type: 'PROGRESS', downloadId, pct, done, total, speed }).catch(() => {});
   }
 
+  // ============ SW 保活心跳 ============
+  // MV3：SW 空闲约 30s 被 Chrome 回收。下载跑在 content，回收不影响下载，
+  // 但 SW 内存态（tabActive/tabQueues）会丢、队列没人调度。下载期间每 10s 发
+  // 一次 HEARTBEAT，让 SW 持续有事件 → 不空闲 → 不被回收。
+  const heartbeatTimers = new Map(); // downloadId → interval id
+  function startHeartbeat(downloadId) {
+    if (heartbeatTimers.has(downloadId)) return;
+    const t = setInterval(() => {
+      chrome.runtime.sendMessage({ type: 'HEARTBEAT', downloadId }).catch(() => {});
+    }, 10000);
+    heartbeatTimers.set(downloadId, t);
+  }
+  function stopHeartbeat(downloadId) {
+    const t = heartbeatTimers.get(downloadId);
+    if (t) { clearInterval(t); heartbeatTimers.delete(downloadId); }
+  }
+
+  // ============ 后台标签页检测（防被 Chrome 节流拖慢） ============
+  // 页面切到后台时，Chrome 会节流定时器/降低网络优先级 → 分片 20s 超时被拉长、
+  // 下载龟速。检测到切后台时给用户提示（不打扰：一次性横幅）。
+  let hiddenBanner = null;
+  function showHiddenBanner() {
+    if (hiddenBanner || !document.body) return;
+    const div = document.createElement('div');
+    div.id = 'vgp-hidden-banner';
+    div.textContent = '⚠️ StreamCap：页面已切到后台，下载会被 Chrome 限速变慢。请保持此标签页在前台直到下载完成。';
+    div.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:2147483647;background:#f59e0b;color:#111;font:12px system-ui,sans-serif;padding:6px 12px;text-align:center;box-shadow:0 2px 8px rgba(0,0,0,.35)';
+    document.body.appendChild(div);
+    hiddenBanner = div;
+  }
+  function hideHiddenBanner() {
+    if (hiddenBanner) { hiddenBanner.remove(); hiddenBanner = null; }
+  }
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) {
+      // 只在有下载进行时提示，避免打扰无下载场景
+      if (heartbeatTimers.size > 0) {
+        showHiddenBanner();
+        log('warn', '页面切到后台，Chrome 会节流下载（定时器/网络降级），请保持标签页在前台');
+      }
+    } else {
+      hideHiddenBanner();
+    }
+  });
+
   // ============ 核心：并行下载 + OPFS 持久化 ============
+  const runningDownloads = new Set(); // downloadId → 防重入（retry 双派发时只跑一个循环）
   async function startDownload(downloadId, m3u8Url, resumeFrom, concurrency, referer, pageTitle) {
+    if (runningDownloads.has(downloadId)) {
+      // 同一任务已有下载循环在跑（可能是 retry 双派发/重复 START），忽略本次
+      log('warn', `[#${downloadId}] 收到重复 START，忽略（已有下载循环在跑）`);
+      return;
+    }
+    runningDownloads.add(downloadId);
     const ac = getAbortController(downloadId);
     const signal = ac.signal;
     // 日志任务标识：优先用任务名（如 ipzz196.mp4），没有时才回退到 id
@@ -223,6 +275,8 @@
 
     log('info', `[${taskLabel}] 开始下载: ${m3u8Url.substring(0, 60)}...`);
     if (resumeFrom > 0) log('info', `[${taskLabel}] 断点续传，跳过前 ${resumeFrom} 段`);
+    startHeartbeat(downloadId); // 下载期间保活 SW，防止空闲被回收
+    if (document.hidden) showHiddenBanner();
 
     let total, totalDone = resumeFrom;
 
@@ -423,8 +477,14 @@
 
       // 7. 下载循环结束
       removeAbortController(downloadId);
+      runningDownloads.delete(downloadId);
+      stopHeartbeat(downloadId);
+      hideHiddenBanner();
     } catch (err) {
       removeAbortController(downloadId);
+      runningDownloads.delete(downloadId);
+      stopHeartbeat(downloadId);
+      hideHiddenBanner();
       if (err.name === 'AbortError') {
         log('info', `[${taskLabel}] 下载被用户取消，分片已保留可续传`);
         chrome.runtime.sendMessage({ type: 'DOWNLOAD_ERROR', downloadId, error: '已取消', done: totalDone, total });
