@@ -35,7 +35,7 @@ const tabActive = {};       // { tabId → downloadId | null }
 let sniffStore = {};        // { tabId → { m3u8s: [...], pageUrl: '' } }
 let managerPorts = [];      // manager 页的长连接端口
 
-// 日志任务标识：优先任务名（ipzz196.mp4），重复任务带序号，否则回退 id
+// 日志任务标识：优先任务名（如 video.mp4），重复任务带序号，否则回退 id
 function taskLabel(id) {
   const d = downloads[id];
   if (!d) return `#${id}`;

@@ -270,7 +270,7 @@
     runningDownloads.add(downloadId);
     const ac = getAbortController(downloadId);
     const signal = ac.signal;
-    // 日志任务标识：优先用任务名（如 ipzz196.mp4），没有时才回退到 id
+    // 日志任务标识：优先用任务名（如 video.mp4），没有时才回退到 id
     const taskLabel = pageTitle ? `${pageTitle}.mp4` : `#${downloadId}`;
 
     log('info', `[${taskLabel}] 开始下载: ${m3u8Url.substring(0, 60)}...`);

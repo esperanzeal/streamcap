@@ -17,7 +17,13 @@ const BARS = { queued: 'bar-q', downloading: 'bar-go', retrying: 'bar-go', expor
 function act(msg) { chrome.runtime.sendMessage(msg).catch(() => {}); }
 
 function render() {
-  const all = Object.values(downloads).sort((a, b) => b.createdAt - a.createdAt);
+  // 排序：进行中/下载中永远置顶（用户看下载任务不用拉到底），其余按创建时间倒序
+  const statusRank = { downloading: 0, retrying: 0, exporting: 0, queued: 1, paused: 1, completed: 2, failed: 2, cancelled: 2 };
+  const all = Object.values(downloads).sort((a, b) => {
+    const ra = statusRank[a.status] ?? 3, rb = statusRank[b.status] ?? 3;
+    if (ra !== rb) return ra - rb;
+    return b.createdAt - a.createdAt;
+  });
   const cnt = {};
   all.forEach(d => { cnt[d.status] = (cnt[d.status] || 0) + 1; });
 
@@ -31,7 +37,8 @@ function render() {
 
   const filtered = all.filter(d => {
     if (filter === 'all') return true;
-    if (filter === 'active') return d.status === 'downloading' || d.status === 'queued' || d.status === 'exporting';
+    if (filter === 'active') return d.status === 'downloading' || d.status === 'retrying' || d.status === 'exporting';
+    if (filter === 'queued') return d.status === 'queued';
     return d.status === filter;
   });
 
