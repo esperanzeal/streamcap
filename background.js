@@ -606,6 +606,13 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return;
   }
 
+  // content 保活心跳：下载进行中每 10s 发一次，防止 SW 空闲 30s 被 Chrome 回收
+  if (msg.type === 'HEARTBEAT') {
+    const d = downloads[msg.downloadId];
+    if (d) d.lastPing = Date.now();
+    return;
+  }
+
   if (msg.type === 'DOWNLOAD_COMPLETE') {
     const d = downloads[msg.downloadId];
     if (d) {
@@ -645,6 +652,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         const delay = d.retryCount * 3000; // 3s / 6s / 9s 退避
         setTimeout(() => {
           if (!downloads[d.id]) return; // 已被删除
+          // 退避期间用户可能已暂停/取消/重新调度该任务：只有仍处于 retrying
+          // （未被用户干预）才自动重派，避免双派发
+          if (d.status !== 'retrying') return;
           d.status = 'queued';
           persist();
           broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
@@ -760,6 +770,63 @@ chrome.downloads.onChanged.addListener((delta) => {
   handleDownloadSignal(delta);
 });
 
+// ============ SW 防休眠（MV3 空闲约 30s 会被 Chrome 终止） ============
+// 下载跑在 content script 里，SW 被终止本身不影响下载；但会丢失内存态，
+// 且"暂停中等待调度"的队列没人唤醒（用户不操作就永远卡着——日志里 22:00-22:03
+// 55 个 queued 任务干等就是证据）。用 alarms 定期唤醒 SW 重建队列 + 心跳兜底。
+const KEEPALIVE_ALARM = 'vgp_keepalive';
+
+function ensureKeepaliveAlarm() {
+  chrome.alarms.get(KEEPALIVE_ALARM, a => {
+    if (!a) {
+      // periodInMinutes: 1 = Chrome 116 允许的最小周期；SW 空闲 30s 被杀后，
+      // 最迟 1 分钟内被唤醒重建队列，避免 queued 任务无人调度。
+      chrome.alarms.create(KEEPALIVE_ALARM, { periodInMinutes: 1, delayInMinutes: 1 });
+    }
+  });
+}
+
+chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name !== KEEPALIVE_ALARM) return;
+  // 心跳兜底：SW 刚被唤醒时，检查 downloading 任务是否还活着。
+  // 若 content 已死（页面被冻结/关闭），标为可续传暂停并让出并发槽。
+  const pingers = Object.values(downloads)
+    .filter(d => d.status === 'downloading')
+    .map(d => pingDeadTask(d, '页面无响应（后台冻结/关闭），可点继续续传'));
+  Promise.allSettled(pingers).then(() => {
+    maybeDispatch(); // 队列里若有 queued 任务，趁机派发
+  });
+});
+
+// 心跳探测：downloading 任务若 content script 已死（页面导航/刷新/冻结后无感知），
+// 会永远卡 downloading 且占着并发槽。ping 无响应 → 标为可续传暂停。
+// 带 tabActive 归属校验：ping 超时窗口内用户可能"暂停→继续"换过任务，
+// 只有当前仍由本任务占用并发槽时才标记暂停，避免误伤刚恢复的任务。
+// 并行探测 + 每任务超时：冻结的 tab 若消息不返回，不能卡住后续任务的探测。
+function pingDeadTask(d, pauseReason) {
+  const withTimeout = (p, ms) => new Promise((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error('ping timeout')), ms);
+    p.then(v => { clearTimeout(t); resolve(v); }, e => { clearTimeout(t); reject(e); });
+  });
+  return withTimeout(chrome.tabs.sendMessage(d.tabId, { type: 'PING' }), 2000)
+    .catch(() => {
+      const cur = downloads[d.id];
+      // 最近 20s 内收到过 content 心跳 → content 还活着，只是 PING 消息延迟/丢失，不误伤
+      if (cur && cur.lastPing && Date.now() - cur.lastPing < 20000) return;
+      if (cur && cur.status === 'downloading' && tabActive[cur.tabId] === cur.id) {
+        cur.status = 'paused';
+        cur.error = pauseReason;
+        tabActive[cur.tabId] = null;
+        // 通知 content 停止下载（与 pauseDownload 对齐，防循环继续写 OPFS）
+        chrome.tabs.sendMessage(cur.tabId, { type: 'CANCEL_DOWNLOAD', downloadId: cur.id }).catch(() => {});
+        persist();
+        broadcast({ type: 'DOWNLOAD_UPDATE', download: cur });
+        log('warn', `[心跳] ${taskLabel(cur.id)} content 无响应，标为可续传暂停`);
+        maybeDispatch();
+      }
+    });
+}
+
 // ============ Manager 长连接 ============
 
 chrome.runtime.onConnect.addListener(port => {
@@ -772,6 +839,9 @@ chrome.runtime.onConnect.addListener(port => {
     });
   }
 });
+
+// SW 启动即注册保活 alarm（onInstalled 只跑一次，SW 空闲重启不触发）
+ensureKeepaliveAlarm();
 
 // ============ 恢复 ============
 
@@ -834,32 +904,10 @@ chrome.storage.local.get('vgp_downloads', data => {
 
     // 心跳兜底：downloading 任务若 content script 已死（页面导航/刷新/冻结后无感知），
     // 会永远卡 downloading 且占着并发槽。这里逐个 ping，无响应 → 标为可续传暂停。
-    // 并行探测 + 每任务超时：冻结的 tab 若消息不返回，不能卡住后续任务的探测。
-    const withTimeout = (p, ms) => new Promise((resolve, reject) => {
-      const t = setTimeout(() => reject(new Error('ping timeout')), ms);
-      p.then(v => { clearTimeout(t); resolve(v); }, e => { clearTimeout(t); reject(e); });
-    });
     (async () => {
       const pingers = Object.values(downloads)
         .filter(d => d.status === 'downloading')
-        .map(async d => {
-          try {
-            await withTimeout(chrome.tabs.sendMessage(d.tabId, { type: 'PING' }), 2000);
-          } catch {
-            const cur = downloads[d.id];
-            if (cur && cur.status === 'downloading') {
-              cur.status = 'paused';
-              cur.error = '页面已无响应，可点继续续传';
-              tabActive[d.tabId] = null;
-              // 通知 content 停止下载（与 pauseDownload 对齐，防循环继续写 OPFS）
-              chrome.tabs.sendMessage(d.tabId, { type: 'CANCEL_DOWNLOAD', downloadId: d.id }).catch(() => {});
-              persist();
-              broadcast({ type: 'DOWNLOAD_UPDATE', download: cur });
-              log('warn', `[心跳] ${taskLabel(d.id)} content 无响应，标为可续传暂停`);
-              maybeDispatch();
-            }
-          }
-        });
+        .map(d => pingDeadTask(d, '页面已无响应，可点继续续传'));
       await Promise.allSettled(pingers);
     })();
 
