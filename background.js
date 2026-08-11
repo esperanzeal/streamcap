@@ -178,6 +178,7 @@ function persist() {
     speed: d.speed, error: d.error, createdAt: d.createdAt, tabId: d.tabId,
     fileName: d.fileName, pageTitle: d.pageTitle, dupIndex: d.dupIndex,
     retryCount: d.retryCount, retryAt: d.retryAt, consecutiveFails: d.consecutiveFails,
+    lastProgressAt: d.lastProgressAt, stalledAt: d.stalledAt,
   }));
   chrome.storage.local.set({ vgp_downloads: list });
 }
@@ -262,6 +263,8 @@ async function dispatchTab(tabId, downloadId) {
   d.status = 'downloading';
   d.error = null; // 下载恢复时清除历史错误提示
   if (!d.done) d.pct = 0; // 续传时保留已有进度
+  d.lastProgressAt = Date.now(); // 派发即记"最后活跃"：启动/解析阶段计入宽限期，防误判停滞
+  d.stalledAt = null; // 清除历史停滞标记
   tabActive[tabId] = downloadId;
   persist();
   broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
@@ -321,16 +324,17 @@ async function maybeDispatch() {
   if (!unlimited && activeCount >= max) return;
 
   // 收集所有可派发的候选（排队中且所在 tab 空闲），按创建时间排序
+  // 停滞任务（stalledAt）按停滞时刻排到队尾最后执行，不占用优先调度位
   const candidates = [];
   for (const tid of Object.keys(tabQueues)) {
     const tabId = Number(tid);
     if (tabActive[tabId]) continue; // 该 tab 已有活动任务
     for (const did of tabQueues[tabId]) {
       const d = downloads[did];
-      if (d && d.status === 'queued') candidates.push({ tabId, did, createdAt: d.createdAt });
+      if (d && d.status === 'queued') candidates.push({ tabId, did, sortKey: d.stalledAt || d.createdAt || 0 });
     }
   }
-  candidates.sort((a, b) => a.createdAt - b.createdAt);
+  candidates.sort((a, b) => a.sortKey - b.sortKey);
 
   let slots = unlimited ? Infinity : (max - activeCount);
   for (const c of candidates) {
@@ -364,6 +368,7 @@ async function resumeAll() {
     d.error = null;
     d.consecutiveFails = 0;
     d.retryCount = 0;
+    d.stalledAt = null; // 手动恢复 = 新的尝试周期，回到正常 FIFO 位置
     if (!tabQueues[d.tabId]) tabQueues[d.tabId] = [];
     if (!tabQueues[d.tabId].includes(d.id)) tabQueues[d.tabId].push(d.id);
   }
@@ -450,8 +455,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       }
       d.status = 'queued';
       d.error = null;
-      // 重试任务：重置连续失败计数（保留 createdAt 保持 FIFO 原位置）
+      // 重试任务：重置连续失败计数与停滞标记（保留 createdAt 保持 FIFO 原位置）
       d.consecutiveFails = 0;
+      d.stalledAt = null; // 手动重试 = 新的尝试周期，回到正常 FIFO 位置
       if (!tabQueues[tabId]) tabQueues[tabId] = [];
       if (!tabQueues[tabId].includes(msg.retryId)) tabQueues[tabId].push(msg.retryId);
       persist();
@@ -652,12 +658,14 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     if (d) {
       d.pct = msg.pct; d.done = msg.done; d.total = msg.total;
       d.speed = msg.speed || '';
+      d.lastProgressAt = Date.now(); // 真实下载进度，用于超时无进度判定
       broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
     }
     return;
   }
 
   // content 保活心跳：下载进行中每 10s 发一次，防止 SW 空闲 30s 被 Chrome 回收
+  // 注意：心跳≠进度，只说明 content 消息循环活着；下载是否推进看 lastProgressAt
   if (msg.type === 'HEARTBEAT') {
     const d = downloads[msg.downloadId];
     if (d) d.lastPing = Date.now();
@@ -881,6 +889,34 @@ chrome.alarms.onAlarm.addListener((alarm) => {
   Promise.allSettled(pingers).then(() => {
     maybeDispatch(); // 队列里若有 queued 任务，趁机派发
   });
+
+  // 无进度超时判定：下载中任务若长时间没有真实进度（PROGRESS），说明下载循环卡死
+  // （fetch 挂起/页面冻结后消息循环还活着但下载不推进）。把任务标为可续传暂停、
+  // 释放并发槽、记录 stalledAt 排到队尾——恢复调度后它排最后执行，不反复占槽。
+  // 阈值放宽到 180s：慢网/丢包时单分片 20s 超时 × (3 首轮 + 5 补试) 可能让一次
+  // mini 批次（4 分片并行）的 reportProgress 间隔逼近 100s+，后台 tab 定时器节流还会拉长。
+  const now = Date.now();
+  const PROGRESS_TIMEOUT = 180000; // 180s 无任何真实进度 → 判卡死
+  const stalled = Object.values(downloads).filter(d => {
+    if (d.status !== 'downloading') return false;
+    // 刚派发（dispatchTab 已重置 lastProgressAt）的任务有完整宽限期，不会秒判
+    const last = d.lastProgressAt || d.createdAt || 0;
+    return now - last > PROGRESS_TIMEOUT;
+  });
+  for (const d of stalled) {
+    // tabActive 归属校验：只有当前仍由本任务占用并发槽时才释放，避免误清该 tab 其他任务的槽
+    if (tabActive[d.tabId] !== d.id) continue;
+    d.status = 'paused';
+    d.error = '长时间无进度，移至队列末尾，可手动继续续传';
+    d.stalledAt = now; // 独立停滞时间戳：manager 排序时排在队尾，不污染 createdAt 语义
+    tabActive[d.tabId] = null;
+    // 通知 content 停止下载循环（防卡死循环继续空转/继续占资源）
+    chrome.tabs.sendMessage(d.tabId, { type: 'CANCEL_DOWNLOAD', downloadId: d.id }).catch(() => {});
+    persist();
+    broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
+    log('warn', `[停滞] ${taskLabel(d.id)} 无进度超过 ${PROGRESS_TIMEOUT / 1000}s，标为暂停并移至队尾`);
+  }
+  if (stalled.length > 0) maybeDispatch();
 });
 
 // 心跳探测：downloading 任务若 content script 已死（页面导航/刷新/冻结后无感知），
