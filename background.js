@@ -1,5 +1,17 @@
 // background.js — StreamCap v3
 // webRequest 嗅探 + 下载队列 + 消息路由
+//
+// 消息类型速查（与 content.js / popup / manager 共享）：
+//   START_DOWNLOAD, CANCEL_DOWNLOAD, PROGRESS, DOWNLOAD_BLOB, DOWNLOAD_ERROR,
+//   FINALIZE_DOWNLOAD, CLEANUP_OPFS, DOWNLOAD_UPDATE, DOWNLOAD_REMOVED,
+//   ENQUEUE, PAUSE, PAUSE_ALL, RESUME_ALL, RETRY_FAILED, DELETE_DOWNLOAD,
+//   GET_DOWNLOADS, GET_M3U8S, CLEAR_SNIFF, SCAN_VIDEOS, REPORT_VIDEO,
+//   OPEN_MANAGER, SET_MAX_CONCURRENT, HEARTBEAT, PING, INIT
+//
+// cors_rules.json *.ts 规则说明：
+//   规则 id=3 (*.ts urlFilter) 匹配所有以 .ts 结尾的 URL 请求，为其注入 CORS 头。
+//   .ts 为 HLS 视频分片的实际后缀（非 TypeScript），resourceTypes 限定
+//   xmlhttprequest+other 防止误匹配 script 加载。这是视频下载必需规则。
 
 // ============ 右键菜单 ============
 chrome.runtime.onInstalled.addListener(() => {
@@ -191,6 +203,7 @@ function broadcast(msg) {
 }
 
 // ============ 日志（按日期分文件，存 storage.local，防爆上限 5000 条/天） ============
+// 注：此 log() 与 content.js 中的实现重复。修改日志格式时需同步两处。
 function todayKey() {
   const d = new Date();
   return 'vgp_logs_' +
@@ -668,23 +681,6 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return;
   }
 
-  if (msg.type === 'DOWNLOAD_COMPLETE') {
-    const d = downloads[msg.downloadId];
-    if (d) {
-      d.status = 'completed';
-      d.pct = 100;
-      d.fileName = msg.fileName || '';
-      // 下载成功：连续失败计数清零（下次失败从 0 重新计数）
-      d.consecutiveFails = 0;
-      d.retryCount = 0;
-      tabActive[d.tabId] = null;
-      persist();
-      broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
-      maybeDispatch();
-    }
-    return;
-  }
-
   if (msg.type === 'DOWNLOAD_ERROR') {
     const d = downloads[msg.downloadId];
     if (d) {
@@ -863,6 +859,7 @@ chrome.downloads.onChanged.addListener((delta) => {
 // 且"暂停中等待调度"的队列没人唤醒（用户不操作就永远卡着——日志里 22:00-22:03
 // 55 个 queued 任务干等就是证据）。用 alarms 定期唤醒 SW 重建队列 + 心跳兜底。
 const KEEPALIVE_ALARM = 'vgp_keepalive';
+const CLEANUP_ALARM = 'vgp_cleanup';
 
 function ensureKeepaliveAlarm() {
   chrome.alarms.get(KEEPALIVE_ALARM, a => {
@@ -872,9 +869,30 @@ function ensureKeepaliveAlarm() {
       chrome.alarms.create(KEEPALIVE_ALARM, { periodInMinutes: 1, delayInMinutes: 1 });
     }
   });
+  // 定期 OPFS 孤儿分片清理（每 30 分钟），避免仅靠 SW 启动一次清理导致长期累积
+  chrome.alarms.get(CLEANUP_ALARM, a => {
+    if (!a) {
+      chrome.alarms.create(CLEANUP_ALARM, { periodInMinutes: 30, delayInMinutes: 5 });
+    }
+  });
 }
 
 chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name === CLEANUP_ALARM) {
+    // 定期清理：通知所有打开的 tab 删除孤儿 OPFS 分片。
+    // 注意：activeIds 必须用 storage 里的全量任务 id 而非内存 downloads——
+    // SW 刚唤醒时内存态可能未加载完（或任务刚被删除但未落盘），用内存集会误删在下载任务的分片。
+    chrome.storage.local.get('vgp_downloads', data => {
+      const activeIds = (data.vgp_downloads || []).map(d => d.id);
+      chrome.tabs.query({}, tabs => {
+        for (const t of tabs) {
+          chrome.tabs.sendMessage(t.id, { type: 'CLEANUP_OPFS', activeDownloadIds: activeIds }).catch(() => {});
+        }
+      });
+    });
+    return;
+  }
+
   if (alarm.name !== KEEPALIVE_ALARM) return;
   // 心跳兜底：SW 刚被唤醒时，检查 downloading 任务是否还活着。
   // 若 content 已死（页面被冻结/关闭），标为可续传暂停并让出并发槽。

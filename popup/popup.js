@@ -1,8 +1,29 @@
 // popup.js — StreamCap
 const $ = s => document.querySelector(s);
+const $$ = s => document.querySelectorAll(s);
 
 let currentPageUrl = '';
-let currentPageTitle = '';
+let resFilter = 'all';
+
+function resolutionGroup(res) {
+  if (!res || res === '?') return 'other';
+  const m = res.match(/(\d{3,4})p/i);
+  if (m) {
+    const h = parseInt(m[1]);
+    if (h >= 2160) return '4K';
+    if (h >= 1080) return '1080p';
+    if (h >= 720) return '720p';
+  }
+  // 也匹配 WxH 格式
+  const m2 = res.match(/(\d{3,4})x(\d{3,4})/i);
+  if (m2) {
+    const h = parseInt(m2[2]);
+    if (h >= 2160) return '4K';
+    if (h >= 1080) return '1080p';
+    if (h >= 720) return '720p';
+  }
+  return 'other';
+}
 
 function pageFileName() {
   try {
@@ -18,14 +39,31 @@ function renderList(data) {
 
   // sniffStore 页面标题优先，否则用网址栏
   const fn = pageFileName();
+  const actualName = (data.pageTitle || fn) + '.mp4';
   pageInfo.classList.remove('hidden');
-  pageTitleLabel.textContent = '📄 ' + fn + '.mp4';
+  pageTitleLabel.textContent = '📄 ' + actualName;
+  if (data.pageTitle) {
+    pageTitleLabel.innerHTML = '📄 ' + esc(actualName) + ' <span class="page-hint">（页面标题）</span>';
+  } else {
+    pageTitleLabel.innerHTML = '📄 ' + esc(actualName) + ' <span class="page-hint">文件名取自网址路径末段</span>';
+  }
 
-  if (!data.m3u8s || data.m3u8s.length === 0) {
+  const filtered = resFilter === 'all'
+    ? data.m3u8s
+    : data.m3u8s.filter(e => resolutionGroup(e.resolution) === resFilter);
+
+  const filterBar = $('#filterBar');
+  if (data.m3u8s && data.m3u8s.length > 0) {
+    filterBar.classList.remove('hidden');
+  } else {
+    filterBar.classList.add('hidden');
+  }
+
+  if (!data.m3u8s || data.m3u8s.length === 0 || filtered.length === 0) {
     list.innerHTML = '<div class="empty">浏览视频页面后自动嗅探<br><span class="hint">无需手动刷新</span></div>';
     return;
   }
-  list.innerHTML = data.m3u8s.map(e => `
+  list.innerHTML = filtered.map(e => `
     <div class="card">
       <div class="meta">
         <span class="res">${e.resolution}</span>
@@ -87,7 +125,6 @@ function esc(s) { return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>
 // 初始化：从标签页取 URL 和标题
 chrome.tabs.query({ active: true, currentWindow: true }, tabs => {
   currentPageUrl = tabs[0]?.url || '';
-  currentPageTitle = tabs[0]?.title || '';
   chrome.runtime.sendMessage({ type: 'GET_M3U8S' }, data => {
     renderList(data || { m3u8s: [], pageUrl: '' });
   });
@@ -97,7 +134,6 @@ chrome.tabs.query({ active: true, currentWindow: true }, tabs => {
 $('#btnRefresh').addEventListener('click', () => {
   chrome.tabs.query({ active: true, currentWindow: true }, tabs => {
     currentPageUrl = tabs[0]?.url || '';
-    currentPageTitle = tabs[0]?.title || '';
     const tid = tabs[0]?.id;
     const refresh = () => chrome.runtime.sendMessage({ type: 'GET_M3U8S' }, data => renderList(data || {}));
     if (tid) {
@@ -113,4 +149,14 @@ $('#btnClear').addEventListener('click', () => {
 });
 $('#btnMgr').addEventListener('click', () => {
   chrome.runtime.sendMessage({ type: 'OPEN_MANAGER' });
+});
+
+// 分辨率筛选按钮
+$$('.filt-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    $$('.filt-btn').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    resFilter = btn.dataset.res;
+    chrome.runtime.sendMessage({ type: 'GET_M3U8S' }, data => renderList(data || {}));
+  });
 });
