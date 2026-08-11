@@ -141,6 +141,7 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   if (active && downloads[active]) {
     downloads[active].status = 'failed';
     downloads[active].error = '页面已关闭';
+    persist(); // 立即落盘：否则 SW 空闲重启后恢复逻辑会把它当 downloading 重建，假活占槽
     broadcast({ type: 'DOWNLOAD_UPDATE', download: downloads[active] });
   }
   delete tabActive[tabId];
@@ -177,7 +178,7 @@ function persist() {
     status: d.status, pct: d.pct, done: d.done, total: d.total,
     speed: d.speed, error: d.error, createdAt: d.createdAt, tabId: d.tabId,
     fileName: d.fileName, pageTitle: d.pageTitle, dupIndex: d.dupIndex,
-    retryCount: d.retryCount, retryAt: d.retryAt, consecutiveFails: d.consecutiveFails,
+    retryCount: d.retryCount, consecutiveFails: d.consecutiveFails,
     lastProgressAt: d.lastProgressAt, stalledAt: d.stalledAt,
   }));
   chrome.storage.local.set({ vgp_downloads: list });
@@ -246,7 +247,7 @@ function enqueue(tabId, url, referer, resolution, pageUrl, pageTitle, force = fa
     speed: '', error: null, createdAt: Date.now(), tabId,
     fileName: '',
     dupIndex: dupIndex > 1 ? dupIndex : undefined,
-    retryCount: 0, retryAt: null, consecutiveFails: 0,
+    retryCount: 0, consecutiveFails: 0,
   };
   if (!tabQueues[tabId]) tabQueues[tabId] = [];
   tabQueues[tabId].push(id);
@@ -301,11 +302,6 @@ async function dispatchTab(tabId, downloadId) {
       maybeDispatch();
     }
   }
-}
-
-function dequeueNext(tabId) {
-  // 已废弃：改为全局并发调度 maybeDispatch()
-  maybeDispatch();
 }
 
 // 读取并发任务数（0=无上限）。注意：必须用 undefined 判断，不能用 ||（0 会被吞）
@@ -726,7 +722,6 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       if (fails < MAX_RETRY) {
         d.consecutiveFails = fails + 1;
         d.retryCount = (d.retryCount || 0) + 1;
-        d.retryAt = Date.now();
         d.status = 'retrying';
         d.error = `第 ${d.consecutiveFails}/${MAX_RETRY} 次重试: ${msg.error}`;
         persist();
