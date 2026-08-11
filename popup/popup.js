@@ -39,6 +39,8 @@ function renderList(data) {
 
   list.querySelectorAll('.btn-queue').forEach(btn => {
     btn.addEventListener('click', () => {
+      // 立即禁用防双击（两次 ENQUEUE 会产生重复任务；响应失败时恢复）
+      btn.disabled = true;
       chrome.runtime.sendMessage({
         type: 'ENQUEUE',
         url: btn.dataset.url,
@@ -49,7 +51,31 @@ function renderList(data) {
       }, resp => {
         if (resp?.ok) {
           btn.textContent = '✅ 已加入';
-          btn.disabled = true;
+        } else if (resp?.duplicate) {
+          // 该 URL 已在任务列表：询问是否强制重复下载（默认拒绝，防误操作产生重复文件）
+          const force = confirm(`该视频已在下载任务列表中（状态：${resp.existingStatus || '?'}）。\n\n确定要重复下载一份吗？`);
+          if (force) {
+            chrome.runtime.sendMessage({
+              type: 'ENQUEUE',
+              url: btn.dataset.url,
+              referer: btn.dataset.ref,
+              resolution: btn.dataset.res,
+              pageUrl: currentPageUrl,
+              pageTitle: pageFileName(),
+              force: true,
+            }, r2 => {
+              if (r2?.ok) {
+                btn.textContent = '✅ 已加入';
+              } else {
+                btn.disabled = false;
+              }
+            });
+          } else {
+            btn.disabled = false;
+          }
+        } else {
+          // 其他错误（如无标签页）：恢复按钮
+          btn.disabled = false;
         }
       });
     });

@@ -57,6 +57,8 @@ function render() {
     const isExporting = d.status === 'exporting';
     const isDead = d.status === 'failed' || d.status === 'cancelled';
     const isRetryable = isDead || isPaused || isDone;
+    // 已完成任务的按钮语义是"重新下载"（清进度从头下），失败/暂停是"重试/继续"（续传）
+    const retryLabel = isDone ? '重新下载' : (isPaused ? '继续' : '重试');
     const barW = d.pct || 0;
     const doneText = d.total ? `${d.done}/${d.total}` : '—';
     // 速度/临时文案只在下载中、重试中显示（已完成/失败等不显示，避免残留"合并中"等）
@@ -89,7 +91,7 @@ function render() {
       </div>
       <div class="card-actions">
         ${isActive ? `<button class="btn-act" data-act="pause" data-id="${d.id}">暂停</button>` : ''}
-        ${isRetryable ? `<button class="btn-act retry" data-act="retry" data-id="${d.id}">${isPaused ? '继续' : '重试'}</button>` : ''}
+        ${isRetryable ? `<button class="btn-act retry" data-act="retry" data-id="${d.id}">${retryLabel}</button>` : ''}
         ${!isActive && !isExporting ? `<button class="btn-act danger" data-act="delete" data-id="${d.id}">删除</button>` : ''}
       </div>
     </div>`;
@@ -120,6 +122,8 @@ $$('.tab-btn').forEach(b => {
     $$('.tab-btn').forEach(x => x.classList.remove('active'));
     b.classList.add('active');
     filter = b.dataset.filter;
+    // "重试失败"按钮只在失败 tab 下显示
+    $('#btnRetryAll').style.display = filter === 'failed' ? 'inline-block' : 'none';
     render();
   });
 });
@@ -170,13 +174,11 @@ $('#btnPauseAll').addEventListener('click', () => {
 $('#btnResumeAll').addEventListener('click', () => {
   act({ type: 'RESUME_ALL' });
 });
-// 全部重试：重试所有失败/取消任务
+// 全部重试（失败/取消任务）：走 background 统一处理，保留进度续传，仅 failed/cancelled 生效
 $('#btnRetryAll').addEventListener('click', () => {
-  Object.values(downloads).forEach(d => {
-    if (d.status === 'failed' || d.status === 'cancelled') {
-      act({ type: 'ENQUEUE', tabId: d.tabId, url: d.url, referer: d.referer, resolution: d.resolution, pageUrl: d.pageUrl, pageTitle: d.pageTitle, retryId: d.id });
-    }
-  });
+  const targets = Object.values(downloads).filter(d => d.status === 'failed' || d.status === 'cancelled');
+  if (targets.length === 0) { alert('没有失败/取消的任务可重试'); return; }
+  act({ type: 'RETRY_FAILED' });
 });
 
 $('#btnClearFail').addEventListener('click', () => {

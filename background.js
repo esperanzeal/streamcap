@@ -177,6 +177,7 @@ function persist() {
     status: d.status, pct: d.pct, done: d.done, total: d.total,
     speed: d.speed, error: d.error, createdAt: d.createdAt, tabId: d.tabId,
     fileName: d.fileName, pageTitle: d.pageTitle, dupIndex: d.dupIndex,
+    retryCount: d.retryCount, retryAt: d.retryAt, consecutiveFails: d.consecutiveFails,
   }));
   chrome.storage.local.set({ vgp_downloads: list });
 }
@@ -221,7 +222,18 @@ function clearLogs(dateStr, callback) {
 
 // ============ 队列管理 ============
 
-function enqueue(tabId, url, referer, resolution, pageUrl, pageTitle) {
+function enqueue(tabId, url, referer, resolution, pageUrl, pageTitle, force = false) {
+  // 重复检测：同一 URL 已有未取消任务 → 除非 force 确认，否则拒绝入队
+  const existing = Object.values(downloads).find(x => x.url === url && x.status !== 'cancelled');
+  if (existing && !force) {
+    return { ok: false, duplicate: true, existingId: existing.id, existingStatus: existing.status };
+  }
+  // force 双保险：2s 内同 URL 只允许 force 入队一次（防双击/重发绕过 UI 禁用产生重复任务）
+  if (force && existing) {
+    if (existing.createdAt && Date.now() - existing.createdAt < 2000) {
+      return { ok: false, error: '该 URL 刚加入过，已忽略重复请求' };
+    }
+  }
   const id = nextId++;
   // 重复检测：同一 URL 已在任务列表中 → 新任务加序号（(2)、(3)...），提醒用户任务重复
   const dupIndex = Object.values(downloads).filter(x => x.url === url).length + 1;
@@ -233,6 +245,7 @@ function enqueue(tabId, url, referer, resolution, pageUrl, pageTitle) {
     speed: '', error: null, createdAt: Date.now(), tabId,
     fileName: '',
     dupIndex: dupIndex > 1 ? dupIndex : undefined,
+    retryCount: 0, retryAt: null, consecutiveFails: 0,
   };
   if (!tabQueues[tabId]) tabQueues[tabId] = [];
   tabQueues[tabId].push(id);
@@ -240,7 +253,7 @@ function enqueue(tabId, url, referer, resolution, pageUrl, pageTitle) {
   broadcast({ type: 'DOWNLOAD_UPDATE', download: downloads[id] });
   log('info', `[入队] ${taskLabel(id)} ${url.substring(0, 60)}`);
   maybeDispatch();
-  return id;
+  return { ok: true, downloadId: id };
 }
 
 async function dispatchTab(tabId, downloadId) {
@@ -343,13 +356,16 @@ async function pauseAll() {
 }
 
 // 全部继续：所有暂停任务重新入队，由并发限制决定启动数量
+// 手动恢复 = 新的尝试周期：重置连续失败计数，与单任务"继续"(ENQUEUE retryId)行为对齐
 async function resumeAll() {
   const tasks = Object.values(downloads).filter(d => d.status === 'paused');
   for (const d of tasks) {
     d.status = 'queued';
     d.error = null;
+    d.consecutiveFails = 0;
+    d.retryCount = 0;
     if (!tabQueues[d.tabId]) tabQueues[d.tabId] = [];
-    tabQueues[d.tabId].push(d.id);
+    if (!tabQueues[d.tabId].includes(d.id)) tabQueues[d.tabId].push(d.id);
   }
   persist();
   tasks.forEach(d => broadcast({ type: 'DOWNLOAD_UPDATE', download: d }));
@@ -423,14 +439,21 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       // 重试：优先用 manager 传来的 tabId，fallback 到 active tab
       const d = downloads[msg.retryId];
       const tabId = msg.tabId || d.tabId;
+      // 状态守卫：正在下载/重试/导出中的任务不接受重试请求（防双击/断线重发把 downloading 打回 queued）
+      if (d.status === 'downloading' || d.status === 'retrying' || d.status === 'exporting') {
+        sendResponse({ ok: false, error: `任务正在${d.status === 'exporting' ? '导出' : '下载'}，无需重试` });
+        return true;
+      }
       if (d.status === 'completed') {
         // 已完成任务重试 = 重新下载：分片已清理，进度归零
         d.done = 0; d.pct = 0; d.total = 0; d.fileName = '';
       }
       d.status = 'queued';
       d.error = null;
+      // 重试任务：重置连续失败计数（保留 createdAt 保持 FIFO 原位置）
+      d.consecutiveFails = 0;
       if (!tabQueues[tabId]) tabQueues[tabId] = [];
-      tabQueues[tabId].push(msg.retryId);
+      if (!tabQueues[tabId].includes(msg.retryId)) tabQueues[tabId].push(msg.retryId);
       persist();
       broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
       maybeDispatch();
@@ -440,8 +463,13 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       chrome.tabs.query({ active: true, currentWindow: true }, tabs => {
         const tabId = tabs[0]?.id;
         if (!tabId) { sendResponse({ ok: false, error: '无法获取标签页' }); return; }
-        const id = enqueue(tabId, msg.url, msg.referer, msg.resolution, msg.pageUrl, msg.pageTitle);
-        sendResponse({ ok: true, downloadId: id });
+        const r = enqueue(tabId, msg.url, msg.referer, msg.resolution, msg.pageUrl, msg.pageTitle, msg.force === true);
+        if (!r.ok && r.duplicate) {
+          // 重复 URL：返回重复状态，由发起方（popup/页面）弹确认框
+          sendResponse({ ok: false, duplicate: true, existingId: r.existingId, existingStatus: r.existingStatus, url: msg.url });
+        } else {
+          sendResponse({ ok: true, downloadId: r.downloadId });
+        }
       });
     }
     return true;
@@ -499,6 +527,29 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       broadcast({ type: 'DOWNLOAD_REMOVED', downloadId: msg.downloadId });
     }
     sendResponse({ ok: true });
+    return true;
+  }
+
+  // 全部重试：仅针对失败/取消任务，原地重置状态重新入队（保留进度续传）
+  // 手动暂停（paused）的任务不在范围内——用"全部继续"恢复
+  if (msg.type === 'RETRY_FAILED') {
+    const targets = Object.values(downloads).filter(d => d.status === 'failed' || d.status === 'cancelled');
+    for (const d of targets) {
+      d.status = 'queued';
+      d.error = null;
+      // 保留 done 进度 → OPFS 断点续传生效；仅 completed 类重下才归零（见 ENQUEUE retryId 分支）
+      d.consecutiveFails = 0;
+      d.retryCount = 0;
+      if (!tabQueues[d.tabId]) tabQueues[d.tabId] = [];
+      if (!tabQueues[d.tabId].includes(d.id)) tabQueues[d.tabId].push(d.id);
+    }
+    if (targets.length > 0) {
+      persist();
+      targets.forEach(d => broadcast({ type: 'DOWNLOAD_UPDATE', download: d }));
+      log('info', `[重试] 全部重试：${targets.length} 个失败/取消任务重新入队`);
+    }
+    maybeDispatch();
+    sendResponse({ ok: true, count: targets.length });
     return true;
   }
 
@@ -619,6 +670,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       d.status = 'completed';
       d.pct = 100;
       d.fileName = msg.fileName || '';
+      // 下载成功：连续失败计数清零（下次失败从 0 重新计数）
+      d.consecutiveFails = 0;
+      d.retryCount = 0;
       tabActive[d.tabId] = null;
       persist();
       broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
@@ -634,31 +688,59 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       if (msg.total !== undefined) d.total = msg.total;
 
       // 用户操作或调度器中止的任务（已取消/已暂停/已放回队列）：保留状态，不自动重试、不覆盖
-      if (msg.error === '已取消' || (msg.error || '').includes('已取消') || d.status === 'paused' || d.status === 'cancelled' || d.status === 'queued') {
+      // 终态（completed/exporting/failed）也直接忽略迟到 ERROR：content 单循环只在结束时上报一次，
+      // 但用户双击重试等操作可能造成 background 状态与 content 循环不同步，防止终态被回退重下
+      if (msg.error === '已取消' || (msg.error || '').includes('已取消') ||
+          d.status === 'paused' || d.status === 'cancelled' || d.status === 'queued' ||
+          d.status === 'completed' || d.status === 'exporting' || d.status === 'failed') {
         persist();
         broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
         return;
       }
 
-      // 自动重试：连续失败 ≤3 次才停止（排除用户操作导致的终止）
-      const MAX_RETRY = 3;
-      const retries = d.retryCount || 0;
-      if (retries < MAX_RETRY && msg.error !== '已取消') {
-        d.retryCount = retries + 1;
-        d.status = 'retrying';
-        d.error = `第 ${d.retryCount}/${MAX_RETRY} 次重试: ${msg.error}`;
+      // 永久错误（404 / blob 丢失 / m3u8 解析失败）：重试无意义，直接失败并释放并发槽
+      if (msg.permanent) {
+        d.status = 'failed';
+        d.error = msg.error;
+        d.consecutiveFails = (d.consecutiveFails || 0) + 1;
+        tabActive[d.tabId] = null;
         persist();
         broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
-        const delay = d.retryCount * 3000; // 3s / 6s / 9s 退避
+        log('warn', `[重试] ${taskLabel(d.id)} 永久错误，直接失败: ${msg.error}`);
+        maybeDispatch();
+        return;
+      }
+
+      // 自动重试：连续失败 ≤3 次才停止（排除用户操作导致的终止）
+      // 计数持久化（persist 已含 consecutiveFails）→ SW 重启不归零，杜绝无限重试占槽
+      const MAX_RETRY = 3;
+      const fails = d.consecutiveFails || 0;
+      if (fails < MAX_RETRY) {
+        d.consecutiveFails = fails + 1;
+        d.retryCount = (d.retryCount || 0) + 1;
+        d.retryAt = Date.now();
+        d.status = 'retrying';
+        d.error = `第 ${d.consecutiveFails}/${MAX_RETRY} 次重试: ${msg.error}`;
+        persist();
+        broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
+        // ★ 让出并发槽：退避期间其他任务可插队，避免失败任务占坑
+        tabActive[d.tabId] = null;
+        maybeDispatch();
+        const delay = d.consecutiveFails * 3000; // 3s / 6s / 9s 退避
+        log('info', `[重试] ${taskLabel(d.id)} 失败，${delay}ms 后重新排队（${d.consecutiveFails}/${MAX_RETRY}）`);
         setTimeout(() => {
           if (!downloads[d.id]) return; // 已被删除
           // 退避期间用户可能已暂停/取消/重新调度该任务：只有仍处于 retrying
           // （未被用户干预）才自动重派，避免双派发
           if (d.status !== 'retrying') return;
           d.status = 'queued';
+          d.error = null;
           persist();
           broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
-          dispatchTab(d.tabId, d.id);
+          // 放回原 tab 队列（保留 createdAt → FIFO 原位置），由 maybeDispatch 统一调度
+          if (!tabQueues[d.tabId]) tabQueues[d.tabId] = [];
+          if (!tabQueues[d.tabId].includes(d.id)) tabQueues[d.tabId].push(d.id);
+          maybeDispatch();
         }, delay);
       } else {
         d.status = 'failed';
@@ -666,6 +748,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         tabActive[d.tabId] = null;
         persist();
         broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
+        log('warn', `[重试] ${taskLabel(d.id)} 连续失败 ${fails + 1} 次，转入失败队列`);
         maybeDispatch();
       }
     }
@@ -702,6 +785,8 @@ function handleDownloadSignal(delta) {
       d.pct = 100;
       d.fileName = rec.filename;
       d.speed = '';
+      d.consecutiveFails = 0;
+      d.retryCount = 0;
       tabActive[rec.tabId] = null;
       persist();
       broadcast({ type: 'DOWNLOAD_UPDATE', download: d });

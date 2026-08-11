@@ -84,6 +84,7 @@
     <button class="tab-btn" data-filter="queued">队列中</button>
     <button class="tab-btn" data-filter="completed">已完成</button>
     <button class="tab-btn" data-filter="failed">失败</button>
+    <button class="btn-sm" id="btnRetryAll" style="display:none;" title="仅对失败/取消任务生效，保留进度续传；手动暂停的任务用「全部继续」">🔁 重试失败</button>
     <label style="color:#8b949e;font-size:12px;">线程:</label>
     <select id="threads" style="background:#21262d;color:#c9d1d9;border:1px solid #30363d;border-radius:6px;padding:4px 8px;font-size:12px;">
       <option value="1">1</option><option value="2">2</option><option value="3">3</option>
@@ -103,7 +104,6 @@
     <button class="btn-sm" id="btnLog">📋 日志</button>
     <button class="btn-sm danger" id="btnPauseAll">⏸️ 全部暂停</button>
     <button class="btn-sm" id="btnResumeAll">▶️ 全部继续</button>
-    <button class="btn-sm" id="btnRetryAll">🔁 全部重试</button>
     <button class="btn-sm danger" id="btnClearDone">清空已完成</button>
     <button class="btn-sm danger" id="btnClearFail">清空失败</button>
   </div>
