@@ -403,11 +403,12 @@
           reportProgress(downloadId, pct, totalDone, total, speed);
         }
 
-        // 重试失败分片
+        // 重试失败分片：fetchWithRetry(5) 即"同一分片连续尝试 5 次"，5 次全失败 → 上报任务失败
         for (let i = 0; i < batchCount; i++) {
           if (batchChunks[i] !== null) continue;
+          const segNum = segStart + i + 1;
           try {
-            log('info', `[${taskLabel}] 重试分片 ${segStart + i + 1}`);
+            log('info', `[${taskLabel}] 重试分片 ${segNum}`);
             const r = await fetchWithRetry(batchUrls[i], 5, signal, refHeaders);
             const rawBuf = await r.arrayBuffer();
             networkBytes += rawBuf.byteLength;
@@ -420,7 +421,12 @@
           } catch (err) {
             // 取消信号（AbortError）直接上抛，不能被包成普通错误 → 否则 background 无法识别"已取消"，会误触发自动重试
             if (err.name === 'AbortError') throw err;
-            throw new Error(`分片 ${segStart + i + 1}/${total} 多次重试失败: ${err.message}`);
+            // 永久错误（404/源站删除）：重试无意义，直接上报任务失败（不重派）
+            if (/HTTP 404|404/.test(err.message || '')) {
+              throw new Error(`分片 ${segNum}/${total} 返回 404，源站分片不存在（永久错误）`);
+            }
+            // 网络类错误：分片 5 次尝试全失败 → 任务失败，由 background 决定重派
+            throw new Error(`分片 ${segNum}/${total} 连续失败 5 次: ${err.message}`);
           }
         }
 
@@ -490,10 +496,13 @@
         chrome.runtime.sendMessage({ type: 'DOWNLOAD_ERROR', downloadId, error: '已取消', done: totalDone, total });
       } else {
         log('error', `[${taskLabel}] 下载失败: ${err.message}`);
+        // 永久错误（404/源站删除/无分片）→ permanent:true，background 直接判失败不重派
+        const permanent = /404|永久错误|无分片/.test(err.message || '');
         // 失败时保留 OPFS（下次可续传）
         chrome.runtime.sendMessage({
           type: 'DOWNLOAD_ERROR', downloadId, error: err.message,
           done: totalDone || resumeFrom, total,
+          permanent,
         });
       }
     }
