@@ -130,7 +130,10 @@ $$('.tab-btn').forEach(b => {
 
 // ============ 清空按钮 ============
 $('#btnClearDone').addEventListener('click', () => {
-  Object.values(downloads).forEach(d => { if (d.status === 'completed') act({ type: 'DELETE_DOWNLOAD', downloadId: d.id }); });
+  const targets = Object.values(downloads).filter(d => d.status === 'completed');
+  if (targets.length === 0) return;
+  if (!confirm(`确定清空 ${targets.length} 个已完成任务？\n\n分片缓存也将一并清理，无法恢复。`)) return;
+  targets.forEach(d => act({ type: 'DELETE_DOWNLOAD', downloadId: d.id }));
 });
 // 线程数设置 + 并发任务数设置
 const threadsSelect = $('#threads');
@@ -182,18 +185,20 @@ $('#btnRetryAll').addEventListener('click', () => {
 });
 
 $('#btnClearFail').addEventListener('click', () => {
-  Object.values(downloads).forEach(d => { if (d.status === 'failed' || d.status === 'cancelled') act({ type: 'DELETE_DOWNLOAD', downloadId: d.id }); });
+  const targets = Object.values(downloads).filter(d => d.status === 'failed' || d.status === 'cancelled');
+  if (targets.length === 0) return;
+  if (!confirm(`确定清空 ${targets.length} 个失败/取消任务？\n\n分片缓存也将一并清理，无法恢复。`)) return;
+  targets.forEach(d => act({ type: 'DELETE_DOWNLOAD', downloadId: d.id }));
 });
 
-// ============ 实时更新 ============
-// 长连接（实时广播）+ storage 兜底双通道。
-// MV3 的 service worker 空闲约 30s 就重启，SW 重启会断开扩展页的长连接 →
-// 若不做自动重连，页面会收不到任何更新（进度条/网速静止，只有 F5 能恢复）。
-// 断线后延迟重连 + 主动拉一次全量，保证断线期间的状态不丢。
+// ============ Manager 长连接（带指数退避重连） ============
+let reconnectDelay = 500;
 function connectManager() {
   const port = chrome.runtime.connect({ name: 'manager' });
   port.onMessage.addListener(msg => {
     if (msg.type === 'INIT') {
+      // 连接真正建立 → 重置指数退避（500ms→1s→2s→4s→上限 10s）
+      reconnectDelay = 500;
       msg.downloads.forEach(d => downloads[d.id] = d);
       render();
     }
@@ -207,14 +212,15 @@ function connectManager() {
     }
   });
   port.onDisconnect.addListener(() => {
-    // SW 重启导致断开 → 延迟重连，并拉一次全量状态兜底
+    // SW 重启导致断开 → 指数退避重连（500ms→1s→2s→4s→上限 10s），连接成功后重置
     setTimeout(() => {
       connectManager();
       chrome.runtime.sendMessage({ type: 'GET_DOWNLOADS' }, list => {
         (list || []).forEach(d => downloads[d.id] = d);
         render();
       });
-    }, 500);
+    }, reconnectDelay);
+    reconnectDelay = Math.min(reconnectDelay * 2, 10000);
   });
 }
 connectManager();

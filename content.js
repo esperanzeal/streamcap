@@ -1,9 +1,14 @@
 // content.js — StreamCap v3
-// 4 路并行下载 + OPFS 断点续传 + 分批合并
+// 多线程并行下载 + OPFS 断点续传 + 分批合并
+//
+// 消息类型速查（与 background.js / popup / manager 共享）：
+//   START_DOWNLOAD, CANCEL_DOWNLOAD, PROGRESS, DOWNLOAD_BLOB, DOWNLOAD_ERROR,
+//   FINALIZE_DOWNLOAD, CLEANUP_OPFS, SCAN_VIDEOS, PING, HEARTBEAT
 (() => {
   'use strict';
 
   // ============ 日志（console + 按日期写入 storage.local） ============
+  // 注：此 log() 与 background.js 中的实现重复。修改日志格式时需同步两处。
   function log(level, msg) {
     try {
       console[level === 'error' ? 'error' : level === 'warn' ? 'warn' : 'log']('[VGP]', msg);
@@ -170,14 +175,58 @@
   }
 
   // ============ AES-128 解密 ============
-  function parseKeyInfo(text, baseUrl) {
-    const m = text.match(/#EXT-X-KEY:METHOD=AES-128,URI="([^"]+)"(?:,IV=(0x[0-9a-fA-F]+))?/);
-    if (!m) return null;
-    const keyUrl = resolveUrl(m[1], baseUrl);
-    const ivHex = m[2] || null;
-    const seqM = text.match(/#EXT-X-MEDIA-SEQUENCE:(\d+)/);
-    const mediaSeq = seqM ? parseInt(seqM[1]) : 0;
-    return { keyUrl, ivHex, mediaSeq };
+  // 解析 m3u8 中的所有 KEY 标签，返回 key 段列表（支持 key rotation）
+  // 每个 key 段包含 { segStartIndex, keyUrl, ivHex }，控制从 segStartIndex 开始的所有分片
+  // 直到下一个 key 段或 playlist 末尾。
+  function parseKeySegments(text, baseUrl) {
+    const lines = text.split('\n').map(l => l.trim());
+    const keySegments = [];
+    let segIndex = 0;
+    let currentKeyInfo = null;
+    let mediaSeq = 0;
+
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+
+      if (line.startsWith('#EXT-X-KEY')) {
+        const m = line.match(/METHOD=AES-128,URI="([^"]+)"(?:,IV=(0x[0-9a-fA-F]+))?/);
+        if (m) {
+          const keyUrl = resolveUrl(m[1], baseUrl);
+          const ivHex = m[2] || null;
+          if (!currentKeyInfo || currentKeyInfo.keyUrl !== keyUrl || currentKeyInfo.ivHex !== ivHex) {
+            currentKeyInfo = { segStartIndex: segIndex, keyUrl, ivHex };
+            keySegments.push(currentKeyInfo);
+          }
+        }
+        continue;
+      }
+
+      if (line.startsWith('#EXT-X-MEDIA-SEQUENCE')) {
+        const m = line.match(/:(\d+)/);
+        if (m) mediaSeq = parseInt(m[1]);
+        continue;
+      }
+
+      // 跳过注释/标签行
+      if (line.startsWith('#') || !line) continue;
+
+      // 分片 URI 行
+      segIndex++;
+    }
+
+    return { keySegments, mediaSeq };
+  }
+
+  // 为给定分片索引查找对应的 key 段（二分查找）
+  function findKeyForSegment(keySegments, segIndex) {
+    if (!keySegments || keySegments.length === 0) return null;
+    let lo = 0, hi = keySegments.length - 1;
+    while (lo < hi) {
+      const mid = Math.ceil((lo + hi) / 2);
+      if (keySegments[mid].segStartIndex <= segIndex) lo = mid;
+      else hi = mid - 1;
+    }
+    return keySegments[lo].segStartIndex <= segIndex ? keySegments[lo] : null;
   }
 
   async function fetchDecryptKey(keyUrl, signal) {
@@ -311,12 +360,14 @@
 
       if (parsed.segments.length === 0) throw new Error('无分片');
 
-      const keyInfo = parseKeyInfo(text, textBaseUrl);
-      let cryptoKey = null;
-      if (keyInfo) {
-        log('info', `[${taskLabel}] AES-128 加密，获取密钥...`);
-        const keyBytes = await fetchDecryptKey(keyInfo.keyUrl, signal);
-        cryptoKey = await crypto.subtle.importKey('raw', keyBytes, { name: 'AES-CBC' }, false, ['decrypt']);
+      const { keySegments, mediaSeq } = parseKeySegments(text, textBaseUrl);
+      const keyCache = new Map(); // keyUrl → cryptoKey（懒加载，支持 key rotation）
+      if (keySegments.length > 0) {
+        log('info', `[${taskLabel}] AES-128 加密（${keySegments.length} 个 key 段），预取首个密钥...`);
+        const firstKey = keySegments[0];
+        const keyBytes = await fetchDecryptKey(firstKey.keyUrl, signal);
+        keyCache.set(firstKey.keyUrl, await crypto.subtle.importKey('raw', keyBytes, { name: 'AES-CBC' }, false, ['decrypt']));
+        if (keySegments.length > 1) log('info', `[${taskLabel}] 检测到 key rotation，其余密钥按需加载`);
         log('success', `[${taskLabel}] 密钥就绪`);
       }
 
@@ -380,9 +431,18 @@
               const rawBuf = await r.arrayBuffer();
               networkBytes += rawBuf.byteLength;
               let segData = new Uint8Array(rawBuf);
-              if (cryptoKey) {
-                const iv = makeIV(keyInfo.ivHex, segStart + idx, keyInfo.mediaSeq);
-                segData = await decryptSegment(segData, cryptoKey, iv);
+              if (keySegments.length > 0) {
+                const ks = findKeyForSegment(keySegments, segStart + idx);
+                if (ks) {
+                  let ck = keyCache.get(ks.keyUrl);
+                  if (!ck) {
+                    const kb = await fetchDecryptKey(ks.keyUrl, signal);
+                    ck = await crypto.subtle.importKey('raw', kb, { name: 'AES-CBC' }, false, ['decrypt']);
+                    keyCache.set(ks.keyUrl, ck);
+                  }
+                  const iv = makeIV(ks.ivHex, segStart + idx, mediaSeq);
+                  segData = await decryptSegment(segData, ck, iv);
+                }
               }
               batchChunks[idx] = segData;
             } catch (err) {
@@ -413,9 +473,18 @@
             const rawBuf = await r.arrayBuffer();
             networkBytes += rawBuf.byteLength;
             let segData = new Uint8Array(rawBuf);
-            if (cryptoKey) {
-              const iv = makeIV(keyInfo.ivHex, segStart + i, keyInfo.mediaSeq);
-              segData = await decryptSegment(segData, cryptoKey, iv);
+            if (keySegments.length > 0) {
+              const ks = findKeyForSegment(keySegments, segStart + i);
+              if (ks) {
+                let ck = keyCache.get(ks.keyUrl);
+                if (!ck) {
+                  const kb = await fetchDecryptKey(ks.keyUrl, signal);
+                  ck = await crypto.subtle.importKey('raw', kb, { name: 'AES-CBC' }, false, ['decrypt']);
+                  keyCache.set(ks.keyUrl, ck);
+                }
+                const iv = makeIV(ks.ivHex, segStart + i, mediaSeq);
+                segData = await decryptSegment(segData, ck, iv);
+              }
             }
             batchChunks[i] = segData;
           } catch (err) {
@@ -473,7 +542,21 @@
           a.style.display = 'none';
           (document.body || document.documentElement).appendChild(a);
           a.click();
-          setTimeout(() => { if (a.parentNode) a.parentNode.removeChild(a); }, 60000);
+          // a.click() 降级路径：60s 后清理 a 元素 + revoke blob URL + 清理分片，
+          // 并向 background 上报永久失败（blob 已交浏览器、无法确认保存结果，且分片已清理）——
+          // 标 failed 释放并发槽，避免任务永久卡在 exporting/downloading 占槽。
+          setTimeout(() => {
+            if (a.parentNode) a.parentNode.removeChild(a);
+            try { URL.revokeObjectURL(url); } catch {}
+            cleanupOpfs(downloadId);
+            log('info', `[${taskLabel}] a.click() 降级路径：blob 已释放、分片已清理`);
+            chrome.runtime.sendMessage({
+              type: 'DOWNLOAD_ERROR',
+              downloadId,
+              error: '已通过页面 a.click() 触发下载（无法确认保存结果），分片已清理，可重新下载',
+              permanent: true
+            }).catch(() => {});
+          }, 60000);
         }
       });
       // 注意：这里不 revoke blob、不清理分片、不标完成——
