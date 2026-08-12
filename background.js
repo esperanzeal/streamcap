@@ -970,8 +970,13 @@ chrome.alarms.onAlarm.addListener((alarm) => {
   // 阈值 90s 已覆盖慢网最坏批次间隔（节流上报保证 done 增长及时可见）。
   const now = Date.now();
   const PROGRESS_TIMEOUT = 90000; // 90s 已下载分片数无增长 → 判卡死（配合 content 节流上报，慢网不会误判）
+  const HEARTBEAT_WINDOW = 120000; // content 心跳窗口：后台标签节流下 HEARTBEAT 可能 60s 才到一次
   const stalled = Object.values(downloads).filter(d => {
     if (d.status !== 'downloading') return false;
+    // 后台标签节流时 PROGRESS 上报被 Chrome 降频（setInterval 最低 1 分钟一次），
+    // 仅凭"90s 无 done 增长"会误判停滞。若近期收到过 HEARTBEAT（content 消息循环
+    // 活着，只是被节流），不判停滞——真正卡死时 HEARTBEAT 也会停。
+    if (d.lastPing && now - d.lastPing < HEARTBEAT_WINDOW) return false;
     // 刚派发（dispatchTab 已重置 lastProgressAt）的任务有完整宽限期，不会秒判
     const last = d.lastProgressAt || d.createdAt || 0;
     return now - last > PROGRESS_TIMEOUT;
@@ -1037,8 +1042,8 @@ function pingDeadTask(d, pauseReason) {
   return withTimeout(chrome.tabs.sendMessage(d.tabId, { type: 'PING' }), 2000)
     .catch(() => {
       const cur = downloads[d.id];
-      // 最近 20s 内收到过 content 心跳 → content 还活着，只是 PING 消息延迟/丢失，不误伤
-      if (cur && cur.lastPing && Date.now() - cur.lastPing < 20000) return;
+      // 最近 120s 内收到过 content 心跳 → content 还活着，只是 PING 消息延迟/后台节流，不误伤
+      if (cur && cur.lastPing && Date.now() - cur.lastPing < 120000) return;
       if (cur && cur.status === 'downloading' && tabActive[cur.tabId] === cur.id) {
         cur.status = 'paused';
         cur.error = pauseReason;

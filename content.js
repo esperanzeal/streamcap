@@ -443,6 +443,9 @@
             totalBytes += batchSize;
             // 同步 totalDone：跳过已落盘批次 → 推进到该批结束位置（顺序处理，单调不减）
             totalDone = Math.min(batchIdx * BATCH_SIZE + BATCH_SIZE, total);
+            // 事件驱动上报（非定时器）：后台标签节流下 setInterval 被降频，
+            // 但这里在每次跳过批次后立即上报，保证 background 持续收到进度
+            reportProgress(downloadId, Math.round(totalDone / total * 100), totalDone, total, '');
             log('info', `[${taskLabel}] 批次 ${batchIdx + 1}/${totalBatches} 已缓存，跳过`);
           } else {
             // 缓存丢失，重新下载
