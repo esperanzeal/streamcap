@@ -330,7 +330,8 @@
     startHeartbeat(downloadId); // 下载期间保活 SW，防止空闲被回收
     if (document.hidden) showHiddenBanner();
 
-    let total, totalDone = resumeFrom;
+    let total;
+    let totalDone = 0; // 函数级真实进度（下载分片数）：先初始化为 0，批次元数据读取后按实际落盘批次修正
 
     try {
       // 0. OPFS 配额预检
@@ -339,7 +340,8 @@
       const needEstimate = resumeFrom > 0 ? 500 : 2048; // 续传用保守估计
       if (freeMB < needEstimate) {
         log('warn', `[${taskLabel}] 磁盘剩余 ${freeMB.toFixed(0)}MB，可能不足`);
-        reportProgress(downloadId, 0, 0, 0, `磁盘仅剩 ${freeMB.toFixed(0)}MB`);
+        // 不发 PROGRESS：此时 total 尚未解析无法算真实 pct，且传 0 会把进度条打回 0（鬼打墙）。
+        // 磁盘不足会在后续 OPFS 写入时体现为失败，走失败路径即可。
       }
 
       const refHeaders = {};
@@ -407,7 +409,9 @@
       const totalBatches = Math.ceil(total / BATCH_SIZE);
       const CONCURRENCY = concurrency || 4;
       let totalBytes = 0;
-      let totalDone = resumeFrom;
+      // totalDone 保持函数级初始值 0，由批次循环顺序推进（跳过落盘批次累加、下载批次 segStart+batchDone），
+      // 天然单调。不要在这里用 (max(completed)+1)*80 预推——completed 可能不连续（中间批次缓存丢失），
+      // 预推会虚高后再被循环覆盖 → 进度条先涨后掉（鬼打墙）。
       let networkBytes = 0;
       const downloadStartTime = performance.now();
 
@@ -437,8 +441,7 @@
           } catch { batchSize = 0; }
           if (batchSize > 0) {
             totalBytes += batchSize;
-            // 同步 totalDone：跳过的已完成批次也要计入总进度，避免重派后
-            // totalDone 停在 resumeFrom 而批次循环从当前批重新累计 → 进度条回退
+            // 同步 totalDone：跳过已落盘批次 → 推进到该批结束位置（顺序处理，单调不减）
             totalDone = Math.min(batchIdx * BATCH_SIZE + BATCH_SIZE, total);
             log('info', `[${taskLabel}] 批次 ${batchIdx + 1}/${totalBatches} 已缓存，跳过`);
           } else {
