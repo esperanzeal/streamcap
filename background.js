@@ -933,15 +933,31 @@ chrome.alarms.onAlarm.addListener((alarm) => {
   for (const d of stalled) {
     // tabActive 归属校验：只有当前仍由本任务占用并发槽时才释放，避免误清该 tab 其他任务的槽
     if (tabActive[d.tabId] !== d.id) continue;
-    d.status = 'paused';
-    d.error = '长时间无进度，移至队列末尾，可手动继续续传';
-    d.stalledAt = now; // 独立停滞时间戳：manager 排序时排在队尾，不污染 createdAt 语义
-    tabActive[d.tabId] = null;
     // 通知 content 停止下载循环（防卡死循环继续空转/继续占资源）
     chrome.tabs.sendMessage(d.tabId, { type: 'CANCEL_DOWNLOAD', downloadId: d.id, reason: 'stalled' }).catch(() => {});
-    persist();
-    broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
-    log('warn', `[停滞] ${taskLabel(d.id)} 无进度超过 ${PROGRESS_TIMEOUT / 1000}s，标为暂停并移至队尾`);
+    tabActive[d.tabId] = null;
+
+    // 自动重试：把任务重新放回等待队列末尾（stalledAt 排尾），由调度器自动重派——
+    // 不需要用户手动点"继续"。与下载失败共用 consecutiveFails（≤3 次自动重派，
+    // 超过则标 failed 放弃，防止无限重试占资源；真正完成后清零）。
+    const fails = (d.consecutiveFails || 0) + 1;
+    d.consecutiveFails = fails;
+    if (fails <= 3) {
+      d.status = 'queued';
+      d.error = `无进度自动重排（${fails}/3）`;
+      d.stalledAt = now; // 排到队尾最后执行，不插队
+      if (!tabQueues[d.tabId]) tabQueues[d.tabId] = [];
+      if (!tabQueues[d.tabId].includes(d.id)) tabQueues[d.tabId].push(d.id);
+      persist();
+      broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
+      log('warn', `[停滞] ${taskLabel(d.id)} 无进度超过 ${PROGRESS_TIMEOUT / 1000}s，自动重排队尾（${fails}/3）`);
+    } else {
+      d.status = 'failed';
+      d.error = `连续 ${fails} 次无进度，自动放弃（分片保留，可手动重试）`;
+      persist();
+      broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
+      log('warn', `[停滞] ${taskLabel(d.id)} 连续 ${fails} 次无进度，标为失败`);
+    }
   }
   if (stalled.length > 0) maybeDispatch();
 });
