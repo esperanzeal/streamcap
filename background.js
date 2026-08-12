@@ -1000,14 +1000,26 @@ chrome.alarms.onAlarm.addListener((alarm) => {
     // 释放并发槽：stopping 一直占着槽（等待确认），超时兜底转 queued 时必须释放，
     // 否则 maybeDispatch 因 tabActive[tabId] 非空永久跳过该 tab，任务卡死永不重派
     tabActive[d.tabId] = null;
-    d.status = 'queued';
-    d.error = '停止确认超时，自动重排队尾';
-    d.stalledAt = now2; // 排到队尾
-    if (!tabQueues[d.tabId]) tabQueues[d.tabId] = [];
-    if (!tabQueues[d.tabId].includes(d.id)) tabQueues[d.tabId].push(d.id);
-    persist();
-    broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
-    log('warn', `[停滞] ${taskLabel(d.id)} 停止确认超时（content 无响应），强制重排队尾`);
+    // 与确认路径一致：超时兜底也累计 consecutiveFails（≤3 次自动重派，超过标 failed 放弃）——
+    // 否则 content 死透的任务会无限"超时重排→重派→再超时"循环，永不放弃
+    const fails = (d.consecutiveFails || 0) + 1;
+    d.consecutiveFails = fails;
+    if (fails <= 3) {
+      d.status = 'queued';
+      d.error = `停止确认超时，自动重排队尾（${fails}/3）`;
+      d.stalledAt = now2; // 排到队尾
+      if (!tabQueues[d.tabId]) tabQueues[d.tabId] = [];
+      if (!tabQueues[d.tabId].includes(d.id)) tabQueues[d.tabId].push(d.id);
+      persist();
+      broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
+      log('warn', `[停滞] ${taskLabel(d.id)} 停止确认超时（content 无响应），自动重排队尾（${fails}/3）`);
+    } else {
+      d.status = 'failed';
+      d.error = `连续 ${fails} 次无进度，自动放弃（分片保留，可手动重试）`;
+      persist();
+      broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
+      log('warn', `[停滞] ${taskLabel(d.id)} 连续 ${fails} 次无进度（超时兜底），标为失败`);
+    }
   }
   if (stalled.length > 0 || stuck.length > 0) maybeDispatch();
 });
