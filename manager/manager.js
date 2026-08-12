@@ -5,20 +5,20 @@ const $$ = s => document.querySelectorAll(s);
 let downloads = {};
 let filter = 'all';
 
-const ICONS = { queued: '⏳', downloading: '⬇️', retrying: '🔁', exporting: '📤', completed: '✅', failed: '❌', cancelled: '🚫', paused: '⏸️' };
+const ICONS = { queued: '⏳', downloading: '⬇️', retrying: '🔁', exporting: '📤', completed: '✅', failed: '❌', cancelled: '🚫', paused: '⏸️', stopping: '⏸️' };
 const BADGES = {
   queued: ['队列中', 'b-queued'], downloading: ['下载中', 'b-active'], retrying: ['重试中', 'b-active'],
   exporting: ['导出中', 'b-active'], completed: ['已完成', 'b-done'], failed: ['失败', 'b-fail'], cancelled: ['已取消', 'b-cxl'],
-  paused: ['已暂停', 'b-queued'],
+  paused: ['已暂停', 'b-queued'], stopping: ['停止中', 'b-queued'],
 };
-const BARS = { queued: 'bar-q', downloading: 'bar-go', retrying: 'bar-go', exporting: 'bar-go', completed: 'bar-ok', failed: 'bar-err', cancelled: 'bar-cxl', paused: 'bar-q' };
+const BARS = { queued: 'bar-q', downloading: 'bar-go', retrying: 'bar-go', exporting: 'bar-go', completed: 'bar-ok', failed: 'bar-err', cancelled: 'bar-cxl', paused: 'bar-q', stopping: 'bar-q' };
 
 // ============ 操作 ============
 function act(msg) { chrome.runtime.sendMessage(msg).catch(() => {}); }
 
 function render() {
   // 排序：进行中/下载中永远置顶（用户看下载任务不用拉到底），其余按创建时间倒序
-  const statusRank = { downloading: 0, retrying: 0, exporting: 0, queued: 1, paused: 1, completed: 2, failed: 2, cancelled: 2 };
+  const statusRank = { downloading: 0, retrying: 0, exporting: 0, stopping: 0, queued: 1, paused: 1, completed: 2, failed: 2, cancelled: 2 };
   const all = Object.values(downloads).sort((a, b) => {
     const ra = statusRank[a.status] ?? 3, rb = statusRank[b.status] ?? 3;
     if (ra !== rb) return ra - rb;
@@ -51,7 +51,7 @@ function render() {
     const icon = ICONS[d.status] || '❓';
     const [badgeText, badgeCls] = BADGES[d.status] || ['?', 'b-queued'];
     const barCls = BARS[d.status] || 'bar-q';
-    const isActive = d.status === 'downloading' || d.status === 'queued' || d.status === 'retrying';
+    const isActive = d.status === 'downloading' || d.status === 'queued' || d.status === 'retrying' || d.status === 'stopping';
     const isPaused = d.status === 'paused';
     const isDone = d.status === 'completed';
     const isExporting = d.status === 'exporting';

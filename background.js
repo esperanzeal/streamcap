@@ -192,6 +192,7 @@ function persist() {
     fileName: d.fileName, pageTitle: d.pageTitle, dupIndex: d.dupIndex,
     retryCount: d.retryCount, consecutiveFails: d.consecutiveFails,
     lastProgressAt: d.lastProgressAt, lastDone: d.lastDone, stalledAt: d.stalledAt,
+    stopPendingAt: d.stopPendingAt,
   }));
   chrome.storage.local.set({ vgp_downloads: list });
 }
@@ -363,7 +364,7 @@ async function maybeDispatch() {
 // 全部暂停：所有活跃/排队任务 → paused（保留分片），供用户手动重新分配并发
 async function pauseAll() {
   const tasks = Object.values(downloads).filter(d =>
-    d.status === 'downloading' || d.status === 'retrying' || d.status === 'queued'
+    d.status === 'downloading' || d.status === 'retrying' || d.status === 'queued' || d.status === 'stopping'
   );
   for (const d of tasks) pauseDownload(d.id);
   maybeDispatch();
@@ -402,6 +403,13 @@ function pauseDownload(downloadId) {
     // 暂停：分片保留在 OPFS，可随时续传
     chrome.tabs.sendMessage(tabId, { type: 'CANCEL_DOWNLOAD', downloadId, reason: 'manual_pause' }).catch(() => {});
     maybeDispatch();
+  } else if (d.status === 'stopping') {
+    // 停止确认中的任务被暂停：直接标 paused 释放槽
+    // （content 旧循环收到 CANCEL 后退出；迟到 ERROR 命中 paused 保护分支不覆盖）
+    d.status = 'paused';
+    tabActive[tabId] = null;
+    chrome.tabs.sendMessage(tabId, { type: 'CANCEL_DOWNLOAD', downloadId, reason: 'manual_pause' }).catch(() => {});
+    maybeDispatch();
   }
   d.error = '已暂停，点击继续恢复';
   persist();
@@ -421,6 +429,13 @@ function cancelDownload(downloadId) {
     d.status = 'cancelled';
     tabActive[tabId] = null;
     // 取消：分片同样保留在 OPFS（浏览器退出时自动清理），可续传
+    chrome.tabs.sendMessage(tabId, { type: 'CANCEL_DOWNLOAD', downloadId, reason: 'manual_cancel' }).catch(() => {});
+    maybeDispatch();
+  } else if (d.status === 'stopping') {
+    // 停止确认中的任务被用户取消：终止停止流程，直接标 cancelled 释放槽
+    // （content 旧循环会收到 CANCEL 后退出；若已退出则迟到 ERROR 命中 cancelled 保护分支）
+    d.status = 'cancelled';
+    tabActive[tabId] = null;
     chrome.tabs.sendMessage(tabId, { type: 'CANCEL_DOWNLOAD', downloadId, reason: 'manual_cancel' }).catch(() => {});
     maybeDispatch();
   }
@@ -454,9 +469,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       // 重试：优先用 manager 传来的 tabId，fallback 到 active tab
       const d = downloads[msg.retryId];
       const tabId = msg.tabId || d.tabId;
-      // 状态守卫：正在下载/重试/导出中的任务不接受重试请求（防双击/断线重发把 downloading 打回 queued）
-      if (d.status === 'downloading' || d.status === 'retrying' || d.status === 'exporting') {
-        sendResponse({ ok: false, error: `任务正在${d.status === 'exporting' ? '导出' : '下载'}，无需重试` });
+      // 状态守卫：正在下载/重试/导出/停止确认中的任务不接受重试请求（防双击/断线重发把 downloading 打回 queued）
+      if (d.status === 'downloading' || d.status === 'retrying' || d.status === 'exporting' || d.status === 'stopping') {
+        sendResponse({ ok: false, error: `任务正在${d.status === 'exporting' ? '导出' : d.status === 'stopping' ? '停止确认' : '下载'}，无需重试` });
         return true;
       }
       if (d.status === 'completed') {
@@ -703,9 +718,40 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       // 用户操作或调度器中止的任务（已取消/已暂停/已放回队列）：保留状态，不自动重试、不覆盖
       // 终态（completed/exporting/failed）也直接忽略迟到 ERROR：content 单循环只在结束时上报一次，
       // 但用户双击重试等操作可能造成 background 状态与 content 循环不同步，防止终态被回退重下
+      // ★ stopping 确认：停滞判定发 CANCEL 后 content 旧循环退出的确认信号。
+      //   此时才把任务转 queued 重新入队（重派只在旧循环确认退出后发生，杜绝竞态），
+      //   并在此处累计 consecutiveFails（≤3 次自动重派，超过标 failed 放弃）。
+      if (d.status === 'stopping' && (msg.error || '').includes('已暂停')) {
+        const fails = (d.consecutiveFails || 0) + 1;
+        d.consecutiveFails = fails;
+        if (fails <= 3) {
+          d.status = 'queued';
+          d.error = `无进度自动重排（${fails}/3）`;
+          d.stalledAt = Date.now(); // 排到队尾最后执行，不插队
+          if (!tabQueues[d.tabId]) tabQueues[d.tabId] = [];
+          if (!tabQueues[d.tabId].includes(d.id)) tabQueues[d.tabId].push(d.id);
+          tabActive[d.tabId] = null; // 确认退出后释放并发槽
+          persist();
+          broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
+          log('warn', `[停滞] ${taskLabel(d.id)} 停止已确认，自动重排队尾（${fails}/3）`);
+          maybeDispatch();
+        } else {
+          d.status = 'failed';
+          d.error = `连续 ${fails} 次无进度，自动放弃（分片保留，可手动重试）`;
+          tabActive[d.tabId] = null;
+          persist();
+          broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
+          log('warn', `[停滞] ${taskLabel(d.id)} 连续 ${fails} 次无进度，标为失败`);
+          maybeDispatch();
+        }
+        return;
+      }
       if (msg.error === '已取消' || (msg.error || '').includes('已取消') ||
           d.status === 'paused' || d.status === 'cancelled' || d.status === 'queued' ||
-          d.status === 'completed' || d.status === 'exporting' || d.status === 'failed') {
+          d.status === 'completed' || d.status === 'exporting' || d.status === 'failed' ||
+          // 迟到的停滞确认（'已暂停'类错误）：任务已离开 stopping（SW 重启重派/downloading 或手动恢复），
+          // 忽略避免白走一次 retrying 往返
+          ((msg.error || '').includes('已暂停') && d.status === 'downloading')) {
         persist();
         broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
         return;
@@ -933,33 +979,37 @@ chrome.alarms.onAlarm.addListener((alarm) => {
   for (const d of stalled) {
     // tabActive 归属校验：只有当前仍由本任务占用并发槽时才释放，避免误清该 tab 其他任务的槽
     if (tabActive[d.tabId] !== d.id) continue;
+    // 两阶段停止：先发 CANCEL 通知 content 停止下载循环，任务进入 stopping 状态
+    // （占槽但不算 downloading、不参与重派），等 content 上报 DOWNLOAD_ERROR 确认
+    // 旧循环已退出后，才转 queued 重新入队由调度器重派。避免"不等确认就重派"
+    // 导致：新 START 撞上旧循环被忽略 / 迟到 DOWNLOAD_ERROR 双计数 / 状态抖动。
+    d.status = 'stopping';
+    d.error = '无进度，等待停止确认后自动重排';
+    d.stopPendingAt = Date.now(); // 超时兜底：content 无响应时强制转 queued
     // 通知 content 停止下载循环（防卡死循环继续空转/继续占资源）
     chrome.tabs.sendMessage(d.tabId, { type: 'CANCEL_DOWNLOAD', downloadId: d.id, reason: 'stalled' }).catch(() => {});
-    tabActive[d.tabId] = null;
-
-    // 自动重试：把任务重新放回等待队列末尾（stalledAt 排尾），由调度器自动重派——
-    // 不需要用户手动点"继续"。与下载失败共用 consecutiveFails（≤3 次自动重派，
-    // 超过则标 failed 放弃，防止无限重试占资源；真正完成后清零）。
-    const fails = (d.consecutiveFails || 0) + 1;
-    d.consecutiveFails = fails;
-    if (fails <= 3) {
-      d.status = 'queued';
-      d.error = `无进度自动重排（${fails}/3）`;
-      d.stalledAt = now; // 排到队尾最后执行，不插队
-      if (!tabQueues[d.tabId]) tabQueues[d.tabId] = [];
-      if (!tabQueues[d.tabId].includes(d.id)) tabQueues[d.tabId].push(d.id);
-      persist();
-      broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
-      log('warn', `[停滞] ${taskLabel(d.id)} 无进度超过 ${PROGRESS_TIMEOUT / 1000}s，自动重排队尾（${fails}/3）`);
-    } else {
-      d.status = 'failed';
-      d.error = `连续 ${fails} 次无进度，自动放弃（分片保留，可手动重试）`;
-      persist();
-      broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
-      log('warn', `[停滞] ${taskLabel(d.id)} 连续 ${fails} 次无进度，标为失败`);
-    }
+    persist();
+    broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
+    log('warn', `[停滞] ${taskLabel(d.id)} 无进度超过 ${PROGRESS_TIMEOUT / 1000}s，已发送停止信号，等待确认后自动重排`);
   }
-  if (stalled.length > 0) maybeDispatch();
+  // stopping 超时兜底：content 已死（页面关闭/冻结无响应）→ 收不到 DOWNLOAD_ERROR 确认，
+  // 30s 后强制转 queued 重派（此时旧循环必然已随页面销毁，无竞态）
+  const now2 = Date.now();
+  const stuck = Object.values(downloads).filter(d => d.status === 'stopping' && d.stopPendingAt && now2 - d.stopPendingAt > 30000);
+  for (const d of stuck) {
+    // 释放并发槽：stopping 一直占着槽（等待确认），超时兜底转 queued 时必须释放，
+    // 否则 maybeDispatch 因 tabActive[tabId] 非空永久跳过该 tab，任务卡死永不重派
+    tabActive[d.tabId] = null;
+    d.status = 'queued';
+    d.error = '停止确认超时，自动重排队尾';
+    d.stalledAt = now2; // 排到队尾
+    if (!tabQueues[d.tabId]) tabQueues[d.tabId] = [];
+    if (!tabQueues[d.tabId].includes(d.id)) tabQueues[d.tabId].push(d.id);
+    persist();
+    broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
+    log('warn', `[停滞] ${taskLabel(d.id)} 停止确认超时（content 无响应），强制重排队尾`);
+  }
+  if (stalled.length > 0 || stuck.length > 0) maybeDispatch();
 });
 
 // 心跳探测：downloading 任务若 content script 已死（页面导航/刷新/冻结后无感知），
@@ -1055,6 +1105,15 @@ chrome.storage.local.get('vgp_downloads', data => {
         if (!tabQueues[d.tabId].includes(d.id)) tabQueues[d.tabId].push(d.id);
       } else if (d.status === 'downloading' || d.status === 'exporting' || d.status === 'retrying') {
         tabActive[d.tabId] = d.id;
+      } else if (d.status === 'stopping') {
+        // SW 重启后 content 旧循环已随页面销毁（或消息通道断裂），无需再等确认：
+        // 直接转 queued 重排，由调度器重新派发（分片保留在 OPFS 可续传）
+        d.status = 'queued';
+        d.error = '停止流程被 SW 重启中断，自动重排队尾';
+        d.stopPendingAt = null; // 清除：否则派发后超时判定可能误触发
+        d.stalledAt = Date.now(); // 排到队尾
+        if (!tabQueues[d.tabId]) tabQueues[d.tabId] = [];
+        if (!tabQueues[d.tabId].includes(d.id)) tabQueues[d.tabId].push(d.id);
       }
     }
     persist();
