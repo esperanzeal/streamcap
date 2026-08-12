@@ -974,9 +974,13 @@ chrome.alarms.onAlarm.addListener((alarm) => {
   const stalled = Object.values(downloads).filter(d => {
     if (d.status !== 'downloading') return false;
     // 后台标签节流时 PROGRESS 上报被 Chrome 降频（setInterval 最低 1 分钟一次），
-    // 仅凭"90s 无 done 增长"会误判停滞。若近期收到过 HEARTBEAT（content 消息循环
-    // 活着，只是被节流），不判停滞——真正卡死时 HEARTBEAT 也会停。
-    if (d.lastPing && now - d.lastPing < HEARTBEAT_WINDOW) return false;
+    // 仅凭"90s 无 done 增长"会误判停滞。豁免条件必须**同时满足**：
+    //   (a) 近期收到 HEARTBEAT（content 消息循环活着）
+    //   (b) 近期也收到过 PROGRESS（说明下载在推进，只是被节流慢）
+    // 若 HEARTBEAT 新鲜但 PROGRESS 停了 → 正是"fetch 挂起但 setInterval 活着"的
+    // 循环卡死场景（心跳≠进度，注释见 HEARTBEAT 处理），不能豁免，必须判停滞。
+    if (d.lastPing && now - d.lastPing < HEARTBEAT_WINDOW &&
+        d.lastProgressAt && now - d.lastProgressAt < PROGRESS_TIMEOUT) return false;
     // 刚派发（dispatchTab 已重置 lastProgressAt）的任务有完整宽限期，不会秒判
     const last = d.lastProgressAt || d.createdAt || 0;
     return now - last > PROGRESS_TIMEOUT;
