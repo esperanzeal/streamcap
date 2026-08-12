@@ -31,6 +31,8 @@
 
   // ============ AbortController 管理 ============
   const abortControllers = new Map(); // downloadId → AbortController
+  // 取消来源（手动暂停/手动取消/停滞判定/心跳兜底/页面导航）→ 主循环 catch AbortError 时用不同文案
+  const cancelReasons = new Map(); // downloadId → reason 字符串
 
   function getAbortController(downloadId) {
     let ac = abortControllers.get(downloadId);
@@ -40,6 +42,7 @@
 
   function removeAbortController(downloadId) {
     abortControllers.delete(downloadId);
+    cancelReasons.delete(downloadId);
   }
 
   // 清理某个 downloadId 的所有 OPFS 文件
@@ -575,8 +578,36 @@
       stopHeartbeat(downloadId);
       hideHiddenBanner();
       if (err.name === 'AbortError') {
-        log('info', `[${taskLabel}] 下载被用户取消，分片已保留可续传`);
-        chrome.runtime.sendMessage({ type: 'DOWNLOAD_ERROR', downloadId, error: '已取消', done: totalDone, total });
+        // 区分取消来源：调度器自动暂停（停滞/心跳/导航）≠ 用户手动暂停/取消
+        const reason = cancelReasons.get(downloadId);
+        let msg, errText;
+        switch (reason) {
+          case 'manual_pause':
+            msg = '已暂停（手动），分片已保留可续传';
+            errText = '已暂停';
+            break;
+          case 'manual_cancel':
+            msg = '已取消（手动），分片已保留可续传';
+            errText = '已取消';
+            break;
+          case 'stalled':
+            msg = '已暂停（自动：长时间无进度），分片已保留可续传';
+            errText = '已暂停(无进度)';
+            break;
+          case 'heartbeat':
+            msg = '已暂停（自动：页面无响应），分片已保留可续传';
+            errText = '已暂停(页面无响应)';
+            break;
+          case 'navigation':
+            msg = '已暂停（自动：页面刷新/跳转），分片已保留可续传';
+            errText = '已暂停(页面刷新)';
+            break;
+          default:
+            msg = '下载被取消，分片已保留可续传';
+            errText = '已取消';
+        }
+        log('info', `[${taskLabel}] ${msg}`);
+        chrome.runtime.sendMessage({ type: 'DOWNLOAD_ERROR', downloadId, error: errText, done: totalDone, total });
       } else {
         log('error', `[${taskLabel}] 下载失败: ${err.message}`);
         // 永久错误（404/源站删除/无分片）→ permanent:true，background 直接判失败不重派
@@ -633,8 +664,11 @@
     if (msg.type === 'CANCEL_DOWNLOAD') {
       const ac = abortControllers.get(msg.downloadId);
       if (ac) {
+        // 记录取消来源：调度器（停滞/心跳/导航）与用户手动操作区分开，日志不再一律写"下载被用户取消"
+        const reason = msg.reason || 'manual_cancel';
+        cancelReasons.set(msg.downloadId, reason);
         ac.abort();
-        log('info', `[${msg.downloadId}] 发送中止信号`);
+        log('info', `[${msg.downloadId}] 发送中止信号（来源: ${reason}）`);
       }
       sendResponse({ ok: true });
       return;

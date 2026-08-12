@@ -174,7 +174,7 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
     d.error = '页面刷新/跳转，可点继续续传';
     tabActive[tabId] = null;
     // 通知 content 停止下载：否则循环可能继续写 OPFS，且点"继续"时新旧循环会共用同一控制器
-    chrome.tabs.sendMessage(tabId, { type: 'CANCEL_DOWNLOAD', downloadId: active }).catch(() => {});
+    chrome.tabs.sendMessage(tabId, { type: 'CANCEL_DOWNLOAD', downloadId: active, reason: 'navigation' }).catch(() => {});
     persist();
     broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
     log('warn', `[页面导航] ${taskLabel(active)} 因页面刷新/跳转暂停（分片已保留）`);
@@ -399,7 +399,7 @@ function pauseDownload(downloadId) {
     d.status = 'paused';
     tabActive[tabId] = null;
     // 暂停：分片保留在 OPFS，可随时续传
-    chrome.tabs.sendMessage(tabId, { type: 'CANCEL_DOWNLOAD', downloadId }).catch(() => {});
+    chrome.tabs.sendMessage(tabId, { type: 'CANCEL_DOWNLOAD', downloadId, reason: 'manual_pause' }).catch(() => {});
     maybeDispatch();
   }
   d.error = '已暂停，点击继续恢复';
@@ -420,7 +420,7 @@ function cancelDownload(downloadId) {
     d.status = 'cancelled';
     tabActive[tabId] = null;
     // 取消：分片同样保留在 OPFS（浏览器退出时自动清理），可续传
-    chrome.tabs.sendMessage(tabId, { type: 'CANCEL_DOWNLOAD', downloadId }).catch(() => {});
+    chrome.tabs.sendMessage(tabId, { type: 'CANCEL_DOWNLOAD', downloadId, reason: 'manual_cancel' }).catch(() => {});
     maybeDispatch();
   }
   persist();
@@ -924,7 +924,7 @@ chrome.alarms.onAlarm.addListener((alarm) => {
     d.stalledAt = now; // 独立停滞时间戳：manager 排序时排在队尾，不污染 createdAt 语义
     tabActive[d.tabId] = null;
     // 通知 content 停止下载循环（防卡死循环继续空转/继续占资源）
-    chrome.tabs.sendMessage(d.tabId, { type: 'CANCEL_DOWNLOAD', downloadId: d.id }).catch(() => {});
+    chrome.tabs.sendMessage(d.tabId, { type: 'CANCEL_DOWNLOAD', downloadId: d.id, reason: 'stalled' }).catch(() => {});
     persist();
     broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
     log('warn', `[停滞] ${taskLabel(d.id)} 无进度超过 ${PROGRESS_TIMEOUT / 1000}s，标为暂停并移至队尾`);
@@ -952,7 +952,7 @@ function pingDeadTask(d, pauseReason) {
         cur.error = pauseReason;
         tabActive[cur.tabId] = null;
         // 通知 content 停止下载（与 pauseDownload 对齐，防循环继续写 OPFS）
-        chrome.tabs.sendMessage(cur.tabId, { type: 'CANCEL_DOWNLOAD', downloadId: cur.id }).catch(() => {});
+        chrome.tabs.sendMessage(cur.tabId, { type: 'CANCEL_DOWNLOAD', downloadId: cur.id, reason: 'heartbeat' }).catch(() => {});
         persist();
         broadcast({ type: 'DOWNLOAD_UPDATE', download: cur });
         log('warn', `[心跳] ${taskLabel(cur.id)} content 无响应，标为可续传暂停`);
