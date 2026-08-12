@@ -689,13 +689,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       }
       d.pct = msg.pct; d.done = msg.done; d.total = msg.total;
       d.speed = msg.speed || '';
-      // 仅当已下载分片数有实际增长时才刷新"最后活跃"时间戳：
-      // content 的节流上报（慢网批次内每 15s）done 可能不变，不能算进度——
-      // 否则真卡死会被节流上报掩盖，停滞判定永远不触发。
-      if ((d.lastDone || 0) !== msg.done) {
-        d.lastDone = msg.done;
-        d.lastProgressAt = Date.now();
-      }
+      // 到达即刷新"最后活跃"：content 每发一次 PROGRESS 说明下载循环在主动工作
+      // （含慢批次节流上报、坏分片重试阶段——done 不变但在干活）。
+      // 真卡死时 PROGRESS 会完全停止（fetch 挂起后循环不再上报），
+      // 由停滞判定的"PROGRESS 停 且 HEARTBEAT 停"双条件兜底，不会被掩盖。
+      d.lastProgressAt = Date.now();
+      d.lastDone = msg.done;
       broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
     }
     return;
@@ -969,21 +968,18 @@ chrome.alarms.onAlarm.addListener((alarm) => {
   // 消息会持续到达但 done 不变；只有 done 真正推进才刷新 lastProgressAt。
   // 阈值 90s 已覆盖慢网最坏批次间隔（节流上报保证 done 增长及时可见）。
   const now = Date.now();
-  const PROGRESS_TIMEOUT = 90000; // 90s 已下载分片数无增长 → 判卡死（配合 content 节流上报，慢网不会误判）
+  const PROGRESS_TIMEOUT = 90000; // 90s 无 PROGRESS → 可疑（真卡死时 PROGRESS 完全停）
   const HEARTBEAT_WINDOW = 120000; // content 心跳窗口：后台标签节流下 HEARTBEAT 可能 60s 才到一次
   const stalled = Object.values(downloads).filter(d => {
     if (d.status !== 'downloading') return false;
-    // 后台标签节流时 PROGRESS 上报被 Chrome 降频（setInterval 最低 1 分钟一次），
-    // 仅凭"90s 无 done 增长"会误判停滞。豁免条件必须**同时满足**：
-    //   (a) 近期收到 HEARTBEAT（content 消息循环活着）
-    //   (b) 近期也收到过 PROGRESS（说明下载在推进，只是被节流慢）
-    // 若 HEARTBEAT 新鲜但 PROGRESS 停了 → 正是"fetch 挂起但 setInterval 活着"的
-    // 循环卡死场景（心跳≠进度，注释见 HEARTBEAT 处理），不能豁免，必须判停滞。
-    if (d.lastPing && now - d.lastPing < HEARTBEAT_WINDOW &&
-        d.lastProgressAt && now - d.lastProgressAt < PROGRESS_TIMEOUT) return false;
-    // 刚派发（dispatchTab 已重置 lastProgressAt）的任务有完整宽限期，不会秒判
-    const last = d.lastProgressAt || d.createdAt || 0;
-    return now - last > PROGRESS_TIMEOUT;
+    // 判定依据：PROGRESS 停（90s）且 HEARTBEAT 停（120s）才判真卡死。
+    // PROGRESS 到达即证明下载循环在主动工作（含坏分片重试、慢批次节流上报——
+    // done 可能不变但在干活），所以只要 PROGRESS 还在发就不判停滞；
+    // HEARTBEAT 停用于区分"页面冻结/后台节流导致上报慢"（心跳慢但活着）。
+    // 真卡死（fetch 挂起/循环死）：PROGRESS 与 HEARTBEAT 都会停 → 双条件命中。
+    const progressDead = now - (d.lastProgressAt || d.createdAt || 0) > PROGRESS_TIMEOUT;
+    const heartbeatDead = !d.lastPing || now - d.lastPing > HEARTBEAT_WINDOW;
+    return progressDead && heartbeatDead;
   });
   for (const d of stalled) {
     // tabActive 归属校验：只有当前仍由本任务占用并发槽时才释放，避免误清该 tab 其他任务的槽

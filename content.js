@@ -506,6 +506,9 @@
         }
 
         // 重试失败分片：fetchWithRetry(5) 即"同一分片连续尝试 5 次"，5 次全失败 → 上报任务失败
+        // 注意：重试阶段可能耗时很长（单片 20s×5+退避≈115s），期间 done 不变。
+        // 必须每片尝试后发一次 PROGRESS 让 background 知道"还在干活"（done 不变也发），
+        // 否则停滞判定（PROGRESS 停 90s）会把坏分片重试误判为卡死 → 取消重派 → 鬼打墙。
         for (let i = 0; i < batchCount; i++) {
           if (batchChunks[i] !== null) continue;
           const segNum = segStart + i + 1;
@@ -514,6 +517,8 @@
             const r = await fetchWithRetry(batchUrls[i], 5, signal, refHeaders);
             const rawBuf = await r.arrayBuffer();
             networkBytes += rawBuf.byteLength;
+            // 重试成功后立即上报（done 增长）
+            reportProgress(downloadId, Math.round(totalDone / total * 100), totalDone, total, '');
             let segData = new Uint8Array(rawBuf);
             if (keySegments.length > 0) {
               const ks = findKeyForSegment(keySegments, segStart + i);
