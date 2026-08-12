@@ -384,10 +384,21 @@
         meta = { downloadId, totalSegments: total, completedBatches: [], batchSize: 80 };
         await saveMeta(downloadId, meta);
       } else if (resumeFrom > 0) {
-        // 确保 meta 反映了之前的进度
-        const expectedBatches = Math.ceil(resumeFrom / meta.batchSize);
-        meta.completedBatches = [];
-        for (let b = 0; b < expectedBatches; b++) meta.completedBatches.push(b);
+        // 确保 meta 反映了之前的进度。
+        // ⚠️ 注意：resumeFrom 是 background 最后收到的 done（可能是批次下载中途的 mini 值），
+        // 不能按分片数直接推算出已完成批次——批次是原子落盘的（80 片全部写完才 push
+        // completedBatches），只有真正写过 OPFS 的批次才算完成。这里用 OPFS 实际校验：
+        // 逐批读 dl_{id}_batch_{b}.blob，存在才标记。杜绝"假标记未落盘批次 → 合并缓存丢失"。
+        const completedBatches = [];
+        const root = await navigator.storage.getDirectory();
+        const prefix = OPFS_PREFIX + `dl_${downloadId}_batch_`;
+        for await (const [name] of root) {
+          if (!name.startsWith(prefix)) continue;
+          const b = parseInt(name.slice(prefix.length));
+          if (!isNaN(b)) completedBatches.push(b);
+        }
+        completedBatches.sort((a, b) => a - b);
+        meta.completedBatches = completedBatches;
         await saveMeta(downloadId, meta);
       }
 
@@ -417,10 +428,18 @@
       const throttleTimer = setInterval(throttleReport, 5000); // 每 5s 检查一次是否满 15s
       for (let batchIdx = 0; batchIdx < totalBatches; batchIdx++) {
         if (completed.has(batchIdx)) {
-          // 已完成的 batch，只统计字节数
-          const buf = await opfsRead(`dl_${downloadId}_batch_${batchIdx}.blob`);
-          if (buf) {
-            totalBytes += buf.byteLength;
+          // 已完成的 batch，只统计字节数（用文件大小，不读整个 blob——千批次下避免巨量 IO）
+          let batchSize = 0;
+          try {
+            const root2 = await navigator.storage.getDirectory();
+            const fh = await root2.getFileHandle(`${OPFS_PREFIX}dl_${downloadId}_batch_${batchIdx}.blob`);
+            batchSize = (await fh.getFile()).size;
+          } catch { batchSize = 0; }
+          if (batchSize > 0) {
+            totalBytes += batchSize;
+            // 同步 totalDone：跳过的已完成批次也要计入总进度，避免重派后
+            // totalDone 停在 resumeFrom 而批次循环从当前批重新累计 → 进度条回退
+            totalDone = Math.min(batchIdx * BATCH_SIZE + BATCH_SIZE, total);
             log('info', `[${taskLabel}] 批次 ${batchIdx + 1}/${totalBatches} 已缓存，跳过`);
           } else {
             // 缓存丢失，重新下载
