@@ -191,7 +191,7 @@ function persist() {
     speed: d.speed, error: d.error, createdAt: d.createdAt, tabId: d.tabId,
     fileName: d.fileName, pageTitle: d.pageTitle, dupIndex: d.dupIndex,
     retryCount: d.retryCount, consecutiveFails: d.consecutiveFails,
-    lastProgressAt: d.lastProgressAt, stalledAt: d.stalledAt,
+    lastProgressAt: d.lastProgressAt, lastDone: d.lastDone, stalledAt: d.stalledAt,
   }));
   chrome.storage.local.set({ vgp_downloads: list });
 }
@@ -278,6 +278,7 @@ async function dispatchTab(tabId, downloadId) {
   d.error = null; // 下载恢复时清除历史错误提示
   if (!d.done) d.pct = 0; // 续传时保留已有进度
   d.lastProgressAt = Date.now(); // 派发即记"最后活跃"：启动/解析阶段计入宽限期，防误判停滞
+  d.lastDone = 0; // 派发清零：progress done 从 0 开始计数，防旧值干扰停滞判定
   d.stalledAt = null; // 清除历史停滞标记
   tabActive[tabId] = downloadId;
   persist();
@@ -667,7 +668,13 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     if (d) {
       d.pct = msg.pct; d.done = msg.done; d.total = msg.total;
       d.speed = msg.speed || '';
-      d.lastProgressAt = Date.now(); // 真实下载进度，用于超时无进度判定
+      // 仅当已下载分片数有实际增长时才刷新"最后活跃"时间戳：
+      // content 的节流上报（慢网批次内每 15s）done 可能不变，不能算进度——
+      // 否则真卡死会被节流上报掩盖，停滞判定永远不触发。
+      if ((d.lastDone || 0) !== msg.done) {
+        d.lastDone = msg.done;
+        d.lastProgressAt = Date.now();
+      }
       broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
     }
     return;
@@ -903,13 +910,14 @@ chrome.alarms.onAlarm.addListener((alarm) => {
     maybeDispatch(); // 队列里若有 queued 任务，趁机派发
   });
 
-  // 无进度超时判定：下载中任务若长时间没有真实进度（PROGRESS），说明下载循环卡死
+  // 无进度超时判定：下载中任务若已下载分片数长时间无增长，说明下载循环卡死
   // （fetch 挂起/页面冻结后消息循环还活着但下载不推进）。把任务标为可续传暂停、
   // 释放并发槽、记录 stalledAt 排到队尾——恢复调度后它排最后执行，不反复占槽。
-  // 阈值放宽到 180s：慢网/丢包时单分片 20s 超时 × (3 首轮 + 5 补试) 可能让一次
-  // mini 批次（4 分片并行）的 reportProgress 间隔逼近 100s+，后台 tab 定时器节流还会拉长。
+  // 判定依据是"done 增长"而非"收到消息"：content 在慢网批次内每 15s 节流上报，
+  // 消息会持续到达但 done 不变；只有 done 真正推进才刷新 lastProgressAt。
+  // 阈值 90s 已覆盖慢网最坏批次间隔（节流上报保证 done 增长及时可见）。
   const now = Date.now();
-  const PROGRESS_TIMEOUT = 180000; // 180s 无任何真实进度 → 判卡死
+  const PROGRESS_TIMEOUT = 90000; // 90s 已下载分片数无增长 → 判卡死（配合 content 节流上报，慢网不会误判）
   const stalled = Object.values(downloads).filter(d => {
     if (d.status !== 'downloading') return false;
     // 刚派发（dispatchTab 已重置 lastProgressAt）的任务有完整宽限期，不会秒判

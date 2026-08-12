@@ -401,6 +401,20 @@
       const downloadStartTime = performance.now();
 
       // 4. 分批下载
+      // 批次进度节流上报：慢网/大文件时单批次可能耗时 >90s，background 的停滞判定
+      // 依赖"done 增长"来刷新 lastProgressAt。这里每 15s 强制报一次当前已下载分片数，
+      // 让 background 能区分"下载在推进只是慢"与"真卡死"。
+      let lastThrottleReport = 0;
+      const throttleReport = () => {
+        const now = Date.now();
+        if (now - lastThrottleReport < 15000) return;
+        lastThrottleReport = now;
+        const elapsed = (performance.now() - downloadStartTime) / 1000;
+        const speed = elapsed > 1 ? formatSpeed(networkBytes / elapsed) : '';
+        const pct = Math.round((totalDone / total) * 100);
+        reportProgress(downloadId, pct, totalDone, total, speed);
+      };
+      const throttleTimer = setInterval(throttleReport, 5000); // 每 5s 检查一次是否满 15s
       for (let batchIdx = 0; batchIdx < totalBatches; batchIdx++) {
         if (completed.has(batchIdx)) {
           // 已完成的 batch，只统计字节数
@@ -519,6 +533,7 @@
       }
 
       // 5. 全部完成 → 合并导出
+      clearInterval(throttleTimer); // 停止节流上报（进入合并/导出阶段，状态变为 exporting，不再受停滞判定管辖）
       log('info', `[${taskLabel}] 下载完成，总大小 ${(totalBytes / 1024 / 1024).toFixed(1)}MB，开始合并...`);
       reportProgress(downloadId, 98, total, total, '合并中...');
 
