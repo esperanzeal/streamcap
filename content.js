@@ -383,7 +383,7 @@
       let meta = await loadMeta(downloadId);
       if (!meta || meta.totalSegments !== total) {
         // 新建元数据（或分片结构变了，重建）
-        meta = { downloadId, totalSegments: total, completedBatches: [], batchSize: 80 };
+        meta = { downloadId, totalSegments: total, completedBatches: [], batchSize: 40 };
         await saveMeta(downloadId, meta);
       } else if (resumeFrom > 0) {
         // 确保 meta 反映了之前的进度。
@@ -869,7 +869,7 @@
       alert('读取分片元数据失败，分片可能已被清理。');
       return;
     }
-    const totalBatches = Math.ceil(meta.totalSegments / (meta.batchSize || 80));
+    const totalBatches = Math.ceil(meta.totalSegments / (meta.batchSize || 40));
 
     let handle;
     try {

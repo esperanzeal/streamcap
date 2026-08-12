@@ -48,6 +48,7 @@
       border-bottom: 1px solid #1a4a8a;
     }
     .page-info .page-hint { color: #484f58; margin-left: 8px; font-size: 10px; }
+    .ver { font-size: 11px; color: #6b7280; font-weight: normal; margin-left: 6px; }
     .hidden { display: none !important; }
     .filter-bar {
       display: flex; gap: 4px; padding: 6px 8px; border-top: 1px solid #0f3460;
@@ -62,7 +63,7 @@
 </head>
 <body>
   <div class="header">
-    <h1>🎬 StreamCap</h1>
+    <h1>🎬 StreamCap <span id="ver" class="ver"></span></h1>
     <div class="header-actions">
       <button id="btnMgr" class="btn-sm" title="下载管理">📂</button>
       <button id="btnClear" class="btn-sm" title="清空列表">🗑</button>

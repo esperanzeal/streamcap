@@ -2,6 +2,15 @@
 const $ = s => document.querySelector(s);
 const $$ = s => document.querySelectorAll(s);
 
+// 显示扩展版本号（从 manifest 读取，随版本升级自动更新）——方便确认加载的是新版本
+(function showVersion() {
+  try {
+    const v = chrome.runtime.getManifest().version;
+    const el = $('#ver');
+    if (el && v) el.textContent = 'v' + v;
+  } catch {}
+})();
+
 let downloads = {};
 let filter = 'all';
 
