@@ -666,6 +666,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.type === 'PROGRESS') {
     const d = downloads[msg.downloadId];
     if (d) {
+      // 状态守卫：终态任务（已完成/已取消/已失败/导出中）忽略迟到的 PROGRESS，
+      // 防止泄漏定时器或 SW 重启前 content 的残留消息覆盖终态、刷新进度条异常
+      if (d.status === 'completed' || d.status === 'failed' || d.status === 'cancelled' ||
+          d.status === 'exporting') {
+        return;
+      }
       d.pct = msg.pct; d.done = msg.done; d.total = msg.total;
       d.speed = msg.speed || '';
       // 仅当已下载分片数有实际增长时才刷新"最后活跃"时间戳：

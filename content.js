@@ -588,6 +588,8 @@
       stopHeartbeat(downloadId);
       hideHiddenBanner();
     } catch (err) {
+      // 所有退出路径都要清理节流上报定时器（成功路径在合并前已 clear，此处兜底异常/取消路径）
+      try { clearInterval(throttleTimer); } catch {}
       removeAbortController(downloadId);
       runningDownloads.delete(downloadId);
       stopHeartbeat(downloadId);
