@@ -687,6 +687,15 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           d.status === 'exporting') {
         return;
       }
+      // ★ done 单调性保护：续传/重派时 content 的 totalDone 会从 0 重新涨，跳过已落盘批次时
+      // 上报的 done 远小于 background 已记录的 done（如跳过 batch 上报 40 < 已记录 600），
+      // 若直接覆盖会把进度条拉回旧位置 → 与后续新进度交替闪烁（旧位置↔新位置来回跳）。
+      // 这里忽略 done 回退（不覆盖 d.done/d.pct），但仍刷新 lastProgressAt：
+      // content 还在主动发 PROGRESS = 循环活着，不能被停滞判定误判为卡死。
+      if (typeof msg.done === 'number' && typeof d.done === 'number' && msg.done < d.done) {
+        d.lastProgressAt = Date.now();
+        return;
+      }
       d.pct = msg.pct; d.done = msg.done; d.total = msg.total;
       d.speed = msg.speed || '';
       // 到达即刷新"最后活跃"：content 每发一次 PROGRESS 说明下载循环在主动工作
