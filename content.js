@@ -620,13 +620,18 @@
     } catch (err) {
       // 所有退出路径都要清理节流上报定时器（成功路径在合并前已 clear，此处兜底异常/取消路径）
       try { clearInterval(throttleTimer); } catch {}
+      // ★ 先读取取消来源：removeAbortController 会删掉 cancelReasons，必须在删除前读取，
+      // 否则 reason 永远丢成 undefined → default 分支上报"已取消" → background 误判为
+      // 用户手动取消（直接 return 不释放槽），停滞/心跳的自动重排确认失效，任务卡在
+      // stopping 占槽，只能靠 30s 超时兜底反复重排。
+      const cancelReason = cancelReasons.get(downloadId);
       removeAbortController(downloadId);
       runningDownloads.delete(downloadId);
       stopHeartbeat(downloadId);
       hideHiddenBanner();
       if (err.name === 'AbortError') {
         // 区分取消来源：调度器自动暂停（停滞/心跳/导航）≠ 用户手动暂停/取消
-        const reason = cancelReasons.get(downloadId);
+        const reason = cancelReason;
         let msg, errText;
         switch (reason) {
           case 'manual_pause':

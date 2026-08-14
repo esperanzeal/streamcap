@@ -729,7 +729,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       // ★ stopping 确认：停滞判定发 CANCEL 后 content 旧循环退出的确认信号。
       //   此时才把任务转 queued 重新入队（重派只在旧循环确认退出后发生，杜绝竞态），
       //   并在此处累计 consecutiveFails（≤3 次自动重派，超过标 failed 放弃）。
-      if (d.status === 'stopping' && (msg.error || '').includes('已暂停')) {
+      //   接受"已暂停"和"已取消"两种文案：content 侧 cancelReasons 若因异常丢失会报"已取消"，
+      //   但 stopping 状态必然是调度器触发（用户手动取消时 status 已是 cancelled，不会是 stopping），
+      //   所以两种文案都应走重排确认，否则任务卡在 stopping 占槽。
+      if (d.status === 'stopping' && ((msg.error || '').includes('已暂停') || (msg.error || '').includes('已取消'))) {
         const fails = (d.consecutiveFails || 0) + 1;
         d.consecutiveFails = fails;
         if (fails <= 3) {
