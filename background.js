@@ -191,7 +191,7 @@ function persist() {
     speed: d.speed, error: d.error, createdAt: d.createdAt, tabId: d.tabId,
     fileName: d.fileName, pageTitle: d.pageTitle, dupIndex: d.dupIndex,
     retryCount: d.retryCount, consecutiveFails: d.consecutiveFails,
-    lastProgressAt: d.lastProgressAt, lastDone: d.lastDone, stalledAt: d.stalledAt,
+    lastProgressAt: d.lastProgressAt, lastDone: d.lastDone, lastDoneAt: d.lastDoneAt, stalledAt: d.stalledAt,
     stopPendingAt: d.stopPendingAt,
   }));
   chrome.storage.local.set({ vgp_downloads: list });
@@ -280,6 +280,7 @@ async function dispatchTab(tabId, downloadId) {
   if (!d.done) d.pct = 0; // 续传时保留已有进度
   d.lastProgressAt = Date.now(); // 派发即记"最后活跃"：启动/解析阶段计入宽限期，防误判停滞
   d.lastDone = 0; // 派发清零：progress done 从 0 开始计数，防旧值干扰停滞判定
+  d.lastDoneAt = Date.now(); // done 增长的初始基准：派发即记，覆盖 m3u8 获取/解析/跳过批次的启动期
   d.stalledAt = null; // 清除历史停滞标记
   tabActive[tabId] = downloadId;
   persist();
@@ -696,14 +697,14 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         d.lastProgressAt = Date.now();
         return;
       }
+      // done 增长检测：进度真正推进才刷新 lastDoneAt（停滞判定的唯一依据）。
+      // 用旧 d.done 比较（在覆盖之前），msg.done > d.done 才算增长。
+      const progressed = typeof msg.done === 'number' && msg.done > (d.done || 0);
       d.pct = msg.pct; d.done = msg.done; d.total = msg.total;
       d.speed = msg.speed || '';
-      // 到达即刷新"最后活跃"：content 每发一次 PROGRESS 说明下载循环在主动工作
-      // （含慢批次节流上报、坏分片重试阶段——done 不变但在干活）。
-      // 真卡死时 PROGRESS 会完全停止（fetch 挂起后循环不再上报），
-      // 由停滞判定的"PROGRESS 停 且 HEARTBEAT 停"双条件兜底，不会被掩盖。
       d.lastProgressAt = Date.now();
       d.lastDone = msg.done;
+      if (progressed) d.lastDoneAt = Date.now();
       broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
     }
     return;
@@ -980,18 +981,15 @@ chrome.alarms.onAlarm.addListener((alarm) => {
   // 消息会持续到达但 done 不变；只有 done 真正推进才刷新 lastProgressAt。
   // 阈值 90s 已覆盖慢网最坏批次间隔（节流上报保证 done 增长及时可见）。
   const now = Date.now();
-  const PROGRESS_TIMEOUT = 90000; // 90s 无 PROGRESS → 可疑（真卡死时 PROGRESS 完全停）
-  const HEARTBEAT_WINDOW = 120000; // content 心跳窗口：后台标签节流下 HEARTBEAT 可能 60s 才到一次
+  const DONE_TIMEOUT = 90000; // 90s 无进度增长（done 不变）→ 判停滞踢出
   const stalled = Object.values(downloads).filter(d => {
     if (d.status !== 'downloading') return false;
-    // 判定依据：PROGRESS 停（90s）且 HEARTBEAT 停（120s）才判真卡死。
-    // PROGRESS 到达即证明下载循环在主动工作（含坏分片重试、慢批次节流上报——
-    // done 可能不变但在干活），所以只要 PROGRESS 还在发就不判停滞；
-    // HEARTBEAT 停用于区分"页面冻结/后台节流导致上报慢"（心跳慢但活着）。
-    // 真卡死（fetch 挂起/循环死）：PROGRESS 与 HEARTBEAT 都会停 → 双条件命中。
-    const progressDead = now - (d.lastProgressAt || d.createdAt || 0) > PROGRESS_TIMEOUT;
-    const heartbeatDead = !d.lastPing || now - d.lastPing > HEARTBEAT_WINDOW;
-    return progressDead && heartbeatDead;
+    // 判定依据：done（已下载分片数）超时未增长。
+    // 真卡死（fetch 挂起/循环死）时 done 永远不涨；慢下载/重试阶段 done 会涨（慢但涨）。
+    // 不再用"PROGRESS 停 且 HEARTBEAT 停"双条件——那两者是 content 里独立的定时器，
+    // 下载循环卡死时照样在发，导致 lastProgressAt/lastPing 永远新鲜，任务永远踢不出去。
+    const doneStalled = now - (d.lastDoneAt || d.createdAt || 0) > DONE_TIMEOUT;
+    return doneStalled;
   });
   for (const d of stalled) {
     // tabActive 归属校验：只有当前仍由本任务占用并发槽时才释放，避免误清该 tab 其他任务的槽
@@ -1007,7 +1005,7 @@ chrome.alarms.onAlarm.addListener((alarm) => {
     chrome.tabs.sendMessage(d.tabId, { type: 'CANCEL_DOWNLOAD', downloadId: d.id, reason: 'stalled' }).catch(() => {});
     persist();
     broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
-    log('warn', `[停滞] ${taskLabel(d.id)} 无进度超过 ${PROGRESS_TIMEOUT / 1000}s，已发送停止信号，等待确认后自动重排`);
+    log('warn', `[停滞] ${taskLabel(d.id)} 无进度超过 ${DONE_TIMEOUT / 1000}s，已发送停止信号，等待确认后自动重排`);
   }
   // stopping 超时兜底：content 已死（页面关闭/冻结无响应）→ 收不到 DOWNLOAD_ERROR 确认，
   // 30s 后强制转 queued 重派（此时旧循环必然已随页面销毁，无竞态）
