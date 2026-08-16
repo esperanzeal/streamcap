@@ -167,6 +167,7 @@ chrome.webRequest.onHeadersReceived.addListener(
       headers.push({ name: 'Access-Control-Allow-Origin', value: '*' });
       headers.push({ name: 'Access-Control-Allow-Methods', value: 'GET, HEAD, OPTIONS' });
       headers.push({ name: 'Access-Control-Allow-Headers', value: 'Range, Referer, Content-Type' });
+      log('debug', `[CORS注入] OPTIONS ${details.url.substring(0, 70)} → 注入预检头（${details.statusCode}）`);
       return { responseHeaders: headers };
     }
     // 视频响应：注入 CORS 头（DNR 扩展名规则的 Content-Type 兜底）
@@ -176,6 +177,7 @@ chrome.webRequest.onHeadersReceived.addListener(
     if (!isVideo) return;
     if (headers.some(h => h.name.toLowerCase() === 'access-control-allow-origin')) return;
     headers.push({ name: 'Access-Control-Allow-Origin', value: '*' });
+    log('debug', `[CORS注入] ${details.url.substring(0, 70)} → 视频响应注入 ACAO（${details.statusCode}, CT=${v || '?'}）`);
     return { responseHeaders: headers };
   },
   { urls: ['<all_urls>'] },

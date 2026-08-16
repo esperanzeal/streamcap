@@ -2,6 +2,7 @@
 import { state, persist, broadcast, taskLabel } from './state.js';
 import { log } from './log.js';
 import { detectFormat } from './formats.js';
+import { addCorsRule } from './cors.js';
 
 export function enqueue(tabId, url, referer, resolution, pageUrl, pageTitle, force = false) {
   const { downloads, tabQueues } = state;
@@ -69,6 +70,10 @@ async function dispatchTab(tabId, downloadId) {
   state.tabActive[tabId] = downloadId;
   persist();
   broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
+  // ★ 给该任务 URL 加 DNR CORS 规则（无扩展名 CDN 如 部分无扩展名 CDN /stream?t= 无 CORS 头，
+  //   content 页面的 fetch 需要响应有 Access-Control-Allow-Origin 才能读取；派发即加，
+  //   规则按 URL host+path 匹配，下载期间一直生效）
+  addCorsRule(d.url).catch(() => {});
 
   const resumeFrom = d.done || 0;
   const settings = await chrome.storage.local.get('vgp_settings');
