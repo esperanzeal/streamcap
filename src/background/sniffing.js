@@ -151,6 +151,28 @@ chrome.webRequest.onHeadersReceived.addListener(
   ['responseHeaders']
 );
 
+// ============ 视频响应注入 CORS 头 ============
+// 部分无扩展名 CDN 等无扩展名 CDN（/stream?t=）不返回 Access-Control-Allow-Origin，
+// 页面上下文 content fetch 被 CORS 拦截（Failed to fetch）。cors_rules.json 只按
+// URL 扩展名（.mp4/.ts/.m4s）注入，覆盖不到这类。这里按响应 Content-Type 兜底：
+// 任何视频流响应（video/*、mpegurl、dash+xml 或 URL 后缀是视频格式）都注入 CORS 头。
+const VIDEO_CT = ['video/', 'application/vnd.apple.mpegurl', 'application/x-mpegurl', 'audio/mpegurl', 'application/dash+xml'];
+chrome.webRequest.onHeadersReceived.addListener(
+  (details) => {
+    const ct = (details.responseHeaders || []).find(h => h.name.toLowerCase() === 'content-type');
+    const v = (ct?.value || '').toLowerCase();
+    const isVideo = VIDEO_CT.some(p => v.includes(p)) || detectFormat(details.url) !== 'unknown';
+    if (!isVideo) return;
+    const headers = details.responseHeaders;
+    const hasCors = headers.some(h => h.name.toLowerCase() === 'access-control-allow-origin');
+    if (hasCors) return;
+    headers.push({ name: 'Access-Control-Allow-Origin', value: '*' });
+    return { responseHeaders: headers };
+  },
+  { urls: ['<all_urls>'] },
+  ['blocking', 'responseHeaders']
+);
+
 chrome.tabs.onRemoved.addListener((tabId) => {
   delete state.sniffStore[tabId];
   const active = state.tabActive[tabId];
