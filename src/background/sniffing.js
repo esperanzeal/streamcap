@@ -159,13 +159,22 @@ chrome.webRequest.onHeadersReceived.addListener(
 const VIDEO_CT = ['video/', 'application/vnd.apple.mpegurl', 'application/x-mpegurl', 'audio/mpegurl', 'application/dash+xml'];
 chrome.webRequest.onHeadersReceived.addListener(
   (details) => {
-    const ct = (details.responseHeaders || []).find(h => h.name.toLowerCase() === 'content-type');
+    const headers = details.responseHeaders;
+    // preflight OPTIONS：Range 头不在 CORS safelist，带 Range 的 fetch 会先发 OPTIONS 预检。
+    // 必须给预检响应注入 Allow-Origin/Methods/Headers，否则预检失败 → fetch 报 Failed to fetch。
+    if (details.method === 'OPTIONS') {
+      if (headers.some(h => h.name.toLowerCase() === 'access-control-allow-origin')) return;
+      headers.push({ name: 'Access-Control-Allow-Origin', value: '*' });
+      headers.push({ name: 'Access-Control-Allow-Methods', value: 'GET, HEAD, OPTIONS' });
+      headers.push({ name: 'Access-Control-Allow-Headers', value: 'Range, Referer, Content-Type' });
+      return { responseHeaders: headers };
+    }
+    // 视频响应：注入 CORS 头（DNR 扩展名规则的 Content-Type 兜底）
+    const ct = headers.find(h => h.name.toLowerCase() === 'content-type');
     const v = (ct?.value || '').toLowerCase();
     const isVideo = VIDEO_CT.some(p => v.includes(p)) || detectFormat(details.url) !== 'unknown';
     if (!isVideo) return;
-    const headers = details.responseHeaders;
-    const hasCors = headers.some(h => h.name.toLowerCase() === 'access-control-allow-origin');
-    if (hasCors) return;
+    if (headers.some(h => h.name.toLowerCase() === 'access-control-allow-origin')) return;
     headers.push({ name: 'Access-Control-Allow-Origin', value: '*' });
     return { responseHeaders: headers };
   },
