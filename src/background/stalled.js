@@ -35,6 +35,32 @@ chrome.alarms.onAlarm.addListener((alarm) => {
   }
 
   if (alarm.name !== KEEPALIVE_ALARM) return;
+  // ★ 定期清理：queued 任务所在 tab 已失效（页面被关闭/无效）→ 标 failed，
+  //   否则任务停留在 queued 永不派发（maybeDispatch 只在并发有空槽时才轮到它，
+  //   且 dispatchTab 预检只在派发时触发；这里兜底每分钟清理一次）。
+  const queuedTasks = Object.values(state.downloads).filter(d => d.status === 'queued');
+  if (queuedTasks.length > 0) {
+    Promise.all(queuedTasks.map(d => chrome.tabs.get(d.tabId).then(() => null, () => d.id)))
+      .then(invalidIds => {
+        const bad = invalidIds.filter(Boolean);
+        if (bad.length) {
+          for (const id of bad) {
+            const d = state.downloads[id];
+            if (d && d.status === 'queued') {
+              d.status = 'failed';
+              d.error = '页面已关闭，无法下载';
+              const q = state.tabQueues[d.tabId];
+              if (q) { const i = q.indexOf(id); if (i >= 0) q.splice(i, 1); }
+              persist();
+              broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
+            }
+          }
+          log('warn', `[清理] ${bad.length} 个排队任务所在页面已关闭，标为失败`);
+          maybeDispatch();
+        }
+      });
+  }
+
   // 心跳兜底：SW 刚被唤醒时，检查 downloading 任务是否还活着。
   // 若 content 已死（页面被冻结/关闭），标为可续传暂停并让出并发槽。
   const pingers = Object.values(state.downloads)

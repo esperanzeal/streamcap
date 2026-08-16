@@ -41,6 +41,19 @@ export function enqueue(tabId, url, referer, resolution, pageUrl, pageTitle, for
 async function dispatchTab(tabId, downloadId) {
   const d = state.downloads[downloadId];
   if (!d) return;
+  // ★ tab 有效性预检：页面已关闭/无效的任务直接标 failed，不尝试注入——
+  //   否则任务停留在 queued 永不派发，手动点开始才暴露"注入失败"。
+  try {
+    await chrome.tabs.get(tabId);
+  } catch {
+    d.status = 'failed';
+    d.error = '页面已关闭，无法下载';
+    persist();
+    broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
+    log('warn', `[调度] ${taskLabel(downloadId)} 所在页面已关闭，标为失败`);
+    maybeDispatch();
+    return;
+  }
   d.status = 'downloading';
   d.error = null; // 下载恢复时清除历史错误提示
   if (!d.done) d.pct = 0; // 续传时保留已有进度

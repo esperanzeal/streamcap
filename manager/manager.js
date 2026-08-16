@@ -26,12 +26,13 @@ const BARS = { queued: 'bar-q', downloading: 'bar-go', retrying: 'bar-go', expor
 function act(msg) { chrome.runtime.sendMessage(msg).catch(() => {}); }
 
 function render() {
-  // 排序：进行中/下载中永远置顶（用户看下载任务不用拉到底），其余按创建时间倒序
+  // 排序：状态分组（进行中/下载中置顶），组内按 priority 序号小到大
+  // （priority 变化会触发 DOWNLOAD_UPDATE → render，自动重排）
   const statusRank = { downloading: 0, retrying: 0, exporting: 0, stopping: 0, queued: 1, paused: 1, completed: 2, failed: 2, cancelled: 2 };
   const all = Object.values(downloads).sort((a, b) => {
     const ra = statusRank[a.status] ?? 3, rb = statusRank[b.status] ?? 3;
     if (ra !== rb) return ra - rb;
-    return b.createdAt - a.createdAt;
+    return (a.priority ?? Number.MAX_SAFE_INTEGER) - (b.priority ?? Number.MAX_SAFE_INTEGER);
   });
   const cnt = {};
   all.forEach(d => { cnt[d.status] = (cnt[d.status] || 0) + 1; });
