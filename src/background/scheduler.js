@@ -160,47 +160,56 @@ async function getMaxConcurrent() {
 
 // 全局并发调度：最多同时跑 maxConcurrent 个任务（0=无上限），每个 tab 至多 1 个
 // 按任务创建时间排序推进（FIFO 优先级）
-export async function maybeDispatch() {
-  const max = await getMaxConcurrent();
-  const unlimited = max === 0;
-  const activeCount = Object.keys(state.tabActive).filter(t => state.tabActive[t]).length;
-  if (!unlimited && activeCount >= max) return;
+// ★ 串行化：prioritizeDownload 触发的调度、被替换任务确认触发的调度可能并发执行，
+//   都读同一份 tabActive/tabQueues，先后派发互相覆盖（优先任务被后到的调度顶掉）。
+//   用 promise 链保证同一时刻只有一个 maybeDispatch 在跑。
+let dispatchChain = Promise.resolve();
+export function maybeDispatch() {
+  const run = async () => {
+    const max = await getMaxConcurrent();
+    const unlimited = max === 0;
+    const activeCount = Object.keys(state.tabActive).filter(t => state.tabActive[t]).length;
+    if (!unlimited && activeCount >= max) return;
 
-  // 收集所有可派发的候选（排队中且所在 tab 空闲），按创建时间排序
-  // 停滞任务（stalledAt）按停滞时刻排到队尾最后执行，不占用优先调度位
-  const candidates = [];
-  for (const tid of Object.keys(state.tabQueues)) {
-    const tabId = Number(tid);
-    if (state.tabActive[tabId]) continue; // 该 tab 已有活动任务
-    for (const did of state.tabQueues[tabId]) {
-      const d = state.downloads[did];
-      if (d && d.status === 'queued') candidates.push({
-        tabId, did,
-        sortKey: d.stalledAt || d.createdAt || 0,
-        priorityAt: d.priorityAt, // 优先下载标记：有值则排最前
-      });
+    // 收集所有可派发的候选（排队中且所在 tab 空闲），按创建时间排序
+    // 停滞任务（stalledAt）按停滞时刻排到队尾最后执行，不占用优先调度位
+    const candidates = [];
+    for (const tid of Object.keys(state.tabQueues)) {
+      const tabId = Number(tid);
+      if (state.tabActive[tabId]) continue; // 该 tab 已有活动任务
+      for (const did of state.tabQueues[tabId]) {
+        const d = state.downloads[did];
+        if (d && d.status === 'queued') candidates.push({
+          tabId, did,
+          sortKey: d.stalledAt || d.createdAt || 0,
+          priorityAt: d.priorityAt, // 优先下载标记：有值则排最前
+        });
+      }
     }
-  }
-  // 排序：优先任务（priorityAt）永远排最前（多个按优先时间），其余按 FIFO
-  candidates.sort((a, b) => {
-    const ap = a.priorityAt ? 0 : 1;
-    const bp = b.priorityAt ? 0 : 1;
-    if (ap !== bp) return ap - bp;
-    return a.sortKey - b.sortKey;
-  });
+    // 排序：优先任务（priorityAt）永远排最前（多个按优先时间），其余按 FIFO
+    candidates.sort((a, b) => {
+      const ap = a.priorityAt ? 0 : 1;
+      const bp = b.priorityAt ? 0 : 1;
+      if (ap !== bp) return ap - bp;
+      return a.sortKey - b.sortKey;
+    });
+    log('debug', `[调度] 候选: ${candidates.map(c => `#${c.did}${c.priorityAt ? '(优先)' : ''}`).join(', ')}`);
 
-  let slots = unlimited ? Infinity : (max - activeCount);
-  for (const c of candidates) {
-    if (slots <= 0) break;
-    if (state.tabActive[c.tabId]) continue; // 前面派发已占用该 tab
-    const q = state.tabQueues[c.tabId];
-    const idx = q.indexOf(c.did);
-    if (idx < 0) continue;
-    q.splice(idx, 1);
-    dispatchTab(c.tabId, c.did);
-    slots--;
-    log('info', `[调度] 派发 ${taskLabel(c.did)} → tab${c.tabId}（并发 ${max}，活跃 ${activeCount + 1}）`);
-  }
+    let slots = unlimited ? Infinity : (max - activeCount);
+    for (const c of candidates) {
+      if (slots <= 0) break;
+      if (state.tabActive[c.tabId]) continue; // 前面派发已占用该 tab
+      const q = state.tabQueues[c.tabId];
+      const idx = q.indexOf(c.did);
+      if (idx < 0) continue;
+      q.splice(idx, 1);
+      dispatchTab(c.tabId, c.did);
+      slots--;
+      log('info', `[调度] 派发 ${taskLabel(c.did)} → tab${c.tabId}（并发 ${max}，活跃 ${activeCount + 1}）`);
+    }
+  };
+  dispatchChain = dispatchChain.then(run).catch(() => {});
+  return dispatchChain;
 }
 
 // 全部暂停：所有活跃/排队任务 → paused（保留分片），供用户手动重新分配并发
