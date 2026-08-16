@@ -91,12 +91,15 @@ window.VGP = window.VGP || {};
     startHeartbeat(downloadId); // 下载期间保活 SW，防止空闲被回收
     if (document.hidden) showHiddenBanner();
 
-    // ★ 阶段3 格式分流：MP4 直链走 Range 分块下载（其余 m3u8/mpd 走下方分片下载）
+    // ★ 阶段3 格式分流：MP4 直链走 Range 分块下载，DASH(mpd) 走分片下载（其余 m3u8 走下方分片下载）
     // 优先用 background 传入的 format（部分站点等 URL 无 .mp4 后缀时靠 Content-Type 识别），
     // 兜底用 URL 后缀判断
     const fmt = format || detectFormat(m3u8Url);
     if (fmt === 'mp4') {
       return downloadDirect(downloadId, m3u8Url, resumeFrom, concurrency, referer, pageTitle, signal);
+    }
+    if (fmt === 'dash') {
+      return downloadDash(downloadId, m3u8Url, resumeFrom, concurrency, referer, pageTitle, signal);
     }
 
     let total;
@@ -674,6 +677,178 @@ window.VGP = window.VGP || {};
           type: 'DOWNLOAD_ERROR', downloadId, error: err.message,
           done: 0, total: 0,
           permanent: /404|永久错误/.test(err.message || ''),
+        });
+      }
+    }
+  }
+
+  // ============ DASH (mpd) 分片下载 ============
+  // 阶段3-2：解析 mpd → 视频轨最佳 Representation → init 段 + media 分片 → 拼接导出。
+  // 支持 SegmentList（显式分片）和 SegmentTemplate（$Number$ 模板，部分站点风格）。
+  // DASH fMP4 = init 段(moov) + media 段(mdat) 顺序拼接即完整 mp4。
+  function parseIsoDuration(s) {
+    const m = String(s).match(/PT(?:(\d+(?:\.\d+)?)H)?(?:(\d+(?:\.\d+)?)M)?(?:(\d+(?:\.\d+)?)S)?/);
+    if (!m) return 0;
+    return (parseFloat(m[1] || 0) * 3600 + parseFloat(m[2] || 0) * 60 + parseFloat(m[3] || 0)) * 1000;
+  }
+
+  async function downloadDash(downloadId, mpdUrl, resumeFrom, concurrency, referer, pageTitle, signal) {
+    const taskLabel = pageTitle ? `${pageTitle}.mp4` : `#${downloadId}`;
+    let totalItems = 0;
+    let totalDone = 0;
+    let throttleTimer = null;
+    try {
+      // 1. 获取 mpd
+      const resp = await fetchWithRetry(mpdUrl, 3, signal, {});
+      const xml = await resp.text();
+      const doc = new DOMParser().parseFromString(xml, 'application/xml');
+      if (doc.querySelector('parsererror')) throw new Error('mpd 解析失败');
+      // 2. 找视频轨 AdaptationSet
+      const as = [...doc.querySelectorAll('AdaptationSet')].find(a => {
+        const ct = a.getAttribute('contentType');
+        const mime = (a.getAttribute('mimeType') || '');
+        return ct === 'video' || (mime.includes('video/mp4') && ct !== 'audio');
+      });
+      if (!as) throw new Error('mpd 未找到视频轨');
+      // 3. 最佳 Representation（带宽最高）
+      const reps = [...as.querySelectorAll('Representation')];
+      if (!reps.length) throw new Error('mpd 无 Representation');
+      const rep = reps.sort((a, b) => (parseInt(b.getAttribute('bandwidth')) || 0) - (parseInt(a.getAttribute('bandwidth')) || 0))[0];
+      const repId = rep.getAttribute('id') || '';
+      const repl = s => String(s).replace(/\$RepresentationID\$/g, repId);
+      // 4. 分片列表（SegmentList 显式 / SegmentTemplate $Number$）
+      let initUrl = '';
+      let segUrls = [];
+      const segList = rep.querySelector('SegmentList') || as.querySelector('SegmentList');
+      if (segList) {
+        initUrl = repl(segList.getAttribute('initialization') || '');
+        segUrls = [...segList.querySelectorAll('SegmentURL')].map(s => repl(s.getAttribute('media') || '')).filter(Boolean);
+      } else {
+        const st = rep.querySelector('SegmentTemplate') || as.querySelector('SegmentTemplate');
+        if (!st) throw new Error('mpd 无 SegmentTemplate/SegmentList');
+        initUrl = repl(st.getAttribute('initialization') || '');
+        const mediaTpl = repl(st.getAttribute('media') || '');
+        const startNum = parseInt(st.getAttribute('startNumber')) || 1;
+        const timescale = parseInt(st.getAttribute('timescale')) || 1;
+        const segDur = parseInt(st.getAttribute('duration')) || 0;
+        let totalMs = 0;
+        const mpdEl = doc.querySelector('MPD');
+        const mpdDur = mpdEl && mpdEl.getAttribute('mediaPresentationDuration');
+        const period = doc.querySelector('Period');
+        const pDur = period && period.getAttribute('duration');
+        if (mpdDur) totalMs = parseIsoDuration(mpdDur);
+        else if (pDur) totalMs = parseIsoDuration(pDur);
+        if (!totalMs || !segDur) throw new Error('mpd 无法计算分片数（无时长信息）');
+        const segCount = Math.ceil(totalMs / (segDur * 1000 / timescale));
+        for (let i = 0; i < segCount; i++) segUrls.push(mediaTpl.replace(/\$Number\$/g, String(startNum + i)));
+      }
+      if (!initUrl) throw new Error('mpd 无 init 段 URL');
+      initUrl = resolveUrl(initUrl, mpdUrl);
+      segUrls = segUrls.map(u => resolveUrl(u, mpdUrl));
+      if (!segUrls.length) throw new Error('mpd 无分片');
+      totalItems = segUrls.length + 1; // [0]=init, [1..]=media 段
+      log('info', `[${taskLabel}] DASH：${segUrls.length} 个分片 + init 段，init=${initUrl.substring(0, 60)}`);
+
+      // 5. 断点元数据 + 下载（init 段 [0] + media 段 [1..]）
+      let meta = await loadMeta(downloadId);
+      if (!meta || meta.totalSegments !== totalItems) {
+        meta = { downloadId, totalSegments: totalItems, completedBatches: [], batchSize: 1 };
+        await saveMeta(downloadId, meta);
+      }
+      const completed = new Set(meta.completedBatches);
+      const CONCURRENCY = concurrency || 4;
+      const downloadStartTime = performance.now();
+      const throttleReport = () => {
+        const now = Date.now();
+        if (now - lastThrottle < 15000) return;
+        lastThrottle = now;
+        reportProgress(downloadId, Math.round(totalDone / totalItems * 100), totalDone, totalItems, '');
+      };
+      let lastThrottle = 0;
+      throttleTimer = setInterval(throttleReport, 5000);
+      const urls = [initUrl, ...segUrls];
+      for (let i = 0; i < urls.length; i++) {
+        if (completed.has(i)) {
+          totalDone = i;
+          reportProgress(downloadId, Math.round(totalDone / totalItems * 100), totalDone, totalItems, '');
+          continue;
+        }
+        let data;
+        try {
+          const r = await fetchWithRetry(urls[i], 3, signal, {});
+          data = new Uint8Array(await r.arrayBuffer());
+        } catch (err) {
+          if (err.name === 'AbortError') throw err;
+          if (/404/.test(err.message || '')) throw new Error(`段 ${i}/${totalItems} 返回 404（永久错误）`);
+          throw new Error(`段 ${i}/${totalItems} 下载失败: ${err.message}`);
+        }
+        await opfsWrite(`dl_${downloadId}_seg_${i}.bin`, data);
+        meta.completedBatches.push(i);
+        completed.add(i);
+        await saveMeta(downloadId, meta);
+        totalDone = i;
+        reportProgress(downloadId, Math.round(totalDone / totalItems * 100), totalDone, totalItems, '');
+        log('info', `[${taskLabel}] ${i === 0 ? 'init 段' : '分片 ' + i + '/' + segUrls.length} 完成`);
+      }
+      clearInterval(throttleTimer);
+
+      // 6. 拼接合并（init + media 段顺序）→ blob → DOWNLOAD_BLOB
+      log('info', `[${taskLabel}] 全部分片完成，开始合并...`);
+      reportProgress(downloadId, 98, totalItems, totalItems, '合并中...');
+      const parts = [];
+      for (let i = 0; i < totalItems; i++) {
+        const buf = await opfsRead(`dl_${downloadId}_seg_${i}.bin`);
+        if (!buf) throw new Error(`段 ${i} 缓存丢失`);
+        parts.push(new Blob([buf]));
+      }
+      const finalBlob = new Blob(parts, { type: 'video/mp4' });
+      log('success', `[${taskLabel}] 合并完成: ${(finalBlob.size / 1024 / 1024).toFixed(1)}MB`);
+      const blobUrl = URL.createObjectURL(finalBlob);
+      const filename = guessName(pageTitle || document.title);
+      chrome.runtime.sendMessage({ type: 'DOWNLOAD_BLOB', downloadId, blobUrl, filename }, (resp2) => {
+        if (chrome.runtime.lastError || !resp2 || !resp2.ok) {
+          const a = document.createElement('a');
+          a.href = blobUrl;
+          a.download = filename;
+          a.style.display = 'none';
+          (document.body || document.documentElement).appendChild(a);
+          a.click();
+          setTimeout(() => {
+            if (a.parentNode) a.parentNode.removeChild(a);
+            try { URL.revokeObjectURL(blobUrl); } catch {}
+            VGP.cleanupOpfs(downloadId);
+            chrome.runtime.sendMessage({ type: 'DOWNLOAD_ERROR', downloadId, error: '已通过页面 a.click() 触发下载，分片已清理', permanent: true }).catch(() => {});
+          }, 60000);
+        }
+      });
+      removeAbortController(downloadId);
+      runningDownloads.delete(downloadId);
+      stopHeartbeat(downloadId);
+      hideHiddenBanner();
+    } catch (err) {
+      try { clearInterval(throttleTimer); } catch {}
+      const cancelReason = cancelReasons.get(downloadId);
+      removeAbortController(downloadId);
+      runningDownloads.delete(downloadId);
+      stopHeartbeat(downloadId);
+      hideHiddenBanner();
+      if (err.name === 'AbortError') {
+        let errText = '已取消';
+        switch (cancelReason) {
+          case 'manual_pause': errText = '已暂停'; break;
+          case 'manual_cancel': errText = '已取消'; break;
+          case 'stalled': errText = '已暂停(无进度)'; break;
+          case 'heartbeat': errText = '已暂停(页面无响应)'; break;
+          case 'navigation': errText = '已暂停(页面刷新)'; break;
+        }
+        log('info', `[${taskLabel}] ${errText}，分片已保留可续传`);
+        chrome.runtime.sendMessage({ type: 'DOWNLOAD_ERROR', downloadId, error: errText, done: totalDone, total: totalItems });
+      } else {
+        log('error', `[${taskLabel}] DASH 下载失败: ${err.message}`);
+        chrome.runtime.sendMessage({
+          type: 'DOWNLOAD_ERROR', downloadId, error: err.message,
+          done: totalDone || resumeFrom, total: totalItems,
+          permanent: /404|永久错误|mpd 解析失败|未找到视频轨|无 Representation|无 SegmentTemplate|无法计算分片数|无 init 段 URL|无分片/.test(err.message || ''),
         });
       }
     }
