@@ -155,9 +155,9 @@ export async function prioritizeDownload(downloadId) {
     log('warn', `[优先] ${taskLabel(downloadId)} 替换 ${taskLabel(victim.id)}（进度 ${victim.done || 0} 片），等待停止确认后回队列队首`);
   }
 
-  // 优先任务：priority 设为"当前最小 - 1"，排序时必排最前（数字最小）
-  const minP = Math.min(...Object.values(state.downloads).map(x => x.priority ?? Number.MAX_SAFE_INTEGER));
-  d.priority = minP - 1;
+  // 优先任务：priority 用负向计数器递减（--priorityFloor），O(1) 且必排最前，
+  // 避免 Math.min 全量扫描和 priority 无界负增长
+  d.priority = --state.priorityFloor;
   const q = state.tabQueues[d.tabId];
   if (q) {
     const i = q.indexOf(downloadId);

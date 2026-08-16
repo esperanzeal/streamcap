@@ -325,15 +325,13 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           maybeDispatch();
           return;
         }
-        // 停滞重排：priority 设为当前最大 + 1（排到队尾）
-        const act = Object.values(state.downloads)
-          .filter(x => !['completed', 'failed', 'cancelled'].includes(x.status) && x.id !== d.id);
+        // 停滞重排：priority 用正向计数器递增（++prioritySeq），天然比所有已分配序号大 = 队尾
         const fails = (d.consecutiveFails || 0) + 1;
         d.consecutiveFails = fails;
         if (fails <= 3) {
           d.status = 'queued';
           d.error = `无进度自动重排（${fails}/3）`;
-          d.priority = Math.max(0, ...act.map(x => x.priority ?? 0)) + 1; // 排到队尾：Math.max(0,-Infinity)=0，空数组时不会变 -Infinity
+          d.priority = ++state.prioritySeq;
           if (!state.tabQueues[d.tabId]) state.tabQueues[d.tabId] = [];
           if (!state.tabQueues[d.tabId].includes(d.id)) state.tabQueues[d.tabId].push(d.id);
           state.tabActive[d.tabId] = null; // 确认退出后释放并发槽
@@ -455,6 +453,7 @@ chrome.storage.local.get('vgp_downloads', data => {
     sorted.forEach((d, i) => { if (d.priority === undefined || d.priority === null) d.priority = i + 1; });
   }
   state.prioritySeq = Math.max(0, ...list.map(d => d.priority ?? 0));
+  state.priorityFloor = Math.min(0, ...list.map(d => d.priority ?? 0)); // 负向计数器延续（点过优先的任务）
 
   // 区分"浏览器重启"和"SW 空闲重启"：
   // MV3 service worker 空闲约 30s 会被 Chrome 终止、有事件再唤醒（SW 重启很频繁），

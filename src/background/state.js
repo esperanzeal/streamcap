@@ -1,7 +1,8 @@
 // state.js — StreamCap 全局状态 + 持久化/广播
 export const state = {
   nextId: Date.now(),
-  prioritySeq: 0, // 任务优先级序号：创建任务时递增分配（数字小 = 优先），优先/停滞重排都改这个值
+  prioritySeq: 0,   // 正向优先级计数器：创建任务/停滞重排时 ++（数字大 = 靠后）
+  priorityFloor: 0, // 负向优先级计数器：点击优先时 --（数字小 = 靠前）
   downloads: {},      // id → record
   tabQueues: {},      // tabId → [downloadId, ...]
   tabActive: {},      // tabId → downloadId | null

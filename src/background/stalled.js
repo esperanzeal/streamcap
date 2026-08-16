@@ -126,14 +126,12 @@ chrome.alarms.onAlarm.addListener((alarm) => {
     }
     // 与确认路径一致：超时兜底也累计 consecutiveFails（≤3 次自动重派，超过标 failed 放弃）——
     // 否则 content 死透的任务会无限"超时重排→重派→再超时"循环，永不放弃
-    const act = Object.values(state.downloads)
-      .filter(x => !['completed', 'failed', 'cancelled'].includes(x.status) && x.id !== d.id);
     const fails = (d.consecutiveFails || 0) + 1;
     d.consecutiveFails = fails;
     if (fails <= 3) {
       d.status = 'queued';
       d.error = `停止确认超时，自动重排队尾（${fails}/3）`;
-      d.priority = Math.max(0, ...act.map(x => x.priority ?? 0)) + 1; // 排到队尾：Math.max(0,-Infinity)=0，空数组时不会变 -Infinity
+      d.priority = ++state.prioritySeq; // 正向计数器递增 = 队尾
       if (!state.tabQueues[d.tabId]) state.tabQueues[d.tabId] = [];
       if (!state.tabQueues[d.tabId].includes(d.id)) state.tabQueues[d.tabId].push(d.id);
       persist();
