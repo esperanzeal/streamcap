@@ -84,7 +84,7 @@ async function dispatchTab(tabId, downloadId) {
     try {
       await chrome.scripting.executeScript({
         target: { tabId },
-        files: ['src/content/log.js', 'src/content/opfs.js', 'src/content/hls.js', 'src/content/downloader.js', 'src/content/merge.js', 'src/content/sniffer.js', 'src/content/main.js'],
+        files: ['src/content/log.js', 'src/content/opfs.js', 'src/content/formats.js', 'src/content/hls.js', 'src/content/downloader.js', 'src/content/merge.js', 'src/content/sniffer.js', 'src/content/main.js'],
       });
       await chrome.tabs.sendMessage(tabId, payload);
     } catch (err2) {

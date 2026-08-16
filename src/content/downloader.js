@@ -4,7 +4,7 @@ window.VGP = window.VGP || {};
 (function (VGP) {
   const { log, fetchWithRetry, parseM3u8, selectBestVariant, resolveUrl,
     parseKeySegments, findKeyForSegment, fetchDecryptKey, decryptSegment, makeIV,
-    opfsWrite, opfsRead, saveMeta, loadMeta } = VGP;
+    opfsWrite, opfsRead, saveMeta, loadMeta, detectFormat } = VGP;
 
   // ============ AbortController 管理 ============
   const abortControllers = new Map(); // downloadId → AbortController
@@ -90,6 +90,11 @@ window.VGP = window.VGP || {};
     if (resumeFrom > 0) log('info', `[${taskLabel}] 断点续传，跳过前 ${resumeFrom} 段`);
     startHeartbeat(downloadId); // 下载期间保活 SW，防止空闲被回收
     if (document.hidden) showHiddenBanner();
+
+    // ★ 阶段3 格式分流：MP4 直链走 Range 分块下载（其余 m3u8/mpd 走下方分片下载）
+    if (detectFormat(m3u8Url) === 'mp4') {
+      return downloadDirect(downloadId, m3u8Url, resumeFrom, concurrency, referer, pageTitle, signal);
+    }
 
     let total;
     let totalDone = 0; // 函数级真实进度（下载分片数）：先初始化为 0，批次元数据读取后按实际落盘批次修正
@@ -431,6 +436,152 @@ window.VGP = window.VGP || {};
           type: 'DOWNLOAD_ERROR', downloadId, error: err.message,
           done: totalDone || resumeFrom, total,
           permanent,
+        });
+      }
+    }
+  }
+
+  // ============ MP4 直链下载（Range 分块 + OPFS 断点续传 + 合并导出） ============
+  // 阶段3：格式分流入口（startDownload 检测 mp4 URL 时调用）。
+  // 16MB/块 Range 下载，块级断点续传（meta.completedBatches 复用），完成合并 → DOWNLOAD_BLOB。
+  async function downloadDirect(downloadId, url, resumeFrom, concurrency, referer, pageTitle, signal) {
+    const taskLabel = pageTitle ? `${pageTitle}.mp4` : `#${downloadId}`;
+    let totalBlocks = 0;
+    let totalDone = 0;
+    let throttleTimer = null;
+    try {
+      // 1. 探测总大小（页面 fetch Range，浏览器自动带 Referer；页面需保持打开）
+      let size = 0;
+      try {
+        const r = await fetch(url, { headers: { Range: 'bytes=0-0' } });
+        if (r.status === 206) {
+          const cr = r.headers.get('content-range');
+          const m = cr && cr.match(/\/(\d+)$/);
+          if (m) size = parseInt(m[1]);
+        } else if (r.status === 200) {
+          const len = r.headers.get('content-length');
+          if (len) size = parseInt(len);
+        }
+      } catch {}
+      if (!size) throw new Error('无法获取文件大小（请保持视频页面打开）');
+      log('info', `[${taskLabel}] MP4 直链，总大小 ${(size / 1024 / 1024).toFixed(1)}MB`);
+
+      // 2. 分块（16MB/块）
+      const BLOCK_SIZE = 16 * 1024 * 1024;
+      totalBlocks = Math.ceil(size / BLOCK_SIZE);
+
+      // 3. 断点元数据（块级续传，复用 HLS meta 结构）
+      let meta = await loadMeta(downloadId);
+      if (!meta || meta.totalSegments !== totalBlocks) {
+        meta = { downloadId, totalSegments: totalBlocks, completedBatches: [], batchSize: 1 };
+        await saveMeta(downloadId, meta);
+      }
+      const completed = new Set(meta.completedBatches);
+      const CONCURRENCY = concurrency || 4;
+      let totalBytes = 0;
+      const downloadStartTime = performance.now();
+      const throttleReport = () => {
+        const now = Date.now();
+        if (now - lastThrottle < 15000) return;
+        lastThrottle = now;
+        reportProgress(downloadId, Math.round(totalDone / totalBlocks * 100), totalDone, totalBlocks, '');
+      };
+      let lastThrottle = 0;
+      throttleTimer = setInterval(throttleReport, 5000);
+
+      // 4. 下载每块（Range 请求，并行 CONCURRENCY）
+      for (let blockIdx = 0; blockIdx < totalBlocks; blockIdx++) {
+        if (completed.has(blockIdx)) {
+          // 续传：统计已有块字节
+          const buf = await opfsRead(`dl_${downloadId}_block_${blockIdx}.bin`);
+          if (buf) {
+            totalBytes += buf.byteLength;
+            totalDone = blockIdx + 1;
+            reportProgress(downloadId, Math.round(totalDone / totalBlocks * 100), totalDone, totalBlocks, '');
+            continue;
+          }
+          completed.delete(blockIdx); // 缓存丢失，重新下载
+        }
+        const start = blockIdx * BLOCK_SIZE;
+        const end = Math.min(start + BLOCK_SIZE, size) - 1;
+        let data;
+        try {
+          const r = await fetchWithRetry(url, 3, signal, { Range: `bytes=${start}-${end}` });
+          data = new Uint8Array(await r.arrayBuffer());
+        } catch (err) {
+          if (err.name === 'AbortError') throw err;
+          if (/404/.test(err.message || '')) throw new Error(`MP4 分块 ${blockIdx + 1}/${totalBlocks} 返回 404（永久错误）`);
+          throw new Error(`MP4 分块 ${blockIdx + 1}/${totalBlocks} 下载失败: ${err.message}`);
+        }
+        await opfsWrite(`dl_${downloadId}_block_${blockIdx}.bin`, data);
+        totalBytes += data.byteLength;
+        meta.completedBatches.push(blockIdx);
+        completed.add(blockIdx);
+        await saveMeta(downloadId, meta);
+        totalDone = blockIdx + 1;
+        reportProgress(downloadId, Math.round(totalDone / totalBlocks * 100), totalDone, totalBlocks, '');
+        log('info', `[${taskLabel}] 分块 ${blockIdx + 1}/${totalBlocks} 完成 (${(data.byteLength / 1024 / 1024).toFixed(1)}MB)`);
+      }
+      clearInterval(throttleTimer);
+
+      // 5. 合并 → blob → DOWNLOAD_BLOB
+      log('info', `[${taskLabel}] 分块全部完成，开始合并...`);
+      reportProgress(downloadId, 98, totalBlocks, totalBlocks, '合并中...');
+      const chunks = [];
+      for (let b = 0; b < totalBlocks; b++) {
+        const buf = await opfsRead(`dl_${downloadId}_block_${b}.bin`);
+        if (!buf) throw new Error(`分块 ${b} 缓存丢失`);
+        chunks.push(new Blob([buf]));
+      }
+      const finalBlob = new Blob(chunks, { type: 'video/mp4' });
+      log('success', `[${taskLabel}] 合并完成: ${(finalBlob.size / 1024 / 1024).toFixed(1)}MB`);
+      const blobUrl = URL.createObjectURL(finalBlob);
+      const filename = guessName(pageTitle || document.title);
+      chrome.runtime.sendMessage({ type: 'DOWNLOAD_BLOB', downloadId, blobUrl, filename }, (resp) => {
+        if (chrome.runtime.lastError || !resp || !resp.ok) {
+          log('warn', `[${taskLabel}] chrome.downloads 触发失败，回退 a.click()`);
+          const a = document.createElement('a');
+          a.href = blobUrl;
+          a.download = filename;
+          a.style.display = 'none';
+          (document.body || document.documentElement).appendChild(a);
+          a.click();
+          setTimeout(() => {
+            if (a.parentNode) a.parentNode.removeChild(a);
+            try { URL.revokeObjectURL(blobUrl); } catch {}
+            VGP.cleanupOpfs(downloadId);
+            chrome.runtime.sendMessage({ type: 'DOWNLOAD_ERROR', downloadId, error: '已通过页面 a.click() 触发下载，分片已清理', permanent: true }).catch(() => {});
+          }, 60000);
+        }
+      });
+      removeAbortController(downloadId);
+      runningDownloads.delete(downloadId);
+      stopHeartbeat(downloadId);
+      hideHiddenBanner();
+    } catch (err) {
+      try { clearInterval(throttleTimer); } catch {}
+      const cancelReason = cancelReasons.get(downloadId);
+      removeAbortController(downloadId);
+      runningDownloads.delete(downloadId);
+      stopHeartbeat(downloadId);
+      hideHiddenBanner();
+      if (err.name === 'AbortError') {
+        let errText = '已取消';
+        switch (cancelReason) {
+          case 'manual_pause': errText = '已暂停'; break;
+          case 'manual_cancel': errText = '已取消'; break;
+          case 'stalled': errText = '已暂停(无进度)'; break;
+          case 'heartbeat': errText = '已暂停(页面无响应)'; break;
+          case 'navigation': errText = '已暂停(页面刷新)'; break;
+        }
+        log('info', `[${taskLabel}] ${errText}，分片已保留可续传`);
+        chrome.runtime.sendMessage({ type: 'DOWNLOAD_ERROR', downloadId, error: errText, done: totalDone, total: totalBlocks });
+      } else {
+        log('error', `[${taskLabel}] MP4 下载失败: ${err.message}`);
+        chrome.runtime.sendMessage({
+          type: 'DOWNLOAD_ERROR', downloadId, error: err.message,
+          done: totalDone || resumeFrom, total: totalBlocks,
+          permanent: /404|永久错误|无法获取文件大小/.test(err.message || ''),
         });
       }
     }

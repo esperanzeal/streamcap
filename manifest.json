@@ -36,6 +36,7 @@
     "js": [
       "src/content/log.js",
       "src/content/opfs.js",
+      "src/content/formats.js",
       "src/content/hls.js",
       "src/content/downloader.js",
       "src/content/merge.js",
