@@ -44,21 +44,26 @@ async function fetchSize(url, referer) {
   let ruleId = null;
   if (referer) {
     ruleId = ++dnrRuleId;
-    let urlFilter = '*' + url.substring(0, 100) + '*'; // urlFilter 有 2048 字符限制，截断加通配
+    // DNR urlFilter 合法语法：`||host/path`（|| 表示域名起始边界），省略 resourceTypes 全类型匹配
+    let urlFilter;
     try {
       const u = new URL(url);
-      urlFilter = `*${u.host}${u.pathname}*`;
-    } catch {}
+      urlFilter = `||${u.host}${u.pathname}`;
+    } catch {
+      urlFilter = '||' + url.split('?')[0].slice(0, 200);
+    }
     try {
       await chrome.declarativeNetRequest.updateSessionRules({
         addRules: [{
           id: ruleId,
           priority: 1,
           action: { type: 'modifyHeaders', requestHeaders: [{ header: 'Referer', operation: 'set', value: referer }] },
-          condition: { urlFilter, resourceTypes: ['xmlhttprequest', 'other'] },
+          condition: { urlFilter },
         }],
       });
-    } catch {}
+    } catch (e) {
+      log('warn', `[嗅探] DNR 规则添加失败: ${e.message}`);
+    }
   }
   try {
     // 尝试序列：Range(206→content-range) → HEAD(200→content-length) → GET(200→content-length)
@@ -70,6 +75,8 @@ async function fetchSize(url, referer) {
     for (const init of attempts) {
       try {
         const resp = await fetch(url, init);
+        const kind = init.headers ? 'Range' : (init.method || 'GET');
+        log('debug', `[嗅探] 大小探测(${kind}) ${url.substring(0, 70)} → HTTP ${resp.status}`);
         if (resp.status === 206) {
           const cr = resp.headers.get('content-range'); // bytes 0-0/123456
           const m = cr && cr.match(/\/(\d+)$/);
@@ -78,7 +85,6 @@ async function fetchSize(url, referer) {
           const len = resp.headers.get('content-length');
           if (len) return parseInt(len);
         }
-        // 其他状态（403 防盗链/非视频）：换下一个尝试
       } catch (e) {
         log('warn', `[嗅探] 大小探测失败 ${url.substring(0, 60)}: ${e.message}`);
       }
