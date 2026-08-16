@@ -3,17 +3,19 @@
 import { state, persist, broadcast, taskLabel } from './state.js';
 import { log, getLogs, clearLogs } from './log.js';
 import { enqueue, maybeDispatch, pauseAll, resumeAll, pauseDownload, cancelDownload, prioritizeDownload } from './scheduler.js';
-import { storeVideos, openManager } from './sniffing.js';
+import { storeVideos, openManager, fillSizes } from './sniffing.js';
 import { handleDownloadSignal, markLoaded, pendingDownloadSignals } from './signals.js';
 import { ensureKeepaliveAlarm, pingDeadTask } from './stalled.js';
 
 // ============ 消息路由 ============
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-  // 嗅探查询
+  // 嗅探查询（popup 打开/刷新时补齐 mp4 直链的文件大小）
   if (msg.type === 'GET_M3U8S') {
-    chrome.tabs.query({ active: true, currentWindow: true }, tabs => {
-      sendResponse(state.sniffStore[tabs[0]?.id] || { videos: [], pageUrl: '' });
+    chrome.tabs.query({ active: true, currentWindow: true }, async tabs => {
+      const store = state.sniffStore[tabs[0]?.id];
+      if (store) await fillSizes(store); // 补齐 mp4 大小（Range 请求）
+      sendResponse(store || { videos: [], pageUrl: '' });
     });
     return true;
   }

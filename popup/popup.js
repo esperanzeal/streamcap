@@ -74,11 +74,18 @@ function renderList(data) {
   }
   // 格式标签（阶段2：HLS/DASH/MP4/FLV）
   const fmtLabel = { hls: 'HLS', dash: 'DASH', mp4: 'MP4', flv: 'FLV' };
+  const fmtSize = b => {
+    if (!b && b !== 0) return '';
+    if (b > 1024 * 1024 * 1024) return (b / 1024 / 1024 / 1024).toFixed(1) + 'GB';
+    if (b > 1024 * 1024) return (b / 1024 / 1024).toFixed(1) + 'MB';
+    return (b / 1024).toFixed(0) + 'KB';
+  };
   list.innerHTML = filtered.map(e => `
     <div class="card">
       <div class="meta">
         <span class="res">${e.resolution}</span>
         <span class="fmt-tag ${e.format}">${fmtLabel[e.format] || '?'}</span>
+        <span class="size">${e.format === 'mp4' ? (e.size === undefined ? '⏳' : (e.size ? fmtSize(e.size) : '—')) : ''}</span>
         <span style="font-size:10px;color:#666">${new Date(e.timestamp).toLocaleTimeString()}</span>
       </div>
       <div class="url-preview" title="${esc(e.url)}">${esc(e.url)}</div>

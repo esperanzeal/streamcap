@@ -35,6 +35,40 @@ export function storeVideos(tabId, urls, pageTitle) {
   if (state.sniffStore[tabId].videos.length > 30) state.sniffStore[tabId].videos = state.sniffStore[tabId].videos.slice(0, 30);
 }
 
+// ============ 文件大小探测（MP4 直链用 Range 请求拿 Content-Range 总大小） ============
+// 只对 mp4 直链有意义（HLS/DASH 是分片流，playlist 大小不代表视频大小）。
+async function fetchSize(url) {
+  try {
+    const resp = await fetch(url, { headers: { Range: 'bytes=0-0' } });
+    if (resp.status === 206 || resp.ok) {
+      const cr = resp.headers.get('content-range'); // 形如 bytes 0-0/123456
+      if (cr) {
+        const m = cr.match(/\/(\d+)$/);
+        if (m) return parseInt(m[1]);
+      }
+      // 服务器忽略 Range 返回 200：content-length 即总大小
+      const len = resp.headers.get('content-length');
+      if (len && resp.status === 200) return parseInt(len);
+    }
+  } catch {}
+  return null;
+}
+
+// 补齐 sniffStore 里 mp4 条目的 size（GET_M3U8S 时调用，popup 打开/刷新时展示）
+export async function fillSizes(store) {
+  if (!store || !store.videos) return;
+  const need = store.videos.filter(e => e.format === 'mp4' && e.size === undefined);
+  // 并发上限 3，避免一次拉太多
+  for (let i = 0; i < need.length; i += 3) {
+    const chunk = need.slice(i, i + 3);
+    await Promise.all(chunk.map(async e => {
+      const size = await fetchSize(e.url);
+      if (size) e.size = size;
+      else e.size = null; // 请求失败：显示"—"（标记已尝试，不重复请求）
+    }));
+  }
+}
+
 // ============ 右键菜单 ============
 chrome.runtime.onInstalled.addListener(() => {
   chrome.contextMenus.create({
