@@ -82,6 +82,23 @@ chrome.alarms.onAlarm.addListener((alarm) => {
     // 释放并发槽：stopping 一直占着槽（等待确认），超时兜底转 queued 时必须释放，
     // 否则 maybeDispatch 因 tabActive[tabId] 非空永久跳过该 tab，任务卡死永不重派
     state.tabActive[d.tabId] = null;
+    // ★ 被优先下载替换的任务：超时兜底同样回队列队首（不计连续失败），
+    //   与确认路径行为一致，避免 content 无响应时被误按停滞重排（排队尾+累计 fails）。
+    if (d.replacedFlag) {
+      delete d.replacedFlag;
+      d.status = 'queued';
+      d.error = null;
+      d.stalledAt = null;
+      if (!state.tabQueues[d.tabId]) state.tabQueues[d.tabId] = [];
+      const q = state.tabQueues[d.tabId];
+      const qi = q.indexOf(d.id);
+      if (qi >= 0) q.splice(qi, 1);
+      q.unshift(d.id);
+      persist();
+      broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
+      log('warn', `[优先] ${taskLabel(d.id)} 停止确认超时（content 无响应），回队列队首`);
+      continue;
+    }
     // 与确认路径一致：超时兜底也累计 consecutiveFails（≤3 次自动重派，超过标 failed 放弃）——
     // 否则 content 死透的任务会无限"超时重排→重派→再超时"循环，永不放弃
     const fails = (d.consecutiveFails || 0) + 1;

@@ -303,6 +303,24 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       //   但 stopping 状态必然是调度器触发（用户手动取消时 status 已是 cancelled，不会是 stopping），
       //   所以两种文案都应走重排确认，否则任务卡在 stopping 占槽。
       if (d.status === 'stopping' && ((msg.error || '').includes('已暂停') || (msg.error || '').includes('已取消'))) {
+        // ★ 被优先下载替换的任务：确认旧循环退出后转 queued 回队列队首，不计连续失败
+        //   （区别于停滞重排——停滞任务排队尾且累计 fails 直到放弃）。
+        if (d.replacedFlag) {
+          delete d.replacedFlag;
+          d.status = 'queued';
+          d.error = null;
+          d.stalledAt = null;
+          if (!state.tabQueues[d.tabId]) state.tabQueues[d.tabId] = [];
+          const q = state.tabQueues[d.tabId];
+          const qi = q.indexOf(d.id);
+          if (qi >= 0) q.splice(qi, 1);
+          q.unshift(d.id); // 回队首：等并发槽空出即自动续传
+          persist();
+          broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
+          log('info', `[优先] ${taskLabel(d.id)} 停止确认，回队列队首等待续传`);
+          maybeDispatch();
+          return;
+        }
         const fails = (d.consecutiveFails || 0) + 1;
         d.consecutiveFails = fails;
         if (fails <= 3) {

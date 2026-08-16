@@ -118,25 +118,21 @@ export async function prioritizeDownload(downloadId) {
     }
   }
 
-  // 替换所有 victim：标 queued 放回本 tab 队列队首，进度保留（OPFS 断点续传），
-  // 等并发槽空出即自动续传（区别于手动暂停需要用户点"继续"）。
+  // 替换所有 victim：先进 stopping（不参与调度），等 content 确认旧循环退出后再回队列队首。
+  // 不能直接标 queued——否则 maybeDispatch 看到 queued+tab空闲+槽刚释放，会立即把 victim 重新
+  // 派发，但旧循环还在（CANCEL 未到），新 START 被 runningDownloads 防重入忽略 → victim 假活占槽
+  // （用户日志里"被替换的任务刚被暂停就被调度自动派发"就是这个竞态）。
   for (const victim of victims) {
-    victim.status = 'queued';
-    victim.error = null;
-    victim.stalledAt = null;
+    victim.status = 'stopping';
+    victim.error = '被优先下载替换，稍后自动续传';
+    victim.stopPendingAt = Date.now(); // 超时兜底：content 无响应时强制回队首
+    victim.replacedFlag = true; // 标记：停止确认后回队首，不计 consecutiveFails（区别于停滞重排）
     state.tabActive[victim.tabId] = null; // 释放并发槽
-    // 通知 content 停止旧下载循环（分片保留可续传）；旧循环退出后 runningDownloads 释放，
-    // 下次调度到它时能正常启动新循环（防重入兜底，避免新 START 撞旧循环）
+    // 通知 content 停止旧下载循环（分片保留可续传）
     chrome.tabs.sendMessage(victim.tabId, { type: 'CANCEL_DOWNLOAD', downloadId: victim.id, reason: 'manual_pause' }).catch(() => {});
-    const vq = state.tabQueues[victim.tabId];
-    if (vq) {
-      const vi = vq.indexOf(victim.id);
-      if (vi >= 0) vq.splice(vi, 1);
-      vq.unshift(victim.id);
-    }
     persist();
     broadcast({ type: 'DOWNLOAD_UPDATE', download: victim });
-    log('warn', `[优先] ${taskLabel(downloadId)} 替换 ${taskLabel(victim.id)}（进度 ${victim.done || 0} 片），放回队列队首`);
+    log('warn', `[优先] ${taskLabel(downloadId)} 替换 ${taskLabel(victim.id)}（进度 ${victim.done || 0} 片），等待停止确认后回队列队首`);
   }
 
   // 优先任务：标记 priorityAt（maybeDispatch 排序时排最前）+ 提到本 tab 队列队首
