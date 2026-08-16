@@ -248,6 +248,7 @@ window.VGP = window.VGP || {};
                 }
               }
               batchChunks[idx] = segData;
+              batchDone++; // 只有成功下载的分片才计入进度——失败分片不虚涨（否则拔网线时进度照涨、停滞判定被虚涨的 done 刷新永不触发）
             } catch (err) {
               if (err.name === 'AbortError') {
                 // 任务被暂停/取消中止，不是失败：降级为 info，避免误读为任务失败
@@ -258,7 +259,6 @@ window.VGP = window.VGP || {};
               batchChunks[idx] = null;
             }
           }));
-          batchDone += mini.length;
           totalDone = segStart + batchDone;
           const elapsed = (performance.now() - downloadStartTime) / 1000;
           const speed = elapsed > 1 ? formatSpeed(networkBytes / elapsed) : '';
@@ -278,7 +278,8 @@ window.VGP = window.VGP || {};
             const r = await fetchWithRetry(batchUrls[i], 5, signal, refHeaders);
             const rawBuf = await r.arrayBuffer();
             networkBytes += rawBuf.byteLength;
-            // 重试成功后立即上报（done 增长）
+            // 重试成功后：该分片计入成功进度（并行阶段失败时没计，这里补上）
+            totalDone++;
             reportProgress(downloadId, Math.round(totalDone / total * 100), totalDone, total, '');
             let segData = new Uint8Array(rawBuf);
             if (keySegments.length > 0) {
