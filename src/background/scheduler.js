@@ -24,6 +24,7 @@ export function enqueue(tabId, url, referer, resolution, pageUrl, pageTitle, for
     pageTitle: pageTitle || '',
     status: 'queued', pct: 0, done: 0, total: 0,
     speed: '', error: null, createdAt: Date.now(), tabId,
+    priority: ++state.prioritySeq, // 创建序号 = FIFO 优先级（数字小 = 先下载）
     fileName: '',
     dupIndex: dupIndex > 1 ? dupIndex : undefined,
     retryCount: 0, consecutiveFails: 0,
@@ -46,7 +47,6 @@ async function dispatchTab(tabId, downloadId) {
   d.lastProgressAt = Date.now(); // 派发即记"最后活跃"：启动/解析阶段计入宽限期，防误判停滞
   d.lastDone = 0; // 派发清零：progress done 从 0 开始计数，防旧值干扰停滞判定
   d.lastDoneAt = Date.now(); // done 增长的初始基准：派发即记，覆盖 m3u8 获取/解析/跳过批次的启动期
-  d.stalledAt = null; // 清除历史停滞标记
   state.tabActive[tabId] = downloadId;
   persist();
   broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
@@ -135,9 +135,9 @@ export async function prioritizeDownload(downloadId) {
     log('warn', `[优先] ${taskLabel(downloadId)} 替换 ${taskLabel(victim.id)}（进度 ${victim.done || 0} 片），等待停止确认后回队列队首`);
   }
 
-  // 优先任务：标记 priorityAt（maybeDispatch 排序时排最前）+ 提到本 tab 队列队首
-  d.priorityAt = Date.now();
-  d.stalledAt = null; // 清除停滞标记，不排队尾
+  // 优先任务：priority 设为"当前最小 - 1"，排序时必排最前（数字最小）
+  const minP = Math.min(...Object.values(state.downloads).map(x => x.priority ?? Number.MAX_SAFE_INTEGER));
+  d.priority = minP - 1;
   const q = state.tabQueues[d.tabId];
   if (q) {
     const i = q.indexOf(downloadId);
@@ -146,7 +146,7 @@ export async function prioritizeDownload(downloadId) {
   }
   persist();
   broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
-  log('info', `[优先] ${taskLabel(downloadId)} 已标记优先排到队首${victims.length ? `（替换 ${victims.length} 个任务）` : '（并发有空槽，直接等待派发）'}`);
+  log('info', `[优先] ${taskLabel(downloadId)} 已标记优先排到队首（priority=${d.priority}）${victims.length ? `，替换 ${victims.length} 个任务` : ''}`);
   maybeDispatch();
   return { ok: true };
 }
@@ -171,8 +171,7 @@ export function maybeDispatch() {
     const activeCount = Object.keys(state.tabActive).filter(t => state.tabActive[t]).length;
     if (!unlimited && activeCount >= max) return;
 
-    // 收集所有可派发的候选（排队中且所在 tab 空闲），按创建时间排序
-    // 停滞任务（stalledAt）按停滞时刻排到队尾最后执行，不占用优先调度位
+    // 收集所有可派发的候选（排队中且所在 tab 空闲）
     const candidates = [];
     for (const tid of Object.keys(state.tabQueues)) {
       const tabId = Number(tid);
@@ -181,23 +180,13 @@ export function maybeDispatch() {
         const d = state.downloads[did];
         if (d && d.status === 'queued') candidates.push({
           tabId, did,
-          sortKey: d.stalledAt || d.createdAt || 0,
-          priorityAt: d.priorityAt, // 优先下载标记：有值则排最前
+          priority: d.priority ?? Number.MAX_SAFE_INTEGER, // 统一优先级序号：小 = 先派发
         });
       }
     }
-    // 排序：优先任务（priorityAt）永远排最前（多个按"最新点击优先"排最前），其余按 FIFO
-    // ★ 优先任务之间必须按 priorityAt 排序（降序=后点的排前），否则落到 sortKey(createdAt)
-    //    → 先创建/先点过优先的任务排前面，本次点的优先任务被顶掉（用户日志：点 519 优先
-    //    却派发更早点的 508）。
-    candidates.sort((a, b) => {
-      const ap = a.priorityAt ? 0 : 1;
-      const bp = b.priorityAt ? 0 : 1;
-      if (ap !== bp) return ap - bp;
-      if (a.priorityAt && b.priorityAt) return b.priorityAt - a.priorityAt; // 最新优先排最前
-      return a.sortKey - b.sortKey;
-    });
-    log('debug', `[调度] 候选: ${candidates.map(c => `#${c.did}${c.priorityAt ? '(优先)' : ''}`).join(', ')}`);
+    // 排序：单一 priority 序号（创建 FIFO / 优先=减到最小 / 停滞重排=加到最大）
+    candidates.sort((a, b) => a.priority - b.priority);
+    log('debug', `[调度] 候选: ${candidates.map(c => `#${c.did}(${c.priority})`).join(', ')}`);
 
     let slots = unlimited ? Infinity : (max - activeCount);
     for (const c of candidates) {
@@ -234,7 +223,7 @@ export async function resumeAll() {
     d.error = null;
     d.consecutiveFails = 0;
     d.retryCount = 0;
-    d.stalledAt = null; // 手动恢复 = 新的尝试周期，回到正常 FIFO 位置
+    // 手动恢复 = 新的尝试周期，priority 保持原 FIFO 位置
     if (!state.tabQueues[d.tabId]) state.tabQueues[d.tabId] = [];
     if (!state.tabQueues[d.tabId].includes(d.id)) state.tabQueues[d.tabId].push(d.id);
   }

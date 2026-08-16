@@ -82,13 +82,12 @@ chrome.alarms.onAlarm.addListener((alarm) => {
     // 释放并发槽：stopping 一直占着槽（等待确认），超时兜底转 queued 时必须释放，
     // 否则 maybeDispatch 因 tabActive[tabId] 非空永久跳过该 tab，任务卡死永不重派
     state.tabActive[d.tabId] = null;
-    // ★ 被优先下载替换的任务：超时兜底同样回队列队首（不计连续失败），
+    // ★ 被优先下载替换的任务：超时兜底同样回队列（不计连续失败），priority 保持原值
     //   与确认路径行为一致，避免 content 无响应时被误按停滞重排（排队尾+累计 fails）。
     if (d.replacedFlag) {
       delete d.replacedFlag;
       d.status = 'queued';
       d.error = null;
-      d.stalledAt = null;
       if (!state.tabQueues[d.tabId]) state.tabQueues[d.tabId] = [];
       const q = state.tabQueues[d.tabId];
       const qi = q.indexOf(d.id);
@@ -96,22 +95,24 @@ chrome.alarms.onAlarm.addListener((alarm) => {
       q.unshift(d.id);
       persist();
       broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
-      log('warn', `[优先] ${taskLabel(d.id)} 停止确认超时（content 无响应），回队列队首`);
+      log('warn', `[优先] ${taskLabel(d.id)} 停止确认超时（content 无响应），回队列（priority=${d.priority}）`);
       continue;
     }
     // 与确认路径一致：超时兜底也累计 consecutiveFails（≤3 次自动重派，超过标 failed 放弃）——
     // 否则 content 死透的任务会无限"超时重排→重派→再超时"循环，永不放弃
+    const act = Object.values(state.downloads)
+      .filter(x => !['completed', 'failed', 'cancelled'].includes(x.status) && x.id !== d.id);
     const fails = (d.consecutiveFails || 0) + 1;
     d.consecutiveFails = fails;
     if (fails <= 3) {
       d.status = 'queued';
       d.error = `停止确认超时，自动重排队尾（${fails}/3）`;
-      d.stalledAt = now2; // 排到队尾
+      d.priority = Math.max(...act.map(x => x.priority ?? 0)) + 1; // 排到队尾
       if (!state.tabQueues[d.tabId]) state.tabQueues[d.tabId] = [];
       if (!state.tabQueues[d.tabId].includes(d.id)) state.tabQueues[d.tabId].push(d.id);
       persist();
       broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
-      log('warn', `[停滞] ${taskLabel(d.id)} 停止确认超时（content 无响应），自动重排队尾（${fails}/3）`);
+      log('warn', `[停滞] ${taskLabel(d.id)} 停止确认超时（content 无响应），自动重排队尾（${fails}/3，priority=${d.priority}）`);
     } else {
       d.status = 'failed';
       d.error = `连续 ${fails} 次无进度，自动放弃（分片保留，可手动重试）`;

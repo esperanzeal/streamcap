@@ -46,7 +46,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       d.error = null;
       // 重试任务：重置连续失败计数与停滞标记（保留 createdAt 保持 FIFO 原位置）
       d.consecutiveFails = 0;
-      d.stalledAt = null; // 手动重试 = 新的尝试周期，回到正常 FIFO 位置
+      // 手动重试 = 新的尝试周期，priority 保持原 FIFO 位置
       if (!state.tabQueues[tabId]) state.tabQueues[tabId] = [];
       if (!state.tabQueues[tabId].includes(msg.retryId)) state.tabQueues[tabId].push(msg.retryId);
       persist();
@@ -303,36 +303,40 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       //   但 stopping 状态必然是调度器触发（用户手动取消时 status 已是 cancelled，不会是 stopping），
       //   所以两种文案都应走重排确认，否则任务卡在 stopping 占槽。
       if (d.status === 'stopping' && ((msg.error || '').includes('已暂停') || (msg.error || '').includes('已取消'))) {
-        // ★ 被优先下载替换的任务：确认旧循环退出后转 queued 回队列队首，不计连续失败
+        // ★ 被优先下载替换的任务：确认旧循环退出后转 queued 回队列，不计连续失败
         //   （区别于停滞重排——停滞任务排队尾且累计 fails 直到放弃）。
         if (d.replacedFlag) {
           delete d.replacedFlag;
           d.status = 'queued';
           d.error = null;
-          d.stalledAt = null;
+          // priority 保持原值：优先任务已被设为"当前最小-1"（必排最前），
+          // 被替换任务按原 FIFO priority 排队（通常是最早的，自然靠前，仅次于优先任务）
           if (!state.tabQueues[d.tabId]) state.tabQueues[d.tabId] = [];
           const q = state.tabQueues[d.tabId];
           const qi = q.indexOf(d.id);
           if (qi >= 0) q.splice(qi, 1);
-          q.unshift(d.id); // 回队首：等并发槽空出即自动续传
+          q.unshift(d.id);
           persist();
           broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
-          log('info', `[优先] ${taskLabel(d.id)} 停止确认，回队列队首等待续传`);
+          log('info', `[优先] ${taskLabel(d.id)} 停止确认，回队列等待续传（priority=${d.priority}）`);
           maybeDispatch();
           return;
         }
+        // 停滞重排：priority 设为当前最大 + 1（排到队尾）
+        const act = Object.values(state.downloads)
+          .filter(x => !['completed', 'failed', 'cancelled'].includes(x.status) && x.id !== d.id);
         const fails = (d.consecutiveFails || 0) + 1;
         d.consecutiveFails = fails;
         if (fails <= 3) {
           d.status = 'queued';
           d.error = `无进度自动重排（${fails}/3）`;
-          d.stalledAt = Date.now(); // 排到队尾最后执行，不插队
+          d.priority = Math.max(...act.map(x => x.priority ?? 0)) + 1; // 排到队尾：priority 设为当前最大 + 1
           if (!state.tabQueues[d.tabId]) state.tabQueues[d.tabId] = [];
           if (!state.tabQueues[d.tabId].includes(d.id)) state.tabQueues[d.tabId].push(d.id);
           state.tabActive[d.tabId] = null; // 确认退出后释放并发槽
           persist();
           broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
-          log('warn', `[停滞] ${taskLabel(d.id)} 停止已确认，自动重排队尾（${fails}/3）`);
+          log('warn', `[停滞] ${taskLabel(d.id)} 停止已确认，自动重排队尾（${fails}/3，priority=${d.priority}）`);
           maybeDispatch();
         } else {
           d.status = 'failed';
@@ -441,6 +445,13 @@ chrome.storage.local.get('vgp_downloads', data => {
   if (list.length > 0) {
     state.nextId = Math.max(...list.map(d => d.id), Date.now()) + 1;
   }
+  // 旧版本任务没有 priority 字段：按 createdAt 排序补序号（FIFO），并恢复 prioritySeq
+  const needsPrio = list.filter(d => d.priority === undefined || d.priority === null);
+  if (needsPrio.length > 0) {
+    const sorted = [...list].sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0));
+    sorted.forEach((d, i) => { if (d.priority === undefined || d.priority === null) d.priority = i + 1; });
+  }
+  state.prioritySeq = Math.max(0, ...list.map(d => d.priority ?? 0));
 
   // 区分"浏览器重启"和"SW 空闲重启"：
   // MV3 service worker 空闲约 30s 会被 Chrome 终止、有事件再唤醒（SW 重启很频繁），

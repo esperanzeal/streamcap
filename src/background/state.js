@@ -1,6 +1,7 @@
 // state.js — StreamCap 全局状态 + 持久化/广播
 export const state = {
   nextId: Date.now(),
+  prioritySeq: 0, // 任务优先级序号：创建任务时递增分配（数字小 = 优先），优先/停滞重排都改这个值
   downloads: {},      // id → record
   tabQueues: {},      // tabId → [downloadId, ...]
   tabActive: {},      // tabId → downloadId | null
@@ -15,8 +16,9 @@ export function persist() {
     speed: d.speed, error: d.error, createdAt: d.createdAt, tabId: d.tabId,
     fileName: d.fileName, pageTitle: d.pageTitle, dupIndex: d.dupIndex,
     retryCount: d.retryCount, consecutiveFails: d.consecutiveFails,
-    lastProgressAt: d.lastProgressAt, lastDone: d.lastDone, lastDoneAt: d.lastDoneAt, stalledAt: d.stalledAt,
-    stopPendingAt: d.stopPendingAt, priorityAt: d.priorityAt,
+    priority: d.priority,
+    lastProgressAt: d.lastProgressAt, lastDone: d.lastDone, lastDoneAt: d.lastDoneAt,
+    stopPendingAt: d.stopPendingAt,
   }));
   chrome.storage.local.set({ vgp_downloads: list });
 }
