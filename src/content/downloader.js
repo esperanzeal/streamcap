@@ -455,8 +455,10 @@ window.VGP = window.VGP || {};
     try {
       // 1. 探测总大小（页面 fetch Range，浏览器自动带 Referer；页面需保持打开）
       let size = 0;
+      let probeInfo = '';
       try {
         const r = await fetch(url, { headers: { Range: 'bytes=0-0' } });
+        probeInfo = `HTTP ${r.status}`;
         if (r.status === 206) {
           const cr = r.headers.get('content-range');
           const m = cr && cr.match(/\/(\d+)$/);
@@ -465,9 +467,15 @@ window.VGP = window.VGP || {};
           const len = r.headers.get('content-length');
           if (len) size = parseInt(len);
         }
-      } catch {}
-      if (!size) throw new Error('无法获取文件大小（请保持视频页面打开）');
-      log('info', `[${taskLabel}] MP4 直链，总大小 ${(size / 1024 / 1024).toFixed(1)}MB`);
+      } catch (e) {
+        probeInfo = '异常: ' + e.message;
+      }
+      log('info', `[${taskLabel}] MP4 大小探测 ${probeInfo}${size ? ` → ${(size / 1024 / 1024).toFixed(1)}MB` : '（无大小，降级流式）'}`);
+      if (!size) {
+        // 降级：服务器不支持 Range/无 content-length（chunked 流/签名接口）
+        // → 流式整体下载（边读边写 OPFS，无精确进度、无断点续传，但能下载）
+        return downloadStream(downloadId, url, signal, pageTitle, taskLabel);
+      }
 
       // 2. 分块（16MB/块）
       const BLOCK_SIZE = 16 * 1024 * 1024;
@@ -585,6 +593,87 @@ window.VGP = window.VGP || {};
           type: 'DOWNLOAD_ERROR', downloadId, error: err.message,
           done: totalDone || resumeFrom, total: totalBlocks,
           permanent: /404|永久错误|无法获取文件大小/.test(err.message || ''),
+        });
+      }
+    }
+  }
+
+  // ============ MP4 流式整体下载（降级：服务器不支持 Range/无 content-length） ============
+  // 边读边写 OPFS 单块，避免大文件占内存；无精确进度（total 未知），速度实时上报。
+  async function downloadStream(downloadId, url, signal, pageTitle, taskLabel) {
+    let received = 0;
+    let lastReport = 0;
+    try {
+      const resp = await fetch(url, { signal });
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      const root = await navigator.storage.getDirectory();
+      const fh = await root.getFileHandle(VGP.OPFS_PREFIX + `dl_${downloadId}_block_0.bin`, { create: true });
+      const w = await fh.createWritable();
+      const reader = resp.body.getReader();
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        await w.write(value);
+        received += value.byteLength;
+        // 每 8MB 报一次进度（total=0 表示未知，manager 显示"—"但有速度）
+        if (received - lastReport > 8 * 1024 * 1024) {
+          lastReport = received;
+          reportProgress(downloadId, 0, received, 0, '');
+        }
+      }
+      await w.close();
+      log('success', `[${taskLabel}] 流式下载完成: ${(received / 1024 / 1024).toFixed(1)}MB`);
+
+      // 合并 → blob → DOWNLOAD_BLOB
+      reportProgress(downloadId, 98, received, 0, '合并中...');
+      const buf = await opfsRead(`dl_${downloadId}_block_0.bin`);
+      if (!buf) throw new Error('缓存丢失');
+      const finalBlob = new Blob([buf], { type: 'video/mp4' });
+      const blobUrl = URL.createObjectURL(finalBlob);
+      const filename = guessName(pageTitle || document.title);
+      chrome.runtime.sendMessage({ type: 'DOWNLOAD_BLOB', downloadId, blobUrl, filename }, (resp2) => {
+        if (chrome.runtime.lastError || !resp2 || !resp2.ok) {
+          const a = document.createElement('a');
+          a.href = blobUrl;
+          a.download = filename;
+          a.style.display = 'none';
+          (document.body || document.documentElement).appendChild(a);
+          a.click();
+          setTimeout(() => {
+            if (a.parentNode) a.parentNode.removeChild(a);
+            try { URL.revokeObjectURL(blobUrl); } catch {}
+            VGP.cleanupOpfs(downloadId);
+            chrome.runtime.sendMessage({ type: 'DOWNLOAD_ERROR', downloadId, error: '已通过页面 a.click() 触发下载，分片已清理', permanent: true }).catch(() => {});
+          }, 60000);
+        }
+      });
+      removeAbortController(downloadId);
+      runningDownloads.delete(downloadId);
+      stopHeartbeat(downloadId);
+      hideHiddenBanner();
+    } catch (err) {
+      const cancelReason = cancelReasons.get(downloadId);
+      removeAbortController(downloadId);
+      runningDownloads.delete(downloadId);
+      stopHeartbeat(downloadId);
+      hideHiddenBanner();
+      if (err.name === 'AbortError') {
+        let errText = '已取消';
+        switch (cancelReason) {
+          case 'manual_pause': errText = '已暂停'; break;
+          case 'manual_cancel': errText = '已取消'; break;
+          case 'stalled': errText = '已暂停(无进度)'; break;
+          case 'heartbeat': errText = '已暂停(页面无响应)'; break;
+          case 'navigation': errText = '已暂停(页面刷新)'; break;
+        }
+        log('info', `[${taskLabel}] ${errText}，已下载 ${(received / 1024 / 1024).toFixed(1)}MB 未保留（流式无续传）`);
+        chrome.runtime.sendMessage({ type: 'DOWNLOAD_ERROR', downloadId, error: errText, done: 0, total: 0 });
+      } else {
+        log('error', `[${taskLabel}] 流式下载失败: ${err.message}`);
+        chrome.runtime.sendMessage({
+          type: 'DOWNLOAD_ERROR', downloadId, error: err.message,
+          done: 0, total: 0,
+          permanent: /404|永久错误/.test(err.message || ''),
         });
       }
     }
