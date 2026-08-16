@@ -16,7 +16,7 @@ export function persist() {
     fileName: d.fileName, pageTitle: d.pageTitle, dupIndex: d.dupIndex,
     retryCount: d.retryCount, consecutiveFails: d.consecutiveFails,
     lastProgressAt: d.lastProgressAt, lastDone: d.lastDone, lastDoneAt: d.lastDoneAt, stalledAt: d.stalledAt,
-    stopPendingAt: d.stopPendingAt,
+    stopPendingAt: d.stopPendingAt, priorityAt: d.priorityAt,
   }));
   chrome.storage.local.set({ vgp_downloads: list });
 }

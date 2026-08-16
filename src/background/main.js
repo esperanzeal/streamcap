@@ -2,7 +2,7 @@
 // import 各模块时副作用即生效（webRequest/alarms/downloads 监听器注册）。
 import { state, persist, broadcast, taskLabel } from './state.js';
 import { log, getLogs, clearLogs } from './log.js';
-import { enqueue, maybeDispatch, pauseAll, resumeAll, pauseDownload, cancelDownload } from './scheduler.js';
+import { enqueue, maybeDispatch, pauseAll, resumeAll, pauseDownload, cancelDownload, prioritizeDownload } from './scheduler.js';
 import { storeVideos, openManager } from './sniffing.js';
 import { handleDownloadSignal, loaded, pendingDownloadSignals } from './signals.js';
 import { ensureKeepaliveAlarm, pingDeadTask } from './stalled.js';
@@ -122,6 +122,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       broadcast({ type: 'DOWNLOAD_REMOVED', downloadId: msg.downloadId });
     }
     sendResponse({ ok: true });
+    return true;
+  }
+
+  // 优先下载：queued 任务提到队首立即派发，并发满时替换权重最低的下载中任务
+  if (msg.type === 'PRIORITIZE_DOWNLOAD') {
+    prioritizeDownload(msg.downloadId).then(r => sendResponse(r || { ok: true }));
     return true;
   }
 

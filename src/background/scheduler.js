@@ -85,6 +85,40 @@ async function dispatchTab(tabId, downloadId) {
   }
 }
 
+// 优先下载：把 queued 任务提到队首立即派发；并发已满时暂停"权重最低"
+// （已下载分片数最少 = 沉没成本最低）的 downloading 任务腾出并发槽。
+export async function prioritizeDownload(downloadId) {
+  const d = state.downloads[downloadId];
+  if (!d || d.status !== 'queued') return { ok: false, error: '任务不在队列中' };
+
+  const max = await getMaxConcurrent();
+  const unlimited = max === 0;
+  const activeCount = Object.keys(state.tabActive).filter(t => state.tabActive[t]).length;
+  if (!unlimited && activeCount >= max) {
+    // 并发已满：暂停权重最低的 downloading 任务（done 最少）腾槽
+    const downloading = Object.values(state.downloads).filter(x => x.status === 'downloading');
+    if (downloading.length > 0) {
+      downloading.sort((a, b) => (a.done || 0) - (b.done || 0));
+      pauseDownload(downloading[0].id);
+      log('warn', `[优先] ${taskLabel(downloadId)} 优先下载，暂停权重最低的 ${taskLabel(downloading[0].id)}（进度 ${downloading[0].done || 0} 片）腾出并发槽`);
+    }
+  }
+
+  // 提到本 tab 队列队首 + 标记优先（maybeDispatch 排序时 priorityAt 任务排最前）
+  d.priorityAt = Date.now();
+  d.stalledAt = null; // 清除停滞标记，不排队尾
+  const q = state.tabQueues[d.tabId];
+  if (q) {
+    const i = q.indexOf(downloadId);
+    if (i >= 0) q.splice(i, 1);
+    q.unshift(downloadId);
+  }
+  persist();
+  broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
+  maybeDispatch();
+  return { ok: true };
+}
+
 // 读取并发任务数（0=无上限）。注意：必须用 undefined 判断，不能用 ||（0 会被吞）
 async function getMaxConcurrent() {
   const s = await chrome.storage.local.get('vgp_settings');
@@ -108,10 +142,20 @@ export async function maybeDispatch() {
     if (state.tabActive[tabId]) continue; // 该 tab 已有活动任务
     for (const did of state.tabQueues[tabId]) {
       const d = state.downloads[did];
-      if (d && d.status === 'queued') candidates.push({ tabId, did, sortKey: d.stalledAt || d.createdAt || 0 });
+      if (d && d.status === 'queued') candidates.push({
+        tabId, did,
+        sortKey: d.stalledAt || d.createdAt || 0,
+        priorityAt: d.priorityAt, // 优先下载标记：有值则排最前
+      });
     }
   }
-  candidates.sort((a, b) => a.sortKey - b.sortKey);
+  // 排序：优先任务（priorityAt）永远排最前（多个按优先时间），其余按 FIFO
+  candidates.sort((a, b) => {
+    const ap = a.priorityAt ? 0 : 1;
+    const bp = b.priorityAt ? 0 : 1;
+    if (ap !== bp) return ap - bp;
+    return a.sortKey - b.sortKey;
+  });
 
   let slots = unlimited ? Infinity : (max - activeCount);
   for (const c of candidates) {
