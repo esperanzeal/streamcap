@@ -330,7 +330,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         if (fails <= 3) {
           d.status = 'queued';
           d.error = `无进度自动重排（${fails}/3）`;
-          d.priority = Math.max(...act.map(x => x.priority ?? 0)) + 1; // 排到队尾：priority 设为当前最大 + 1
+          d.priority = Math.max(0, ...act.map(x => x.priority ?? 0)) + 1; // 排到队尾：Math.max(0,-Infinity)=0，空数组时不会变 -Infinity
           if (!state.tabQueues[d.tabId]) state.tabQueues[d.tabId] = [];
           if (!state.tabQueues[d.tabId].includes(d.id)) state.tabQueues[d.tabId].push(d.id);
           state.tabActive[d.tabId] = null; // 确认退出后释放并发槽
@@ -488,6 +488,15 @@ chrome.storage.local.get('vgp_downloads', data => {
         if (!state.tabQueues[d.tabId].includes(d.id)) state.tabQueues[d.tabId].push(d.id);
       } else if (d.status === 'downloading' || d.status === 'exporting' || d.status === 'retrying') {
         state.tabActive[d.tabId] = d.id;
+      } else if (d.status === 'stopping') {
+        // ★ SW 重启后 content 旧循环状态不确定（CANCEL 可能已到或消息丢失），
+        //   不能继续等确认——直接转 queued 重新入队（旧版 53da483 的处理）。
+        //   若 content 还活着：runningDownloads 防重入 + done 单调性兜底，不会双循环。
+        d.status = 'queued';
+        d.error = null;
+        d.stopPendingAt = null; // 清除：否则派发后超时判定可能误触发
+        if (!state.tabQueues[d.tabId]) state.tabQueues[d.tabId] = [];
+        if (!state.tabQueues[d.tabId].includes(d.id)) state.tabQueues[d.tabId].push(d.id);
       }
     }
     persist();

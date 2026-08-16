@@ -133,7 +133,7 @@ chrome.alarms.onAlarm.addListener((alarm) => {
     if (fails <= 3) {
       d.status = 'queued';
       d.error = `停止确认超时，自动重排队尾（${fails}/3）`;
-      d.priority = Math.max(...act.map(x => x.priority ?? 0)) + 1; // 排到队尾
+      d.priority = Math.max(0, ...act.map(x => x.priority ?? 0)) + 1; // 排到队尾：Math.max(0,-Infinity)=0，空数组时不会变 -Infinity
       if (!state.tabQueues[d.tabId]) state.tabQueues[d.tabId] = [];
       if (!state.tabQueues[d.tabId].includes(d.id)) state.tabQueues[d.tabId].push(d.id);
       persist();
