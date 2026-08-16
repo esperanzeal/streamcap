@@ -159,6 +159,8 @@ chrome.webRequest.onHeadersReceived.addListener(
 const VIDEO_CT = ['video/', 'application/vnd.apple.mpegurl', 'application/x-mpegurl', 'audio/mpegurl', 'application/dash+xml'];
 chrome.webRequest.onHeadersReceived.addListener(
   (details) => {
+    // 【诊断】所有响应都打日志，确认 listener 是否被调用（MV3 blocking 是否生效）
+    log('debug', `[webReq] ${details.method} ${details.url.substring(0, 60)} → ${details.statusCode} initiator=${details.initiator || '?'}`);
     const headers = details.responseHeaders;
     // 页面 origin（请求发起者）：credentials: include 时 ACAO 必须是具体 origin 而非 *，
     // 且必须有 Allow-Credentials: true，否则浏览器拒绝响应。
