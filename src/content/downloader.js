@@ -191,17 +191,10 @@ window.VGP = window.VGP || {};
       // 批次进度节流上报：慢网/大文件时单批次可能耗时 >90s，background 的停滞判定
       // 依赖"done 增长"来刷新 lastDoneAt。这里每 15s 强制报一次当前已下载分片数，
       // 让 background 能区分"下载在推进只是慢"与"真卡死"（done 增长仍由批次循环上报）。
-      let lastThrottleReport = 0;
-      const throttleReport = () => {
-        const now = Date.now();
-        if (now - lastThrottleReport < 15000) return;
-        lastThrottleReport = now;
+      const throttleTimer = startThrottle(downloadId, () => {
         const elapsed = (performance.now() - downloadStartTime) / 1000;
-        const speed = elapsed > 1 ? formatSpeed(networkBytes / elapsed) : '';
-        const pct = Math.round((totalDone / total) * 100);
-        reportProgress(downloadId, pct, totalDone, total, speed);
-      };
-      const throttleTimer = setInterval(throttleReport, 5000); // 每 5s 检查一次是否满 15s
+        return { pct: Math.round(totalDone / total * 100), done: totalDone, total, speed: elapsed > 1 ? formatSpeed(networkBytes / elapsed) : '' };
+      });
       for (let batchIdx = 0; batchIdx < totalBatches; batchIdx++) {
         if (completed.has(batchIdx)) {
           // 已完成的 batch，只统计字节数（用文件大小，不读整个 blob——千批次下避免巨量 IO）
@@ -351,35 +344,7 @@ window.VGP = window.VGP || {};
       log('success', `[${taskLabel}] 合并完成: ${(finalBlob.size / 1024 / 1024).toFixed(1)}MB`);
 
       // 6. 触发下载：交给 background 用 chrome.downloads 触发（比 a.click() 稳定）
-      const url = URL.createObjectURL(finalBlob);
-      const filename = guessName(pageTitle || document.title);
-      chrome.runtime.sendMessage({ type: 'DOWNLOAD_BLOB', downloadId, blobUrl: url, filename }, (resp) => {
-        if (chrome.runtime.lastError || !resp || !resp.ok) {
-          // 消息失败时 fallback 到页面内 a.click()
-          log('warn', `[${taskLabel}] chrome.downloads 触发失败，回退 a.click()`);
-          const a = document.createElement('a');
-          a.href = url;
-          a.download = filename;
-          a.style.display = 'none';
-          (document.body || document.documentElement).appendChild(a);
-          a.click();
-          // a.click() 降级路径：60s 后清理 a 元素 + revoke blob URL + 清理分片，
-          // 并向 background 上报永久失败（blob 已交浏览器、无法确认保存结果，且分片已清理）——
-          // 标 failed 释放并发槽，避免任务永久卡在 exporting/downloading 占槽。
-          setTimeout(() => {
-            if (a.parentNode) a.parentNode.removeChild(a);
-            try { URL.revokeObjectURL(url); } catch {}
-            VGP.cleanupOpfs(downloadId);
-            log('info', `[${taskLabel}] a.click() 降级路径：blob 已释放、分片已清理`);
-            chrome.runtime.sendMessage({
-              type: 'DOWNLOAD_ERROR',
-              downloadId,
-              error: '已通过页面 a.click() 触发下载（无法确认保存结果），分片已清理，可重新下载',
-              permanent: true
-            }).catch(() => {});
-          }, 60000);
-        }
-      });
+      exportBlob(downloadId, finalBlob, pageTitle, taskLabel);
       // 注意：这里不 revoke blob、不清理分片、不标完成——
       // 等 background 收到 Chrome 下载结果信号后发 FINALIZE_DOWNLOAD 再收尾，
       // 避免"扩展显示完成但 Chrome 下载失败"的状态不一致
@@ -393,57 +358,8 @@ window.VGP = window.VGP || {};
     } catch (err) {
       // 所有退出路径都要清理节流上报定时器（成功路径在合并前已 clear，此处兜底异常/取消路径）
       try { clearInterval(throttleTimer); } catch {}
-      // ★ 先读取取消来源：removeAbortController 会删掉 cancelReasons，必须在删除前读取，
-      // 否则 reason 永远丢成 undefined → default 分支上报"已取消" → background 误判为
-      // 用户手动取消（直接 return 不释放槽），停滞/心跳的自动重排确认失效，任务卡在
-      // stopping 占槽，只能靠 30s 超时兜底反复重排。
-      const cancelReason = cancelReasons.get(downloadId);
-      removeAbortController(downloadId);
-      runningDownloads.delete(downloadId);
-      stopHeartbeat(downloadId);
-      hideHiddenBanner();
-      if (err.name === 'AbortError') {
-        // 区分取消来源：调度器自动暂停（停滞/心跳/导航）≠ 用户手动暂停/取消
-        const reason = cancelReason;
-        let msg, errText;
-        switch (reason) {
-          case 'manual_pause':
-            msg = '已暂停（手动），分片已保留可续传';
-            errText = '已暂停';
-            break;
-          case 'manual_cancel':
-            msg = '已取消（手动），分片已保留可续传';
-            errText = '已取消';
-            break;
-          case 'stalled':
-            msg = '已暂停（自动：长时间无进度），分片已保留可续传';
-            errText = '已暂停(无进度)';
-            break;
-          case 'heartbeat':
-            msg = '已暂停（自动：页面无响应），分片已保留可续传';
-            errText = '已暂停(页面无响应)';
-            break;
-          case 'navigation':
-            msg = '已暂停（自动：页面刷新/跳转），分片已保留可续传';
-            errText = '已暂停(页面刷新)';
-            break;
-          default:
-            msg = '下载被取消，分片已保留可续传';
-            errText = '已取消';
-        }
-        log('info', `[${taskLabel}] ${msg}`);
-        chrome.runtime.sendMessage({ type: 'DOWNLOAD_ERROR', downloadId, error: errText, done: totalDone, total });
-      } else {
-        log('error', `[${taskLabel}] 下载失败: ${err.message}`);
-        // 永久错误（404/源站删除/无分片）→ permanent:true，background 直接判失败不重派
-        const permanent = /404|永久错误|无分片/.test(err.message || '');
-        // 失败时保留 OPFS（下次可续传）
-        chrome.runtime.sendMessage({
-          type: 'DOWNLOAD_ERROR', downloadId, error: err.message,
-          done: totalDone || resumeFrom, total,
-          permanent,
-        });
-      }
+      // ★ reportDownloadError 内部先读取消来源再 removeAbortController（避免 reason 丢失）
+      reportDownloadError(downloadId, err, taskLabel, { done: totalDone, total, resumeFrom });
     }
   }
 
@@ -494,14 +410,7 @@ window.VGP = window.VGP || {};
       const CONCURRENCY = concurrency || 4;
       let totalBytes = 0;
       const downloadStartTime = performance.now();
-      const throttleReport = () => {
-        const now = Date.now();
-        if (now - lastThrottle < 15000) return;
-        lastThrottle = now;
-        reportProgress(downloadId, Math.round(totalDone / totalBlocks * 100), totalDone, totalBlocks, '');
-      };
-      let lastThrottle = 0;
-      throttleTimer = setInterval(throttleReport, 5000);
+      throttleTimer = startThrottle(downloadId, () => ({ pct: Math.round(totalDone / totalBlocks * 100), done: totalDone, total: totalBlocks }));
 
       // 4. 下载每块（Range 请求，并行 CONCURRENCY）
       for (let blockIdx = 0; blockIdx < totalBlocks; blockIdx++) {
@@ -549,55 +458,16 @@ window.VGP = window.VGP || {};
       }
       const finalBlob = new Blob(chunks, { type: 'video/mp4' });
       log('success', `[${taskLabel}] 合并完成: ${(finalBlob.size / 1024 / 1024).toFixed(1)}MB`);
-      const blobUrl = URL.createObjectURL(finalBlob);
-      const filename = guessName(pageTitle || document.title);
-      chrome.runtime.sendMessage({ type: 'DOWNLOAD_BLOB', downloadId, blobUrl, filename }, (resp) => {
-        if (chrome.runtime.lastError || !resp || !resp.ok) {
-          log('warn', `[${taskLabel}] chrome.downloads 触发失败，回退 a.click()`);
-          const a = document.createElement('a');
-          a.href = blobUrl;
-          a.download = filename;
-          a.style.display = 'none';
-          (document.body || document.documentElement).appendChild(a);
-          a.click();
-          setTimeout(() => {
-            if (a.parentNode) a.parentNode.removeChild(a);
-            try { URL.revokeObjectURL(blobUrl); } catch {}
-            VGP.cleanupOpfs(downloadId);
-            chrome.runtime.sendMessage({ type: 'DOWNLOAD_ERROR', downloadId, error: '已通过页面 a.click() 触发下载，分片已清理', permanent: true }).catch(() => {});
-          }, 60000);
-        }
-      });
+      exportBlob(downloadId, finalBlob, pageTitle, taskLabel);
       removeAbortController(downloadId);
       runningDownloads.delete(downloadId);
       stopHeartbeat(downloadId);
       hideHiddenBanner();
     } catch (err) {
       try { clearInterval(throttleTimer); } catch {}
-      const cancelReason = cancelReasons.get(downloadId);
-      removeAbortController(downloadId);
-      runningDownloads.delete(downloadId);
-      stopHeartbeat(downloadId);
-      hideHiddenBanner();
-      if (err.name === 'AbortError') {
-        let errText = '已取消';
-        switch (cancelReason) {
-          case 'manual_pause': errText = '已暂停'; break;
-          case 'manual_cancel': errText = '已取消'; break;
-          case 'stalled': errText = '已暂停(无进度)'; break;
-          case 'heartbeat': errText = '已暂停(页面无响应)'; break;
-          case 'navigation': errText = '已暂停(页面刷新)'; break;
-        }
-        log('info', `[${taskLabel}] ${errText}，分片已保留可续传`);
-        chrome.runtime.sendMessage({ type: 'DOWNLOAD_ERROR', downloadId, error: errText, done: totalDone, total: totalBlocks });
-      } else {
-        log('error', `[${taskLabel}] MP4 下载失败: ${err.message}`);
-        chrome.runtime.sendMessage({
-          type: 'DOWNLOAD_ERROR', downloadId, error: err.message,
-          done: totalDone || resumeFrom, total: totalBlocks,
-          permanent: /404|永久错误|无法获取文件大小/.test(err.message || ''),
-        });
-      }
+      reportDownloadError(downloadId, err, taskLabel, {
+        done: totalDone, total: totalBlocks, resumeFrom,
+      });
     }
   }
 
@@ -631,54 +501,16 @@ window.VGP = window.VGP || {};
       reportProgress(downloadId, 98, received, 0, '合并中...');
       const buf = await opfsRead(`dl_${downloadId}_block_0.bin`);
       if (!buf) throw new Error('缓存丢失');
-      const finalBlob = new Blob([buf], { type: 'video/mp4' });
-      const blobUrl = URL.createObjectURL(finalBlob);
-      const filename = guessName(pageTitle || document.title);
-      chrome.runtime.sendMessage({ type: 'DOWNLOAD_BLOB', downloadId, blobUrl, filename }, (resp2) => {
-        if (chrome.runtime.lastError || !resp2 || !resp2.ok) {
-          const a = document.createElement('a');
-          a.href = blobUrl;
-          a.download = filename;
-          a.style.display = 'none';
-          (document.body || document.documentElement).appendChild(a);
-          a.click();
-          setTimeout(() => {
-            if (a.parentNode) a.parentNode.removeChild(a);
-            try { URL.revokeObjectURL(blobUrl); } catch {}
-            VGP.cleanupOpfs(downloadId);
-            chrome.runtime.sendMessage({ type: 'DOWNLOAD_ERROR', downloadId, error: '已通过页面 a.click() 触发下载，分片已清理', permanent: true }).catch(() => {});
-          }, 60000);
-        }
-      });
+      exportBlob(downloadId, new Blob([buf], { type: 'video/mp4' }), pageTitle, taskLabel);
       removeAbortController(downloadId);
       runningDownloads.delete(downloadId);
       stopHeartbeat(downloadId);
       hideHiddenBanner();
     } catch (err) {
-      const cancelReason = cancelReasons.get(downloadId);
-      removeAbortController(downloadId);
-      runningDownloads.delete(downloadId);
-      stopHeartbeat(downloadId);
-      hideHiddenBanner();
-      if (err.name === 'AbortError') {
-        let errText = '已取消';
-        switch (cancelReason) {
-          case 'manual_pause': errText = '已暂停'; break;
-          case 'manual_cancel': errText = '已取消'; break;
-          case 'stalled': errText = '已暂停(无进度)'; break;
-          case 'heartbeat': errText = '已暂停(页面无响应)'; break;
-          case 'navigation': errText = '已暂停(页面刷新)'; break;
-        }
-        log('info', `[${taskLabel}] ${errText}，已下载 ${(received / 1024 / 1024).toFixed(1)}MB 未保留（流式无续传）`);
-        chrome.runtime.sendMessage({ type: 'DOWNLOAD_ERROR', downloadId, error: errText, done: 0, total: 0 });
-      } else {
-        log('error', `[${taskLabel}] 流式下载失败: ${err.message}`);
-        chrome.runtime.sendMessage({
-          type: 'DOWNLOAD_ERROR', downloadId, error: err.message,
-          done: 0, total: 0,
-          permanent: /404|永久错误/.test(err.message || ''),
-        });
-      }
+      reportDownloadError(downloadId, err, taskLabel, {
+        done: 0, total: 0, resumeFrom: 0,
+        abortNote: `，已下载 ${(received / 1024 / 1024).toFixed(1)}MB 未保留（流式无续传）`,
+      });
     }
   }
 
@@ -758,14 +590,7 @@ window.VGP = window.VGP || {};
       const completed = new Set(meta.completedBatches);
       const CONCURRENCY = concurrency || 4;
       const downloadStartTime = performance.now();
-      const throttleReport = () => {
-        const now = Date.now();
-        if (now - lastThrottle < 15000) return;
-        lastThrottle = now;
-        reportProgress(downloadId, Math.round(totalDone / totalItems * 100), totalDone, totalItems, '');
-      };
-      let lastThrottle = 0;
-      throttleTimer = setInterval(throttleReport, 5000);
+      throttleTimer = startThrottle(downloadId, () => ({ pct: Math.round(totalDone / totalItems * 100), done: totalDone, total: totalItems }));
       const urls = [initUrl, ...segUrls];
       for (let i = 0; i < urls.length; i++) {
         if (completed.has(i)) {
@@ -803,54 +628,16 @@ window.VGP = window.VGP || {};
       }
       const finalBlob = new Blob(parts, { type: 'video/mp4' });
       log('success', `[${taskLabel}] 合并完成: ${(finalBlob.size / 1024 / 1024).toFixed(1)}MB`);
-      const blobUrl = URL.createObjectURL(finalBlob);
-      const filename = guessName(pageTitle || document.title);
-      chrome.runtime.sendMessage({ type: 'DOWNLOAD_BLOB', downloadId, blobUrl, filename }, (resp2) => {
-        if (chrome.runtime.lastError || !resp2 || !resp2.ok) {
-          const a = document.createElement('a');
-          a.href = blobUrl;
-          a.download = filename;
-          a.style.display = 'none';
-          (document.body || document.documentElement).appendChild(a);
-          a.click();
-          setTimeout(() => {
-            if (a.parentNode) a.parentNode.removeChild(a);
-            try { URL.revokeObjectURL(blobUrl); } catch {}
-            VGP.cleanupOpfs(downloadId);
-            chrome.runtime.sendMessage({ type: 'DOWNLOAD_ERROR', downloadId, error: '已通过页面 a.click() 触发下载，分片已清理', permanent: true }).catch(() => {});
-          }, 60000);
-        }
-      });
+      exportBlob(downloadId, finalBlob, pageTitle, taskLabel);
       removeAbortController(downloadId);
       runningDownloads.delete(downloadId);
       stopHeartbeat(downloadId);
       hideHiddenBanner();
     } catch (err) {
       try { clearInterval(throttleTimer); } catch {}
-      const cancelReason = cancelReasons.get(downloadId);
-      removeAbortController(downloadId);
-      runningDownloads.delete(downloadId);
-      stopHeartbeat(downloadId);
-      hideHiddenBanner();
-      if (err.name === 'AbortError') {
-        let errText = '已取消';
-        switch (cancelReason) {
-          case 'manual_pause': errText = '已暂停'; break;
-          case 'manual_cancel': errText = '已取消'; break;
-          case 'stalled': errText = '已暂停(无进度)'; break;
-          case 'heartbeat': errText = '已暂停(页面无响应)'; break;
-          case 'navigation': errText = '已暂停(页面刷新)'; break;
-        }
-        log('info', `[${taskLabel}] ${errText}，分片已保留可续传`);
-        chrome.runtime.sendMessage({ type: 'DOWNLOAD_ERROR', downloadId, error: errText, done: totalDone, total: totalItems });
-      } else {
-        log('error', `[${taskLabel}] DASH 下载失败: ${err.message}`);
-        chrome.runtime.sendMessage({
-          type: 'DOWNLOAD_ERROR', downloadId, error: err.message,
-          done: totalDone || resumeFrom, total: totalItems,
-          permanent: /404|永久错误|mpd 解析失败|未找到视频轨|无 Representation|无 SegmentTemplate|无法计算分片数|无 init 段 URL|无分片/.test(err.message || ''),
-        });
-      }
+      reportDownloadError(downloadId, err, taskLabel, {
+        done: totalDone, total: totalItems, resumeFrom,
+      });
     }
   }
 
@@ -871,6 +658,74 @@ window.VGP = window.VGP || {};
       const id = parts.filter(Boolean).pop() || 'video';
       return `${id}.mp4`;
     } catch { return 'downloaded_video.mp4'; }
+  }
+
+  // ============ 公共 helper（四路下载路径共用，消除复制粘贴） ============
+
+  // 统一永久错误判定：404/解析失败/无分片等重试无意义 → 直接失败
+  const PERMANENT_PATTERN = /404|永久错误|无分片|无法获取文件大小|mpd 解析失败|未找到视频轨|无 Representation|无 SegmentTemplate|无法计算分片数|无 init 段 URL/;
+
+  // 节流上报模板：每 15s 报一次（setInterval 每 5s 检查），getProgress 返回 { pct, done, total, speed? }
+  function startThrottle(downloadId, getProgress) {
+    let last = 0;
+    return setInterval(() => {
+      const now = Date.now();
+      if (now - last < 15000) return;
+      last = now;
+      const p = getProgress(now);
+      reportProgress(downloadId, p.pct, p.done, p.total, p.speed || '');
+    }, 5000);
+  }
+
+  // 合并导出：blob → DOWNLOAD_BLOB → 失败回退 a.click() → 60s 后清理
+  function exportBlob(downloadId, finalBlob, pageTitle, taskLabel) {
+    const blobUrl = URL.createObjectURL(finalBlob);
+    const filename = guessName(pageTitle || document.title);
+    chrome.runtime.sendMessage({ type: 'DOWNLOAD_BLOB', downloadId, blobUrl, filename }, (resp) => {
+      if (chrome.runtime.lastError || !resp || !resp.ok) {
+        log('warn', `[${taskLabel}] chrome.downloads 触发失败，回退 a.click()`);
+        const a = document.createElement('a');
+        a.href = blobUrl;
+        a.download = filename;
+        a.style.display = 'none';
+        (document.body || document.documentElement).appendChild(a);
+        a.click();
+        setTimeout(() => {
+          if (a.parentNode) a.parentNode.removeChild(a);
+          try { URL.revokeObjectURL(blobUrl); } catch {}
+          VGP.cleanupOpfs(downloadId);
+          chrome.runtime.sendMessage({ type: 'DOWNLOAD_ERROR', downloadId, error: '已通过页面 a.click() 触发下载，分片已清理', permanent: true }).catch(() => {});
+        }, 60000);
+      }
+    });
+  }
+
+  // 统一错误上报：清理运行态 + AbortError 按取消来源映射文案 + 永久/普通错误
+  function reportDownloadError(downloadId, err, taskLabel, { done, total, resumeFrom, abortNote }) {
+    const cancelReason = cancelReasons.get(downloadId);
+    removeAbortController(downloadId);
+    runningDownloads.delete(downloadId);
+    stopHeartbeat(downloadId);
+    hideHiddenBanner();
+    if (err.name === 'AbortError') {
+      let errText = '已取消';
+      switch (cancelReason) {
+        case 'manual_pause': errText = '已暂停'; break;
+        case 'manual_cancel': errText = '已取消'; break;
+        case 'stalled': errText = '已暂停(无进度)'; break;
+        case 'heartbeat': errText = '已暂停(页面无响应)'; break;
+        case 'navigation': errText = '已暂停(页面刷新)'; break;
+      }
+      log('info', `[${taskLabel}] ${errText}${abortNote || '，分片已保留可续传'}`);
+      chrome.runtime.sendMessage({ type: 'DOWNLOAD_ERROR', downloadId, error: errText, done, total });
+    } else {
+      log('error', `[${taskLabel}] 下载失败: ${err.message}`);
+      chrome.runtime.sendMessage({
+        type: 'DOWNLOAD_ERROR', downloadId, error: err.message,
+        done: done || resumeFrom, total,
+        permanent: PERMANENT_PATTERN.test(err.message || ''),
+      });
+    }
   }
 
   VGP.startDownload = startDownload;
