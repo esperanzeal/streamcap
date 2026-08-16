@@ -42,6 +42,26 @@ window.VGP = window.VGP || {};
       sendResponse({ ok: true });
       return;
     }
+    // 文件大小探测（popup 请求）：页面上下文发 Range 请求，浏览器自动带 Referer/Cookie，
+    // 从 content-range 解析总大小（部分站点等 CDN 防盗链校验 Referer，background 发会 403）
+    if (msg.type === 'FETCH_SIZE') {
+      try {
+        const r = await fetch(msg.url, { headers: { Range: 'bytes=0-0' } });
+        if (r.status === 206) {
+          const cr = r.headers.get('content-range');
+          const m = cr && cr.match(/\/(\d+)$/);
+          sendResponse({ size: m ? parseInt(m[1]) : null });
+        } else if (r.status === 200) {
+          const len = r.headers.get('content-length');
+          sendResponse({ size: len ? parseInt(len) : null });
+        } else {
+          sendResponse({ size: null });
+        }
+      } catch {
+        sendResponse({ size: null });
+      }
+      return true; // 异步响应
+    }
     // 清理孤儿分片：删除不属于任何活跃任务的分片（扩展启动/定时清理时兜底）
     if (msg.type === 'CLEANUP_OPFS') {
       const active = new Set(msg.activeDownloadIds || []);

@@ -13,8 +13,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   // 嗅探查询（popup 打开/刷新时补齐 mp4 直链的文件大小）
   if (msg.type === 'GET_M3U8S') {
     chrome.tabs.query({ active: true, currentWindow: true }, async tabs => {
-      const store = state.sniffStore[tabs[0]?.id];
-      if (store) await fillSizes(store); // 补齐 mp4 大小（Range 请求）
+      const tabId = tabs[0]?.id;
+      const store = state.sniffStore[tabId];
+      if (store && tabId) await fillSizes(store, tabId); // 让页面 content 探测 mp4 大小
       sendResponse(store || { videos: [], pageUrl: '' });
     });
     return true;

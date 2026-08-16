@@ -37,77 +37,28 @@ export function storeVideos(tabId, urls, pageTitle) {
 
 // ============ 文件大小探测（MP4 直链用 Range 请求拿 Content-Range 总大小） ============
 // 只对 mp4 直链有意义（HLS/DASH 是分片流，playlist 大小不代表视频大小）。
-// 部分站点等 CDN 防盗链校验 Referer：fetch 不能设 forbidden header（referrer option 跨源会被忽略），
-// 用 declarativeNetRequest session 动态规则给探测请求注入 Referer，请求完删除规则。
-let dnrRuleId = 20000;
-async function fetchSize(url, referer) {
-  let ruleId = null;
-  if (referer) {
-    ruleId = ++dnrRuleId;
-    // DNR urlFilter 合法语法：`||host/path`（|| 表示域名起始边界），省略 resourceTypes 全类型匹配
-    let urlFilter;
-    try {
-      const u = new URL(url);
-      urlFilter = `||${u.host}${u.pathname}`;
-    } catch {
-      urlFilter = '||' + url.split('?')[0].slice(0, 200);
-    }
-    try {
-      await chrome.declarativeNetRequest.updateSessionRules({
-        addRules: [{
-          id: ruleId,
-          priority: 1,
-          action: { type: 'modifyHeaders', requestHeaders: [{ header: 'Referer', operation: 'set', value: referer }] },
-          condition: { urlFilter },
-        }],
-      });
-    } catch (e) {
-      log('warn', `[嗅探] DNR 规则添加失败: ${e.message}`);
-    }
-  }
+// 由视频页面的 content script 发请求：页面上下文浏览器自动带 Referer + Cookie，
+// 且 部分站点等 CDN 允许同源页面 fetch（播放分片就靠它）——background 的 fetch/DNR
+// 注入 Referer 都不可靠（forbidden header / DNR 不命中 background 请求）。
+async function fetchSize(url, tabId) {
   try {
-    // 尝试序列：Range(206→content-range) → HEAD(200→content-length) → GET(200→content-length)
-    const attempts = [
-      { headers: { Range: 'bytes=0-0' } },
-      { method: 'HEAD' },
-      {},
-    ];
-    for (const init of attempts) {
-      try {
-        const resp = await fetch(url, init);
-        const kind = init.headers ? 'Range' : (init.method || 'GET');
-        log('debug', `[嗅探] 大小探测(${kind}) ${url.substring(0, 70)} → HTTP ${resp.status}`);
-        if (resp.status === 206) {
-          const cr = resp.headers.get('content-range'); // bytes 0-0/123456
-          const m = cr && cr.match(/\/(\d+)$/);
-          if (m) return parseInt(m[1]);
-        } else if (resp.status === 200) {
-          const len = resp.headers.get('content-length');
-          if (len) return parseInt(len);
-        }
-      } catch (e) {
-        log('warn', `[嗅探] 大小探测失败 ${url.substring(0, 60)}: ${e.message}`);
-      }
-    }
-  } finally {
-    if (ruleId) {
-      try { await chrome.declarativeNetRequest.updateSessionRules({ removeRuleIds: [ruleId] }); } catch {}
-    }
+    const resp = await chrome.tabs.sendMessage(tabId, { type: 'FETCH_SIZE', url });
+    return resp && resp.size ? resp.size : null;
+  } catch {
+    return null; // 页面已关闭/无 content：无法探测
   }
-  return null;
 }
 
 // 补齐 sniffStore 里 mp4 条目的 size（GET_M3U8S 时调用，popup 打开/刷新时展示）
-export async function fillSizes(store) {
-  if (!store || !store.videos) return;
+export async function fillSizes(store, tabId) {
+  if (!store || !store.videos || !tabId) return;
   const need = store.videos.filter(e => e.format === 'mp4' && e.size === undefined);
   // 并发上限 3，避免一次拉太多
   for (let i = 0; i < need.length; i += 3) {
     const chunk = need.slice(i, i + 3);
     await Promise.all(chunk.map(async e => {
-      const size = await fetchSize(e.url, e.referer);
-      if (size) e.size = size;
-      else e.size = null; // 请求失败：显示"—"（标记已尝试，不重复请求）
+      const size = await fetchSize(e.url, tabId);
+      e.size = size || null; // null 显示"—"（页面关闭/获取失败）
     }));
   }
 }
