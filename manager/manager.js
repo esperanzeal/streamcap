@@ -80,13 +80,11 @@ function render() {
 
     const fname = d.pageTitle ? `${d.pageTitle}.mp4` : (d.fileName || '');
     const dupTag = d.dupIndex ? ` <span style="color:#d29922;font-weight:600;">(${d.dupIndex})</span>` : '';
-    // 【测试用】显示 priority 序号，方便观察调度顺序（确认稳定后删除）
-    const prioTag = `<span style="color:#8b949e;font-size:10px;margin-right:6px;border:1px solid #30363d;border-radius:3px;padding:0 4px;" title="priority 序号：数字小 = 优先">P${d.priority ?? '?'}</span>`;
     return `
     <div class="card">
       <div class="card-icon">${icon}</div>
       <div class="card-body">
-        ${fname ? `<div style="font-weight:600;color:#58a6ff;margin-bottom:2px;">${prioTag}📄 ${esc(fname)}${dupTag}</div>` : ''}
+        ${fname ? `<div style="font-weight:600;color:#58a6ff;margin-bottom:2px;">📄 ${esc(fname)}${dupTag}</div>` : ''}
         <div class="card-title">
           ${d.resolution || '?'} · ${new Date(d.createdAt).toLocaleTimeString()}
           <span class="badge ${badgeCls}">${badgeText}</span>
