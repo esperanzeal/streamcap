@@ -1,6 +1,7 @@
 // scheduler.js — StreamCap 队列/调度/暂停/取消
 import { state, persist, broadcast, taskLabel } from './state.js';
 import { log } from './log.js';
+import { detectFormat } from './formats.js';
 
 export function enqueue(tabId, url, referer, resolution, pageUrl, pageTitle, force = false) {
   const { downloads, tabQueues } = state;
@@ -18,6 +19,10 @@ export function enqueue(tabId, url, referer, resolution, pageUrl, pageTitle, for
   const id = state.nextId++;
   // 重复检测：同一 URL 已在任务列表中 → 新任务加序号（(2)、(3)...），提醒用户任务重复
   const dupIndex = Object.values(downloads).filter(x => x.url === url).length + 1;
+  // 格式：优先用 sniffStore 嗅探到的（onHeadersReceived 按 Content-Type 识别过，
+  // 部分站点等无 .mp4 后缀的签名 URL 也能正确标 mp4），兜底按 URL 后缀判断
+  const sniffed = state.sniffStore[tabId]?.videos?.find(v => v.url === url);
+  const taskFormat = sniffed?.format || detectFormat(url);
   downloads[id] = {
     id, url, referer, resolution,
     pageUrl: pageUrl || referer || '',
@@ -25,6 +30,7 @@ export function enqueue(tabId, url, referer, resolution, pageUrl, pageTitle, for
     status: 'queued', pct: 0, done: 0, total: 0,
     speed: '', error: null, createdAt: Date.now(), tabId,
     priority: ++state.prioritySeq, // 创建序号 = FIFO 优先级（数字小 = 先下载）
+    format: taskFormat, // 传给 content 分流下载
     fileName: '',
     dupIndex: dupIndex > 1 ? dupIndex : undefined,
     retryCount: 0, consecutiveFails: 0,
@@ -75,6 +81,7 @@ async function dispatchTab(tabId, downloadId) {
     concurrency,
     referer: d.referer || '',
     pageTitle: d.pageTitle || '',
+    format: d.format, // 入队时的格式（部分站点等 URL 无 .mp4 后缀时靠 Content-Type 识别）
   };
 
   try {

@@ -74,7 +74,7 @@ window.VGP = window.VGP || {};
 
   // ============ 核心：并行下载 + OPFS 持久化 ============
   const runningDownloads = new Set(); // downloadId → 防重入（retry 双派发时只跑一个循环）
-  async function startDownload(downloadId, m3u8Url, resumeFrom, concurrency, referer, pageTitle) {
+  async function startDownload(downloadId, m3u8Url, resumeFrom, concurrency, referer, pageTitle, format) {
     if (runningDownloads.has(downloadId)) {
       // 同一任务已有下载循环在跑（可能是 retry 双派发/重复 START），忽略本次
       log('warn', `[#${downloadId}] 收到重复 START，忽略（已有下载循环在跑）`);
@@ -92,7 +92,10 @@ window.VGP = window.VGP || {};
     if (document.hidden) showHiddenBanner();
 
     // ★ 阶段3 格式分流：MP4 直链走 Range 分块下载（其余 m3u8/mpd 走下方分片下载）
-    if (detectFormat(m3u8Url) === 'mp4') {
+    // 优先用 background 传入的 format（部分站点等 URL 无 .mp4 后缀时靠 Content-Type 识别），
+    // 兜底用 URL 后缀判断
+    const fmt = format || detectFormat(m3u8Url);
+    if (fmt === 'mp4') {
       return downloadDirect(downloadId, m3u8Url, resumeFrom, concurrency, referer, pageTitle, signal);
     }
 

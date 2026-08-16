@@ -7,7 +7,7 @@ window.VGP = window.VGP || {};
   // ============ 消息处理 ============
   chrome.runtime.onMessage.addListener(async (msg, sender, sendResponse) => {
     if (msg.type === 'START_DOWNLOAD') {
-      startDownload(msg.downloadId, msg.m3u8Url, msg.resumeFrom || 0, msg.concurrency || 4, msg.referer || '', msg.pageTitle || '');
+      startDownload(msg.downloadId, msg.m3u8Url, msg.resumeFrom || 0, msg.concurrency || 4, msg.referer || '', msg.pageTitle || '', msg.format);
       sendResponse({ ok: true });
       return;
     }

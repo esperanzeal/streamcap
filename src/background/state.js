@@ -17,6 +17,7 @@ export function persist() {
     fileName: d.fileName, pageTitle: d.pageTitle, dupIndex: d.dupIndex,
     retryCount: d.retryCount, consecutiveFails: d.consecutiveFails,
     priority: d.priority, replacedFlag: d.replacedFlag,
+    format: d.format,
     lastProgressAt: d.lastProgressAt, lastDone: d.lastDone, lastDoneAt: d.lastDoneAt,
     stopPendingAt: d.stopPendingAt,
   }));
