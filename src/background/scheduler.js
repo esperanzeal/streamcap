@@ -318,7 +318,9 @@ export function requeueToFront(d) {
   const qi = q.indexOf(d.id);
   if (qi >= 0) q.splice(qi, 1);
   q.unshift(d.id);
-  state.tabActive[d.tabId] = null;
+  // ★ 不能碰 tabActive：被替换任务标 stopping 时（prioritizeDownload）已释放自己槽，
+  //   之后该 tab 的槽可能被优先任务或队列其他任务占用。再设 null 会清掉别人的槽 →
+  //   并发计数少 1 → maybeDispatch 误判 tab 空闲 → 多派发/同 tab 双任务（review P0-2 抽取引入的回归）
   persist();
   broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
   maybeDispatch();
