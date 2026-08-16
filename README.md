@@ -70,9 +70,9 @@
 - **目录结构**
 
 ```
-background.js        后台：队列/调度/嗅探/状态机/下载信号同步
-content.js           页面侧：分片下载/断点续传/AES-128 解密/合并
 manifest.json        扩展清单
+src/background/      Service Worker（ES module）：main 入口/state 状态/scheduler 调度/sniffing 嗅探/signals 下载信号/stalled 停滞心跳/log 日志/messages 消息常量
+src/content/         页面侧（多文件共享 window.VGP）：main 入口/opfs 缓存/hls 解析解密/downloader 下载循环/merge 合并/sniffer 嗅探/log 日志
 popup/               扩展弹窗（嗅探列表 + 加入下载）
 manager/             下载管理页（任务列表 + 设置）
 logger/              按日期查看/导出日志
@@ -85,7 +85,7 @@ logger/              按日期查看/导出日志
 - 语法检查（有 Node 时）：
 
 ```bash
-node --check background.js && node --check content.js
+for f in src/background/*.js src/content/*.js; do node --check "$f"; done
 ```
 
 ## 许可证

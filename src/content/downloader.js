@@ -1,33 +1,10 @@
-// content.js — StreamCap v3
-// 多线程并行下载 + OPFS 断点续传 + 分批合并
-//
-// 消息类型速查（与 background.js / popup / manager 共享）：
-//   START_DOWNLOAD, CANCEL_DOWNLOAD, PROGRESS, DOWNLOAD_BLOB, DOWNLOAD_ERROR,
-//   FINALIZE_DOWNLOAD, CLEANUP_OPFS, SCAN_VIDEOS, PING, HEARTBEAT
-(() => {
-  'use strict';
-
-  // ============ 日志（console + 按日期写入 storage.local） ============
-  // 注：此 log() 与 background.js 中的实现重复。修改日志格式时需同步两处。
-  function log(level, msg) {
-    try {
-      console[level === 'error' ? 'error' : level === 'warn' ? 'warn' : 'log']('[VGP]', msg);
-    } catch {}
-    try {
-      const now = new Date();
-      // 用本地时区日期做 key：toISOString() 是 UTC 时间，东八区凌晨 0-8 点会落到前一天
-      const key = 'vgp_logs_' +
-        now.getFullYear() + '-' +
-        String(now.getMonth() + 1).padStart(2, '0') + '-' +
-        String(now.getDate()).padStart(2, '0'); // vgp_logs_YYYY-MM-DD（本地日期）
-      chrome.storage.local.get(key, data => {
-        const arr = data[key] || [];
-        arr.push(`[${now.toLocaleTimeString()}] [${level.toUpperCase()}] [页面] ${msg}`);
-        if (arr.length > 5000) arr.splice(0, arr.length - 5000);
-        chrome.storage.local.set({ [key]: arr });
-      });
-    } catch { /* 日志失败不影响主流程 */ }
-  }
+// content downloader.js — 核心下载循环（并行分片 + OPFS 断点续传 + 分批合并）
+'use strict';
+window.VGP = window.VGP || {};
+(function (VGP) {
+  const { log, fetchWithRetry, parseM3u8, selectBestVariant, resolveUrl,
+    parseKeySegments, findKeyForSegment, fetchDecryptKey, decryptSegment, makeIV,
+    opfsWrite, opfsRead, saveMeta, loadMeta } = VGP;
 
   // ============ AbortController 管理 ============
   const abortControllers = new Map(); // downloadId → AbortController
@@ -43,222 +20,6 @@
   function removeAbortController(downloadId) {
     abortControllers.delete(downloadId);
     cancelReasons.delete(downloadId);
-  }
-
-  // 清理某个 downloadId 的所有 OPFS 文件
-  // 注意：当前不主动调用（所有停止流程都保留分片供续传，浏览器退出时自动清理）
-  // 保留备用，未来如需"手动清理残留"功能可复用
-  async function cleanupOpfs(downloadId) {
-    const root = await navigator.storage.getDirectory();
-    const prefix = OPFS_PREFIX + `dl_${downloadId}_`;
-    const metaName = OPFS_PREFIX + `meta_${downloadId}.json`;
-    try {
-      for await (const [name] of root) {
-        if (name.startsWith(prefix) || name === metaName) {
-          try { await root.removeEntry(name); } catch {}
-        }
-      }
-    } catch {}
-  }
-
-  // ============ OPFS 工具 ============
-  const OPFS_PREFIX = 'vgp_';
-
-  async function opfsWrite(name, data) {
-    const root = await navigator.storage.getDirectory();
-    const fh = await root.getFileHandle(OPFS_PREFIX + name, { create: true });
-    const w = await fh.createWritable();
-    await w.write(data);
-    await w.close();
-  }
-
-  async function opfsRead(name) {
-    const root = await navigator.storage.getDirectory();
-    try {
-      const fh = await root.getFileHandle(OPFS_PREFIX + name, { create: false });
-      return await (await fh.getFile()).arrayBuffer();
-    } catch { return null; }
-  }
-
-  async function opfsDelete(name) {
-    const root = await navigator.storage.getDirectory();
-    try { await root.removeEntry(OPFS_PREFIX + name); } catch {}
-  }
-
-  async function opfsList(prefix) {
-    const root = await navigator.storage.getDirectory();
-    const names = [];
-    for await (const [name] of root) {
-      if (name.startsWith(OPFS_PREFIX + prefix)) names.push(name);
-    }
-    return names;
-  }
-
-  // ============ 断点续传元数据 ============
-  async function saveMeta(downloadId, meta) {
-    await opfsWrite(`meta_${downloadId}.json`, JSON.stringify(meta));
-  }
-
-  async function loadMeta(downloadId) {
-    const buf = await opfsRead(`meta_${downloadId}.json`);
-    return buf ? JSON.parse(new TextDecoder().decode(buf)) : null;
-  }
-
-  async function deleteMeta(downloadId) {
-    await opfsDelete(`meta_${downloadId}.json`);
-  }
-
-  // ============ 重试 fetch（含 20s 超时，防 TCP 挂起卡死批次） ============
-  async function fetchWithRetry(url, retries = 3, signal = null, extraHeaders = {}) {
-    for (let attempt = 1; attempt <= retries; attempt++) {
-      if (signal?.aborted) throw new DOMException('已取消', 'AbortError');
-      const timeoutSignal = AbortSignal.timeout(20000); // 20s 无响应 → 超时按失败重试
-      const sig = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
-      try {
-        const resp = await fetch(url, { signal: sig, headers: extraHeaders });
-        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-        return resp;
-      } catch (err) {
-        if (err.name === 'AbortError' && signal?.aborted) throw err; // 用户取消，直接抛
-        if (err.name === 'AbortError') {
-          // 超时（signal 未取消）：包装成普通错误按失败重试，不能被误判为用户取消
-          err = new Error('下载超时（20s 无响应）');
-        }
-        if (attempt === retries) throw err;
-        const delay = Math.min(1000 * Math.pow(2, attempt - 1), 8000);
-        log('warn', `重试 ${attempt}/${retries}，等待 ${delay}ms`);
-        await new Promise(r => setTimeout(r, delay));
-      }
-    }
-  }
-
-  // ============ m3u8 解析 ============
-  function resolveUrl(url, baseUrl) {
-    try { return new URL(url, baseUrl).href; } catch {
-      if (url.startsWith('http')) return url;
-      return baseUrl.substring(0, baseUrl.lastIndexOf('/') + 1) + url;
-    }
-  }
-
-  function parseM3u8(text, baseUrl) {
-    const lines = text.split('\n').map(l => l.trim());
-    const segments = [], variantUrls = [];
-    let isMaster = false;
-    for (let i = 0; i < lines.length; i++) {
-      const line = lines[i];
-      if (!line || line === '#EXTM3U') continue;
-      if (line.startsWith('#EXT-X-STREAM-INF')) {
-        isMaster = true;
-        for (let j = i + 1; j < lines.length; j++) {
-          const n = lines[j];
-          if (n && !n.startsWith('#')) { variantUrls.push(resolveUrl(n, baseUrl)); break; }
-        }
-      }
-      if (line.startsWith('#')) continue;
-      segments.push(resolveUrl(line, baseUrl));
-    }
-    return { segments, isMaster, variantUrls };
-  }
-
-  function selectBestVariant(text) {
-    const lines = text.split('\n').map(l => l.trim());
-    let bestBw = 0, bestUrl = null;
-    for (let i = 0; i < lines.length; i++) {
-      if (!lines[i].startsWith('#EXT-X-STREAM-INF')) continue;
-      const m = lines[i].match(/BANDWIDTH=(\d+)/);
-      const bw = m ? parseInt(m[1]) : 0;
-      for (let j = i + 1; j < lines.length; j++) {
-        if (lines[j] && !lines[j].startsWith('#')) {
-          if (bw > bestBw) { bestBw = bw; bestUrl = lines[j]; }
-          break;
-        }
-      }
-    }
-    return bestUrl;
-  }
-
-  // ============ AES-128 解密 ============
-  // 解析 m3u8 中的所有 KEY 标签，返回 key 段列表（支持 key rotation）
-  // 每个 key 段包含 { segStartIndex, keyUrl, ivHex }，控制从 segStartIndex 开始的所有分片
-  // 直到下一个 key 段或 playlist 末尾。
-  function parseKeySegments(text, baseUrl) {
-    const lines = text.split('\n').map(l => l.trim());
-    const keySegments = [];
-    let segIndex = 0;
-    let currentKeyInfo = null;
-    let mediaSeq = 0;
-
-    for (let i = 0; i < lines.length; i++) {
-      const line = lines[i];
-
-      if (line.startsWith('#EXT-X-KEY')) {
-        const m = line.match(/METHOD=AES-128,URI="([^"]+)"(?:,IV=(0x[0-9a-fA-F]+))?/);
-        if (m) {
-          const keyUrl = resolveUrl(m[1], baseUrl);
-          const ivHex = m[2] || null;
-          if (!currentKeyInfo || currentKeyInfo.keyUrl !== keyUrl || currentKeyInfo.ivHex !== ivHex) {
-            currentKeyInfo = { segStartIndex: segIndex, keyUrl, ivHex };
-            keySegments.push(currentKeyInfo);
-          }
-        }
-        continue;
-      }
-
-      if (line.startsWith('#EXT-X-MEDIA-SEQUENCE')) {
-        const m = line.match(/:(\d+)/);
-        if (m) mediaSeq = parseInt(m[1]);
-        continue;
-      }
-
-      // 跳过注释/标签行
-      if (line.startsWith('#') || !line) continue;
-
-      // 分片 URI 行
-      segIndex++;
-    }
-
-    return { keySegments, mediaSeq };
-  }
-
-  // 为给定分片索引查找对应的 key 段（二分查找）
-  function findKeyForSegment(keySegments, segIndex) {
-    if (!keySegments || keySegments.length === 0) return null;
-    let lo = 0, hi = keySegments.length - 1;
-    while (lo < hi) {
-      const mid = Math.ceil((lo + hi) / 2);
-      if (keySegments[mid].segStartIndex <= segIndex) lo = mid;
-      else hi = mid - 1;
-    }
-    return keySegments[lo].segStartIndex <= segIndex ? keySegments[lo] : null;
-  }
-
-  async function fetchDecryptKey(keyUrl, signal) {
-    const resp = await fetchWithRetry(keyUrl, 3, signal);
-    return new Uint8Array(await resp.arrayBuffer());
-  }
-
-  async function decryptSegment(data, cryptoKey, iv) {
-    const decrypted = await crypto.subtle.decrypt(
-      { name: 'AES-CBC', iv },
-      cryptoKey,
-      data
-    );
-    return new Uint8Array(decrypted);
-  }
-
-  function makeIV(ivHex, segIndex, mediaSeq) {
-    if (ivHex) {
-      const hex = ivHex.replace('0x', '').padStart(32, '0');
-      const bytes = new Uint8Array(16);
-      for (let i = 0; i < 16; i++) {
-        bytes[i] = parseInt(hex.substring(i * 2, i * 2 + 2), 16);
-      }
-      return bytes;
-    }
-    const seq = mediaSeq + segIndex;
-    const bytes = new Uint8Array(16);
-    new DataView(bytes.buffer).setBigUint64(8, BigInt(seq), false);
-    return bytes;
   }
 
   // ============ 进度回报 ============
@@ -388,12 +149,12 @@
       } else if (resumeFrom > 0) {
         // 确保 meta 反映了之前的进度。
         // ⚠️ 注意：resumeFrom 是 background 最后收到的 done（可能是批次下载中途的 mini 值），
-        // 不能按分片数直接推算出已完成批次——批次是原子落盘的（80 片全部写完才 push
+        // 不能按分片数直接推算出已完成批次——批次是原子落盘的（40 片全部写完才 push
         // completedBatches），只有真正写过 OPFS 的批次才算完成。这里用 OPFS 实际校验：
         // 逐批读 dl_{id}_batch_{b}.blob，存在才标记。杜绝"假标记未落盘批次 → 合并缓存丢失"。
         const completedBatches = [];
         const root = await navigator.storage.getDirectory();
-        const prefix = OPFS_PREFIX + `dl_${downloadId}_batch_`;
+        const prefix = VGP.OPFS_PREFIX + `dl_${downloadId}_batch_`;
         for await (const [name] of root) {
           if (!name.startsWith(prefix)) continue;
           const b = parseInt(name.slice(prefix.length));
@@ -410,15 +171,15 @@
       const CONCURRENCY = concurrency || 4;
       let totalBytes = 0;
       // totalDone 保持函数级初始值 0，由批次循环顺序推进（跳过落盘批次累加、下载批次 segStart+batchDone），
-      // 天然单调。不要在这里用 (max(completed)+1)*80 预推——completed 可能不连续（中间批次缓存丢失），
+      // 天然单调。不要在这里用 (max(completed)+1)*40 预推——completed 可能不连续（中间批次缓存丢失），
       // 预推会虚高后再被循环覆盖 → 进度条先涨后掉（鬼打墙）。
       let networkBytes = 0;
       const downloadStartTime = performance.now();
 
       // 4. 分批下载
       // 批次进度节流上报：慢网/大文件时单批次可能耗时 >90s，background 的停滞判定
-      // 依赖"done 增长"来刷新 lastProgressAt。这里每 15s 强制报一次当前已下载分片数，
-      // 让 background 能区分"下载在推进只是慢"与"真卡死"。
+      // 依赖"done 增长"来刷新 lastDoneAt。这里每 15s 强制报一次当前已下载分片数，
+      // 让 background 能区分"下载在推进只是慢"与"真卡死"（done 增长仍由批次循环上报）。
       let lastThrottleReport = 0;
       const throttleReport = () => {
         const now = Date.now();
@@ -436,7 +197,7 @@
           let batchSize = 0;
           try {
             const root2 = await navigator.storage.getDirectory();
-            const fh = await root2.getFileHandle(`${OPFS_PREFIX}dl_${downloadId}_batch_${batchIdx}.blob`);
+            const fh = await root2.getFileHandle(`${VGP.OPFS_PREFIX}dl_${downloadId}_batch_${batchIdx}.blob`);
             batchSize = (await fh.getFile()).size;
           } catch { batchSize = 0; }
           if (batchSize > 0) {
@@ -508,7 +269,7 @@
         // 重试失败分片：fetchWithRetry(5) 即"同一分片连续尝试 5 次"，5 次全失败 → 上报任务失败
         // 注意：重试阶段可能耗时很长（单片 20s×5+退避≈115s），期间 done 不变。
         // 必须每片尝试后发一次 PROGRESS 让 background 知道"还在干活"（done 不变也发），
-        // 否则停滞判定（PROGRESS 停 90s）会把坏分片重试误判为卡死 → 取消重派 → 鬼打墙。
+        // 否则停滞判定（done 未增长 90s）会把坏分片重试误判为卡死 → 取消重派 → 鬼打墙。
         for (let i = 0; i < batchCount; i++) {
           if (batchChunks[i] !== null) continue;
           const segNum = segStart + i + 1;
@@ -596,7 +357,7 @@
           setTimeout(() => {
             if (a.parentNode) a.parentNode.removeChild(a);
             try { URL.revokeObjectURL(url); } catch {}
-            cleanupOpfs(downloadId);
+            VGP.cleanupOpfs(downloadId);
             log('info', `[${taskLabel}] a.click() 降级路径：blob 已释放、分片已清理`);
             chrome.runtime.sendMessage({
               type: 'DOWNLOAD_ERROR',
@@ -693,267 +454,8 @@
     } catch { return 'downloaded_video.mp4'; }
   }
 
-  // ============ 页面级视频检测 ============
-  function extractVideoSources() {
-    const urls = [];
-    document.querySelectorAll('video').forEach(v => {
-      if (v.src && v.src.startsWith('http')) urls.push(v.src);
-      if (v.currentSrc && v.currentSrc.startsWith('http')) urls.push(v.currentSrc);
-      v.querySelectorAll('source').forEach(s => {
-        if (s.src && s.src.startsWith('http')) urls.push(s.src);
-      });
-    });
-    return [...new Set(urls)];
-  }
-
-  // ============ 消息处理 ============
-  chrome.runtime.onMessage.addListener(async (msg, sender, sendResponse) => {
-    if (msg.type === 'START_DOWNLOAD') {
-      startDownload(msg.downloadId, msg.m3u8Url, msg.resumeFrom || 0, msg.concurrency || 4, msg.referer || '', msg.pageTitle || '');
-      sendResponse({ ok: true });
-      return;
-    }
-    if (msg.type === 'CANCEL_DOWNLOAD') {
-      const ac = abortControllers.get(msg.downloadId);
-      if (ac) {
-        // 记录取消来源：调度器（停滞/心跳/导航）与用户手动操作区分开，日志不再一律写"下载被用户取消"
-        const reason = msg.reason || 'manual_cancel';
-        cancelReasons.set(msg.downloadId, reason);
-        ac.abort();
-        log('info', `[${msg.downloadId}] 发送中止信号（来源: ${reason}）`);
-      }
-      sendResponse({ ok: true });
-      return;
-    }
-    if (msg.type === 'SCAN_VIDEOS') {
-      sendResponse({ urls: extractVideoSources(), pageUrl: location.href, pageTitle: document.title });
-      return;
-    }
-    // 心跳探测：background 恢复时确认 content script 是否存活
-    if (msg.type === 'PING') {
-      sendResponse({ ok: true });
-      return;
-    }
-    // Chrome 下载完成信号：revoke blob + 清理本任务分片（background 在下载 complete 后发送）
-    if (msg.type === 'FINALIZE_DOWNLOAD') {
-      if (msg.blobUrl) {
-        try { URL.revokeObjectURL(msg.blobUrl); } catch {}
-      }
-      cleanupOpfs(msg.downloadId);
-      log('success', `[${msg.downloadId}] Chrome 下载已确认完成，blob 已释放、分片已清理`);
-      sendResponse({ ok: true });
-      return;
-    }
-    // 清理孤儿分片：删除不属于任何活跃任务的分片（扩展启动时兜底清理）
-    if (msg.type === 'CLEANUP_OPFS') {
-      const active = new Set(msg.activeDownloadIds || []);
-      const root = await navigator.storage.getDirectory();
-      let removed = 0;
-      for await (const [name] of root) {
-        if (!name.startsWith(OPFS_PREFIX)) continue;
-        if (name.startsWith(OPFS_PREFIX + 'dl_')) {
-          const m = name.match(/^vgp_dl_(\d+)_/);
-          if (!m || !active.has(Number(m[1]))) {
-            try { await root.removeEntry(name); removed++; } catch {}
-          }
-        } else if (name.startsWith(OPFS_PREFIX + 'meta_')) {
-          const m = name.match(/^vgp_meta_(\d+)\.json$/);
-          if (!m || !active.has(Number(m[1]))) {
-            try { await root.removeEntry(name); removed++; } catch {}
-          }
-        }
-      }
-      // 只在实际删了东西时打日志，避免 SW 重启刷屏（每次都广播一次清理）
-      if (removed > 0) log('info', `[清理] 删除孤儿分片 ${removed} 个`);
-      sendResponse({ ok: true, removed });
-      return;
-    }
-  });
-
-  // ============ 初次扫描（500ms debounce） ============
-  const scan = () => {
-    const urls = extractVideoSources();
-    if (urls.length > 0) {
-      chrome.runtime.sendMessage({ type: 'REPORT_VIDEO', urls, pageTitle: document.title }).catch(() => {});
-    }
-  };
-  let scanTimer = null;
-  const debouncedScan = () => {
-    if (scanTimer) clearTimeout(scanTimer);
-    scanTimer = setTimeout(scan, 500);
-  };
-  if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', () => setTimeout(scan, 2000));
-  } else {
-    setTimeout(scan, 2000);
-  }
-  new MutationObserver(debouncedScan).observe(document.body || document.documentElement, {
-    childList: true, subtree: true,
-  });
-
-  // ============ 合并导出浮层按钮 ============
-  // OPFS 按 origin 隔离：分片存在"下载该视频的网站页面"的 OPFS 里，
-  // 扩展页面读不到 → 必须在视频网站页面里触发合并（本页 content script 可读本页 OPFS）。
-  // 点击后 showSaveFilePicker 选保存位置，流式逐批写盘：不占内存、不经过 Chrome 下载器。
-  // 显示与否由 vgp_settings.mergeButton 开关控制（默认开）。
-  function ensureMergeButton(show) {
-    const existing = document.getElementById('vgp-merge-btn');
-    if (show && !existing) {
-      const btn = document.createElement('button');
-      btn.id = 'vgp-merge-btn';
-      btn.textContent = '🗜️ 合并导出';
-      btn.title = 'StreamCap：把本网站缓存的下载分片直接合并保存到磁盘（不占内存）';
-      btn.style.cssText = 'position:fixed;right:16px;bottom:60px;z-index:2147483647;background:#3b82f6;color:#fff;border:0;border-radius:8px;padding:10px 14px;font:13px system-ui,sans-serif;cursor:pointer;box-shadow:0 2px 10px rgba(0,0,0,.45)';
-      btn.addEventListener('click', onMergeClick);
-      (document.body || document.documentElement).appendChild(btn);
-    } else if (!show && existing) {
-      existing.remove();
-    }
-  }
-
-  async function initMergeButton() {
-    const s = await chrome.storage.local.get('vgp_settings');
-    ensureMergeButton((s.vgp_settings || {}).mergeButton !== false);
-  }
-
-  // 开关变化 → 已打开的页面实时显示/隐藏按钮
-  chrome.storage.onChanged.addListener((changes, area) => {
-    if (area === 'local' && changes.vgp_settings && changes.vgp_settings.newValue) {
-      ensureMergeButton(changes.vgp_settings.newValue.mergeButton !== false);
-    }
-  });
-
-  function taskDisplayName(d) {
-    try {
-      const base = d.url.split('/').pop().split('?')[0];
-      if (base) return decodeURIComponent(base);
-    } catch {}
-    return '任务#' + d.id;
-  }
-
-  async function onMergeClick() {
-    const root = await navigator.storage.getDirectory();
-    const metaIds = new Set();
-    for await (const [name] of root) {
-      const m = name.match(/^vgp_meta_(\d+)\.json$/);
-      if (m) metaIds.add(Number(m[1]));
-    }
-    if (!metaIds.size) {
-      alert('本网站没有分片缓存。分片存在下载该视频的网站页面里（OPFS 按网站隔离），请到对应网站页面再试。');
-      return;
-    }
-    const list = await new Promise(res => chrome.runtime.sendMessage({ type: 'GET_DOWNLOADS' }, r => res(r || [])));
-    const tasks = (list || []).filter(d => metaIds.has(d.id));
-    if (!tasks.length) {
-      alert('找到分片但匹配不到任务（任务可能已被删除，分片将随清理回收）。');
-      return;
-    }
-    let target = tasks[0];
-    if (tasks.length > 1) {
-      const pick = prompt('选择要合并的任务：\n' + tasks.map((d, i) => `${i + 1}. ${taskDisplayName(d)}`).join('\n'));
-      const idx = parseInt(pick, 10) - 1;
-      if (isNaN(idx) || !tasks[idx]) return;
-      target = tasks[idx];
-    }
-    await mergeFromOpfs(target);
-  }
-
-  async function mergeFromOpfs(d) {
-    // 0. 任务若还在下载，下载循环会持续改写分片文件 → 合并必冲突，先提示
-    const fresh = await new Promise(res => chrome.runtime.sendMessage({ type: 'GET_DOWNLOADS' }, r => res(r || [])));
-    const cur = (fresh || []).find(x => x.id === d.id);
-    if (cur && ['downloading', 'queued', 'retrying'].includes(cur.status)) {
-      if (!confirm(`任务「${taskDisplayName(d)}」正在下载中（${cur.status}），下载会持续改写分片文件，合并可能失败。\n\n建议：先到下载管理暂停该任务再回来合并。\n\n仍然继续合并吗？`)) return;
-    }
-
-    const root = await navigator.storage.getDirectory();
-    let meta;
-    try {
-      meta = JSON.parse(await (await (await root.getFileHandle(OPFS_PREFIX + `meta_${d.id}.json`)).getFile()).text());
-    } catch {
-      alert('读取分片元数据失败，分片可能已被清理。');
-      return;
-    }
-    const totalBatches = Math.ceil(meta.totalSegments / (meta.batchSize || 40));
-
-    let handle;
-    try {
-      handle = await showSaveFilePicker({
-        suggestedName: taskDisplayName(d).replace(/\.m3u8$/i, '.mp4'),
-        types: [{ description: '视频文件', accept: { 'video/mp4': ['.mp4'], 'video/x-matroska': ['.mkv'] } }],
-      });
-    } catch (e) {
-      if (e.name === 'AbortError') return;
-      alert('选择保存位置失败: ' + e.message);
-      return;
-    }
-
-    // 读批次文件，带重试：InvalidStateError（句柄快照失效/文件被并发改写）多为瞬时
-    async function readBatch(i) {
-      let lastErr;
-      for (let attempt = 0; attempt < 3; attempt++) {
-        try {
-          const f = await (await root.getFileHandle(OPFS_PREFIX + `dl_${d.id}_batch_${i}.blob`)).getFile();
-          return await f.arrayBuffer();
-        } catch (e) {
-          lastErr = e;
-          await new Promise(r => setTimeout(r, 300 * (attempt + 1)));
-        }
-      }
-      throw lastErr;
-    }
-
-    // 扫描批次，确认完整 + 总大小
-    const sizes = new Array(totalBatches);
-    let totalBytes = 0;
-    for (let i = 0; i < totalBatches; i++) {
-      try {
-        sizes[i] = (await readBatch(i)).byteLength;
-        totalBytes += sizes[i];
-      } catch { sizes[i] = -1; }
-    }
-    const missing = sizes.map((s, i) => s < 0 ? i : -1).filter(i => i >= 0);
-    if (missing.length) {
-      alert(`缺少 ${missing.length} 个批次（如 ${missing[0] + 1} 等）。先到下载管理对该任务点"继续/重试"补齐分片后再合并。`);
-      return;
-    }
-
-    const writable = await handle.createWritable();
-    let wrote = 0;
-    let currentBatch = 0;
-    const t0 = Date.now();
-    const fmt = b => (b / 1024 / 1024 / 1024).toFixed(1) + 'GB';
-    try {
-      for (let i = 0; i < totalBatches; i++) {
-        currentBatch = i;
-        const buf = await readBatch(i);
-        await writable.write(buf);
-        wrote += buf.byteLength;
-        if (i % 10 === 0 || i === totalBatches - 1) {
-          const secs = Math.max(1, (Date.now() - t0) / 1000);
-          log('info', `[合并] ${taskDisplayName(d)} ${fmt(wrote)}/${fmt(totalBytes)} 批次 ${i + 1}/${totalBatches} (${(wrote / 1024 / 1024 / secs).toFixed(0)}MB/s)`);
-        }
-      }
-      await writable.close();
-      const secs = ((Date.now() - t0) / 1000).toFixed(0);
-      log('success', `[合并] ${taskDisplayName(d)} 合并完成 ${fmt(wrote)}，用时 ${secs} 秒`);
-      alert(`✅ 合并完成：${fmt(wrote)}，用时 ${secs} 秒。分片保留在缓存中，确认文件无误后可到下载管理删除该任务以清理。`);
-    } catch (e) {
-      log('error', `[合并] ${taskDisplayName(d)} 失败（批次 ${currentBatch + 1}/${totalBatches}）: ${e.message}`);
-      // 数据已基本写完但落盘确认失败：临时文件(.crswap)里可能就是完整成品
-      if (totalBytes > 0 && wrote / totalBytes > 0.999) {
-        alert(`⚠️ 合并数据已基本写满（${fmt(wrote)}/${fmt(totalBytes)}）但最后落盘确认失败：${e.message}\n\n目标文件夹里通常有一个 <文件名>.crswap 临时文件——检查它的大小，若接近 ${fmt(totalBytes)} 就直接改后缀为 .mp4 即可播放，无需重新合并。`);
-      } else {
-        alert(`合并失败（批次 ${currentBatch + 1}/${totalBatches}）: ${e.message}\n\n分片未动，可重新选择位置再来。若任务正在下载，请先暂停它再合并。`);
-      }
-      try { await writable.abort(); } catch {}
-    }
-  }
-
-  // 页面就绪后注入按钮（受开关控制）
-  const tryInject = () => {
-    if (document.body) { initMergeButton(); return; }
-    setTimeout(tryInject, 500);
-  };
-  tryInject();
-})();
+  VGP.startDownload = startDownload;
+  VGP.getAbortController = getAbortController;
+  VGP.cancelReasons = cancelReasons;
+  VGP.reportProgress = reportProgress;
+})(window.VGP);
