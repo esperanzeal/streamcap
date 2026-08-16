@@ -160,25 +160,36 @@ const VIDEO_CT = ['video/', 'application/vnd.apple.mpegurl', 'application/x-mpeg
 chrome.webRequest.onHeadersReceived.addListener(
   (details) => {
     const headers = details.responseHeaders;
-    // preflight OPTIONS：Range 头不在 CORS safelist，带 Range 的 fetch 会先发 OPTIONS 预检。
-    // 必须给预检响应注入 Allow-Origin/Methods/Headers，否则预检失败 → fetch 报 Failed to fetch。
+    // 页面 origin（请求发起者）：credentials: include 时 ACAO 必须是具体 origin 而非 *，
+    // 且必须有 Allow-Credentials: true，否则浏览器拒绝响应。
+    let origin = '';
+    try {
+      if (details.initiator) origin = new URL(details.initiator).origin;
+    } catch {}
+    const allowOrigin = origin || '*';
+    const corsHeaders = [
+      { name: 'Access-Control-Allow-Origin', value: allowOrigin },
+      { name: 'Access-Control-Allow-Credentials', value: 'true' },
+    ];
+    // preflight OPTIONS：Range 头不在 CORS safelist，带 Range 的 fetch 先发 OPTIONS 预检
     if (details.method === 'OPTIONS') {
-      if (headers.some(h => h.name.toLowerCase() === 'access-control-allow-origin')) return;
-      headers.push({ name: 'Access-Control-Allow-Origin', value: '*' });
-      headers.push({ name: 'Access-Control-Allow-Methods', value: 'GET, HEAD, OPTIONS' });
-      headers.push({ name: 'Access-Control-Allow-Headers', value: 'Range, Referer, Content-Type' });
-      log('debug', `[CORS注入] OPTIONS ${details.url.substring(0, 70)} → 注入预检头（${details.statusCode}）`);
-      return { responseHeaders: headers };
+      // 强制覆盖：去掉服务器可能返回的 ACAO（可能无 Allow-Credentials）
+      const filtered = headers.filter(h => h.name.toLowerCase() !== 'access-control-allow-origin' && h.name.toLowerCase() !== 'access-control-allow-credentials');
+      filtered.push(...corsHeaders);
+      filtered.push({ name: 'Access-Control-Allow-Methods', value: 'GET, HEAD, OPTIONS' });
+      filtered.push({ name: 'Access-Control-Allow-Headers', value: 'Range, Referer, Content-Type' });
+      log('debug', `[CORS注入] OPTIONS ${details.url.substring(0, 60)} → ${allowOrigin}（${details.statusCode}）`);
+      return { responseHeaders: filtered };
     }
-    // 视频响应：注入 CORS 头（DNR 扩展名规则的 Content-Type 兜底）
+    // 视频响应：强制覆盖 ACAO（服务器自带的可能无 Allow-Credentials）
     const ct = headers.find(h => h.name.toLowerCase() === 'content-type');
     const v = (ct?.value || '').toLowerCase();
     const isVideo = VIDEO_CT.some(p => v.includes(p)) || detectFormat(details.url) !== 'unknown';
     if (!isVideo) return;
-    if (headers.some(h => h.name.toLowerCase() === 'access-control-allow-origin')) return;
-    headers.push({ name: 'Access-Control-Allow-Origin', value: '*' });
-    log('debug', `[CORS注入] ${details.url.substring(0, 70)} → 视频响应注入 ACAO（${details.statusCode}, CT=${v || '?'}）`);
-    return { responseHeaders: headers };
+    const filtered = headers.filter(h => h.name.toLowerCase() !== 'access-control-allow-origin' && h.name.toLowerCase() !== 'access-control-allow-credentials');
+    filtered.push(...corsHeaders);
+    log('debug', `[CORS注入] ${details.url.substring(0, 60)} → ${allowOrigin}（${details.statusCode}, CT=${v || '?'}）`);
+    return { responseHeaders: filtered };
   },
   { urls: ['<all_urls>'] },
   ['blocking', 'responseHeaders']

@@ -10,13 +10,6 @@
     "service_worker": "src/background/main.js",
     "type": "module"
   },
-  "declarative_net_request": {
-    "rule_resources": [{
-      "id": "cors_fix",
-      "enabled": true,
-      "path": "cors_rules.json"
-    }]
-  },
   "action": {
     "default_popup": "popup/popup.html",
     "default_title": "StreamCap",

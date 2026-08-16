@@ -10,13 +10,15 @@ window.VGP = window.VGP || {};
       const sig = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
       try {
         // referrer: 完整页面 URL + unsafe-url 策略——部分 CDN（如 部分 CDN）校验
-        // 完整 Referer 而非 origin，content fetch 默认 strict-origin-when-cross-origin
-        // 只带 origin 会导致 m3u8/分片 403。
+        // 完整 Referer 而非 origin；credentials: 'include' 带跨域 CDN cookie
+        // （video 元素播放自动带 cookie，fetch 默认不带 → 403；webRequest 已注入
+        // 具体 origin 的 ACAO + Allow-Credentials 配合）
         const resp = await fetch(url, {
           signal: sig,
           headers: extraHeaders,
           referrer: location.href,
           referrerPolicy: 'unsafe-url',
+          credentials: 'include',
         });
         if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
         return resp;
