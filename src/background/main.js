@@ -13,7 +13,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   // 嗅探查询
   if (msg.type === 'GET_M3U8S') {
     chrome.tabs.query({ active: true, currentWindow: true }, tabs => {
-      sendResponse(state.sniffStore[tabs[0]?.id] || { m3u8s: [], pageUrl: '' });
+      sendResponse(state.sniffStore[tabs[0]?.id] || { videos: [], pageUrl: '' });
     });
     return true;
   }
@@ -21,7 +21,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   // 清空嗅探
   if (msg.type === 'CLEAR_SNIFF') {
     chrome.tabs.query({ active: true, currentWindow: true }, tabs => {
-      if (state.sniffStore[tabs[0]?.id]) state.sniffStore[tabs[0]?.id].m3u8s = [];
+      if (state.sniffStore[tabs[0]?.id]) state.sniffStore[tabs[0]?.id].videos = [];
       sendResponse({ ok: true });
     });
     return true;
@@ -237,7 +237,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     if (!tabId) { sendResponse({ ok: false }); return; }
     chrome.tabs.sendMessage(tabId, { type: 'SCAN_VIDEOS' }, (resp) => {
       if (!chrome.runtime.lastError && resp?.urls) {
-        if (!state.sniffStore[tabId]) state.sniffStore[tabId] = { m3u8s: [], pageUrl: '', pageTitle: '' };
+        if (!state.sniffStore[tabId]) state.sniffStore[tabId] = { videos: [], pageUrl: '', pageTitle: '' };
         if (!state.sniffStore[tabId].pageUrl && resp.pageUrl) state.sniffStore[tabId].pageUrl = resp.pageUrl;
         storeVideos(tabId, resp.urls, resp.pageTitle || '');
       }

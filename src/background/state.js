@@ -5,7 +5,7 @@ export const state = {
   downloads: {},      // id → record
   tabQueues: {},      // tabId → [downloadId, ...]
   tabActive: {},      // tabId → downloadId | null
-  sniffStore: {},     // tabId → { m3u8s: [], pageUrl: '', pageTitle: '' }
+  sniffStore: {},     // tabId → { videos: [], pageUrl: '', pageTitle: '' }
   managerPorts: [],   // manager 页长连接端口
 };
 

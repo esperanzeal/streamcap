@@ -2,6 +2,7 @@
 import { state, persist, broadcast, taskLabel } from './state.js';
 import { maybeDispatch } from './scheduler.js';
 import { log } from './log.js';
+import { detectFormat, FORMAT_LABEL } from './formats.js';
 
 export function guessResolution(url) {
   // 格式1：/1080p/、_1080p、-1080P、1080p.m3u8 等常见变体
@@ -15,20 +16,23 @@ export function guessResolution(url) {
   return '?';
 }
 
-export function isM3u8(url) {
-  return /\.m3u8(\?|$)/i.test(url.split('#')[0]);
-}
-
-// 把扫描/上报的 URL 去重写入 sniffStore（只收 m3u8）
+// 把扫描/上报的 URL 去重写入 sniffStore（收 hls/dash/mp4/flv，条目带 format）
 export function storeVideos(tabId, urls, pageTitle) {
-  if (!state.sniffStore[tabId]) state.sniffStore[tabId] = { m3u8s: [], pageUrl: '', pageTitle: '' };
+  if (!state.sniffStore[tabId]) state.sniffStore[tabId] = { videos: [], pageUrl: '', pageTitle: '' };
   if (pageTitle) state.sniffStore[tabId].pageTitle = pageTitle;
   for (const url of urls) {
-    if (!isM3u8(url)) continue; // 跳过非 m3u8 直链（MP4 等）
-    if (!state.sniffStore[tabId].m3u8s.some(e => e.url === url)) {
-      state.sniffStore[tabId].m3u8s.unshift({ url, referer: state.sniffStore[tabId].pageUrl, resolution: guessResolution(url), timestamp: Date.now() });
+    const fmt = detectFormat(url);
+    if (fmt === 'unknown') continue; // 跳过无法识别的资源
+    if (!state.sniffStore[tabId].videos.some(e => e.url === url)) {
+      state.sniffStore[tabId].videos.unshift({
+        url, format: fmt,
+        referer: state.sniffStore[tabId].pageUrl,
+        resolution: guessResolution(url),
+        timestamp: Date.now(),
+      });
     }
   }
+  if (state.sniffStore[tabId].videos.length > 30) state.sniffStore[tabId].videos = state.sniffStore[tabId].videos.slice(0, 30);
 }
 
 // ============ 右键菜单 ============
@@ -45,7 +49,7 @@ chrome.contextMenus.onClicked.addListener((info, tab) => {
     chrome.tabs.sendMessage(tab.id, { type: 'SCAN_VIDEOS' }, (resp) => {
       if (chrome.runtime.lastError || !resp?.urls) return;
       // 扫描结果写入 sniffStore（之前被丢弃 → 右键嗅探/popup 刷新无效）
-      if (!state.sniffStore[tab.id]) state.sniffStore[tab.id] = { m3u8s: [], pageUrl: '', pageTitle: '' };
+      if (!state.sniffStore[tab.id]) state.sniffStore[tab.id] = { videos: [], pageUrl: '', pageTitle: '' };
       state.sniffStore[tab.id].pageUrl = state.sniffStore[tab.id].pageUrl || tab.url || '';
       storeVideos(tab.id, resp.urls, resp.pageTitle || '');
     });
@@ -57,7 +61,7 @@ export function openManager() {
   chrome.tabs.create({ url: chrome.runtime.getURL('manager/manager.html') });
 }
 
-// ============ webRequest 嗅探 ============
+// ============ webRequest 嗅探（URL 后缀） ============
 chrome.webRequest.onBeforeSendHeaders.addListener(
   (details) => {
     const { url, tabId, requestHeaders } = details;
@@ -68,55 +72,54 @@ chrome.webRequest.onBeforeSendHeaders.addListener(
       if (h.name.toLowerCase() === 'referer') { referer = h.value; break; }
     }
 
-    if (!state.sniffStore[tabId]) state.sniffStore[tabId] = { m3u8s: [], pageUrl: '' };
+    if (!state.sniffStore[tabId]) state.sniffStore[tabId] = { videos: [], pageUrl: '' };
 
-    // 只存 m3u8，去重
-    if (isM3u8(url) && !state.sniffStore[tabId].m3u8s.some(e => e.url === url)) {
-      state.sniffStore[tabId].m3u8s.unshift({
-        url, referer,
+    // 按后缀识别 hls/dash/mp4/flv，去重（mp4 可能误报多，但加入下载前可筛选）
+    const fmt = detectFormat(url);
+    if (fmt !== 'unknown' && !state.sniffStore[tabId].videos.some(e => e.url === url)) {
+      state.sniffStore[tabId].videos.unshift({
+        url, referer, format: fmt,
         resolution: guessResolution(url),
         timestamp: Date.now(),
       });
-      if (state.sniffStore[tabId].m3u8s.length > 30) state.sniffStore[tabId].m3u8s.pop();
+      if (state.sniffStore[tabId].videos.length > 30) state.sniffStore[tabId].videos.pop();
     }
     if (!state.sniffStore[tabId].pageUrl && referer) {
       state.sniffStore[tabId].pageUrl = referer;
     }
   },
-  { urls: ['*://*/*.m3u8*', '*://*/*.m3u8?*'] },
+  { urls: ['*://*/*.m3u8*', '*://*/*.mpd*', '*://*/*.mp4*', '*://*/*.flv*'] },
   ['requestHeaders']
 );
 
-// 兜底：按 Content-Type 嗅探无扩展名的 m3u8 URL
+// 兜底：按 Content-Type 嗅探无扩展名/动态 URL 的视频流
 chrome.webRequest.onHeadersReceived.addListener(
   (details) => {
     const { url, tabId } = details;
-    if (tabId < 0 || isM3u8(url)) return; // 已被上面的 listener 处理
+    if (tabId < 0) return;
 
     const ct = (details.responseHeaders || []).find(
       h => h.name.toLowerCase() === 'content-type'
     );
-    if (!ct || !ct.value) return;
+    const fmt = detectFormat(url, ct?.value || '');
+    if (fmt === 'unknown') return; // 后缀 + Content-Type 都识别不出
 
-    const isHls =
-      ct.value.includes('application/vnd.apple.mpegurl') ||
-      ct.value.includes('application/x-mpegurl') ||
-      ct.value.includes('audio/mpegurl');
+    // 有明确后缀的已由上面的 listener 处理（m3u8/mpd/mp4/flv），这里只补无后缀但 Content-Type 明确的
+    if (detectFormat(url) !== 'unknown') return;
 
-    if (!isHls) return;
+    if (!state.sniffStore[tabId]) state.sniffStore[tabId] = { videos: [], pageUrl: '' };
+    if (state.sniffStore[tabId].videos.some(e => e.url === url)) return;
 
-    if (!state.sniffStore[tabId]) state.sniffStore[tabId] = { m3u8s: [], pageUrl: '' };
-    if (state.sniffStore[tabId].m3u8s.some(e => e.url === url)) return;
-
-    state.sniffStore[tabId].m3u8s.unshift({
+    state.sniffStore[tabId].videos.unshift({
       url,
       referer: state.sniffStore[tabId].pageUrl || '',
+      format: fmt,
       resolution: guessResolution(url),
       timestamp: Date.now(),
     });
-    if (state.sniffStore[tabId].m3u8s.length > 30) state.sniffStore[tabId].m3u8s.pop();
+    if (state.sniffStore[tabId].videos.length > 30) state.sniffStore[tabId].videos.pop();
   },
-  { urls: ['<all_urls>'], types: ['xmlhttprequest'] },
+  { urls: ['<all_urls>'], types: ['xmlhttprequest', 'media'] },
   ['responseHeaders']
 );
 

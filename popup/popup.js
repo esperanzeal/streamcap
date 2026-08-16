@@ -58,24 +58,27 @@ function renderList(data) {
   }
 
   const filtered = resFilter === 'all'
-    ? data.m3u8s
-    : data.m3u8s.filter(e => resolutionGroup(e.resolution) === resFilter);
+    ? data.videos
+    : data.videos.filter(e => resolutionGroup(e.resolution) === resFilter);
 
   const filterBar = $('#filterBar');
-  if (data.m3u8s && data.m3u8s.length > 0) {
+  if (data.videos && data.videos.length > 0) {
     filterBar.classList.remove('hidden');
   } else {
     filterBar.classList.add('hidden');
   }
 
-  if (!data.m3u8s || data.m3u8s.length === 0 || filtered.length === 0) {
+  if (!data.videos || data.videos.length === 0 || filtered.length === 0) {
     list.innerHTML = '<div class="empty">浏览视频页面后自动嗅探<br><span class="hint">无需手动刷新</span></div>';
     return;
   }
+  // 格式标签（阶段2：HLS/DASH/MP4/FLV）
+  const fmtLabel = { hls: 'HLS', dash: 'DASH', mp4: 'MP4', flv: 'FLV' };
   list.innerHTML = filtered.map(e => `
     <div class="card">
       <div class="meta">
         <span class="res">${e.resolution}</span>
+        <span class="fmt-tag ${e.format}">${fmtLabel[e.format] || '?'}</span>
         <span style="font-size:10px;color:#666">${new Date(e.timestamp).toLocaleTimeString()}</span>
       </div>
       <div class="url-preview" title="${esc(e.url)}">${esc(e.url)}</div>
@@ -135,7 +138,7 @@ function esc(s) { return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>
 chrome.tabs.query({ active: true, currentWindow: true }, tabs => {
   currentPageUrl = tabs[0]?.url || '';
   chrome.runtime.sendMessage({ type: 'GET_M3U8S' }, data => {
-    renderList(data || { m3u8s: [], pageUrl: '' });
+    renderList(data || { videos: [], pageUrl: '' });
   });
 });
 
@@ -154,7 +157,7 @@ $('#btnRefresh').addEventListener('click', () => {
   });
 });
 $('#btnClear').addEventListener('click', () => {
-  chrome.runtime.sendMessage({ type: 'CLEAR_SNIFF' }, () => renderList({ m3u8s: [], pageUrl: '' }));
+  chrome.runtime.sendMessage({ type: 'CLEAR_SNIFF' }, () => renderList({ videos: [], pageUrl: '' }));
 });
 $('#btnMgr').addEventListener('click', () => {
   chrome.runtime.sendMessage({ type: 'OPEN_MANAGER' });
