@@ -9,7 +9,15 @@ window.VGP = window.VGP || {};
       const timeoutSignal = AbortSignal.timeout(20000); // 20s 无响应 → 超时按失败重试
       const sig = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
       try {
-        const resp = await fetch(url, { signal: sig, headers: extraHeaders });
+        // referrer: 完整页面 URL + unsafe-url 策略——部分 CDN（如 部分 CDN）校验
+        // 完整 Referer 而非 origin，content fetch 默认 strict-origin-when-cross-origin
+        // 只带 origin 会导致 m3u8/分片 403。
+        const resp = await fetch(url, {
+          signal: sig,
+          headers: extraHeaders,
+          referrer: location.href,
+          referrerPolicy: 'unsafe-url',
+        });
         if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
         return resp;
       } catch (err) {

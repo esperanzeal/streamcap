@@ -457,7 +457,7 @@ window.VGP = window.VGP || {};
       let size = 0;
       let probeInfo = '';
       try {
-        const r = await fetch(url, { headers: { Range: 'bytes=0-0' } });
+        const r = await fetch(url, { headers: { Range: 'bytes=0-0' }, referrer: location.href, referrerPolicy: 'unsafe-url' });
         probeInfo = `HTTP ${r.status}`;
         if (r.status === 206) {
           const cr = r.headers.get('content-range');
@@ -604,7 +604,7 @@ window.VGP = window.VGP || {};
     let received = 0;
     let lastReport = 0;
     try {
-      const resp = await fetch(url, { signal });
+      const resp = await fetch(url, { signal, referrer: location.href, referrerPolicy: 'unsafe-url' });
       if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
       const root = await navigator.storage.getDirectory();
       const fh = await root.getFileHandle(VGP.OPFS_PREFIX + `dl_${downloadId}_block_0.bin`, { create: true });
