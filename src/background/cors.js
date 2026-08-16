@@ -5,12 +5,20 @@
 // 规则注入响应 CORS 头（含 preflight OPTIONS），下载完成由任务清理。
 import { log } from './log.js';
 
-let corsRuleId = 30000; // 与静态规则(1-5)、其他动态规则不冲突
+// 固定规则 id：按 URL 哈希生成（同一 URL 稳定复用同一 id），先删后加实现幂等——
+// DNR session 规则在 SW 重启后保留，若用递增计数器会因 SW 重启重置而 id 冲突。
+function urlHash(url) {
+  let h = 0;
+  for (let i = 0; i < url.length; i++) h = (h * 31 + url.charCodeAt(i)) >>> 0;
+  return h;
+}
 
 export async function addCorsRule(url) {
   try {
     const u = new URL(url);
-    const id = ++corsRuleId;
+    const id = 30000 + (urlHash(u.host + u.pathname) % 20000); // 30000~49999
+    // 幂等：先删同名旧规则（SW 重启残留）再加
+    await chrome.declarativeNetRequest.updateSessionRules({ removeRuleIds: [id] });
     await chrome.declarativeNetRequest.updateSessionRules({
       addRules: [{
         id,
