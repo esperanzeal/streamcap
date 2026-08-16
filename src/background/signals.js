@@ -10,6 +10,9 @@ import { maybeDispatch } from './scheduler.js';
 import { log } from './log.js';
 
 export let loaded = false;
+// ES module 的 import binding 是只读的，main.js 不能直接 `loaded = true`（会抛 TypeError），
+// 必须通过 setter 修改。main.js 恢复逻辑加载完 downloads 后调用。
+export function markLoaded() { loaded = true; }
 export const pendingDownloadSignals = [];
 
 export function handleDownloadSignal(delta) {

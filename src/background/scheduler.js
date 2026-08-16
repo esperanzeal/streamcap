@@ -95,12 +95,30 @@ export async function prioritizeDownload(downloadId) {
   const unlimited = max === 0;
   const activeCount = Object.keys(state.tabActive).filter(t => state.tabActive[t]).length;
   if (!unlimited && activeCount >= max) {
-    // 并发已满：暂停权重最低的 downloading 任务（done 最少）腾槽
+    // 并发已满：替换"权重最低"（done 最少）的 downloading 任务。
+    // 被替换任务不暂停——直接标 queued 放回本 tab 队列队首，进度保留（OPFS 断点续传），
+    // 等并发槽空出即自动续传（区别于手动暂停需要用户点"继续"）。
     const downloading = Object.values(state.downloads).filter(x => x.status === 'downloading');
     if (downloading.length > 0) {
       downloading.sort((a, b) => (a.done || 0) - (b.done || 0));
-      pauseDownload(downloading[0].id);
-      log('warn', `[优先] ${taskLabel(downloadId)} 优先下载，暂停权重最低的 ${taskLabel(downloading[0].id)}（进度 ${downloading[0].done || 0} 片）腾出并发槽`);
+      const victim = downloading[0];
+      victim.status = 'queued';
+      victim.error = null;
+      victim.stalledAt = null;
+      state.tabActive[victim.tabId] = null; // 释放并发槽
+      // 通知 content 停止旧下载循环（分片保留可续传）；旧循环退出后 runningDownloads 释放，
+      // 下次调度到它时能正常启动新循环（防重入兜底，避免新 START 撞旧循环）
+      chrome.tabs.sendMessage(victim.tabId, { type: 'CANCEL_DOWNLOAD', downloadId: victim.id, reason: 'manual_pause' }).catch(() => {});
+      // 放回本 tab 队列队首（数组顺序在前；排序仍按 FIFO，但 createdAt 通常较早）
+      const vq = state.tabQueues[victim.tabId];
+      if (vq) {
+        const vi = vq.indexOf(victim.id);
+        if (vi >= 0) vq.splice(vi, 1);
+        vq.unshift(victim.id);
+      }
+      persist();
+      broadcast({ type: 'DOWNLOAD_UPDATE', download: victim });
+      log('warn', `[优先] ${taskLabel(downloadId)} 优先下载，替换权重最低的 ${taskLabel(victim.id)}（进度 ${victim.done || 0} 片），已放回队列队首`);
     }
   }
 

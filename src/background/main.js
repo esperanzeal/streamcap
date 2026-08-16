@@ -4,7 +4,7 @@ import { state, persist, broadcast, taskLabel } from './state.js';
 import { log, getLogs, clearLogs } from './log.js';
 import { enqueue, maybeDispatch, pauseAll, resumeAll, pauseDownload, cancelDownload, prioritizeDownload } from './scheduler.js';
 import { storeVideos, openManager } from './sniffing.js';
-import { handleDownloadSignal, loaded, pendingDownloadSignals } from './signals.js';
+import { handleDownloadSignal, markLoaded, pendingDownloadSignals } from './signals.js';
 import { ensureKeepaliveAlarm, pingDeadTask } from './stalled.js';
 
 // ============ 消息路由 ============
@@ -465,7 +465,7 @@ chrome.storage.local.get('vgp_downloads', data => {
     log('info', `[恢复] ${s.sw_marker ? 'SW 空闲重启' : '浏览器重启'}，重建队列 queued=${list.filter(d => d.status === 'queued').length}，活跃=${Object.keys(state.tabActive).length}`);
 
     // downloads 加载完成：重放 SW 休眠期间缓存的下载信号（防止 complete 信号丢失）
-    loaded = true;
+    markLoaded();
     for (const sig of pendingDownloadSignals.splice(0)) handleDownloadSignal(sig);
 
     maybeDispatch();
