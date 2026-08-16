@@ -186,11 +186,15 @@ export function maybeDispatch() {
         });
       }
     }
-    // 排序：优先任务（priorityAt）永远排最前（多个按优先时间），其余按 FIFO
+    // 排序：优先任务（priorityAt）永远排最前（多个按"最新点击优先"排最前），其余按 FIFO
+    // ★ 优先任务之间必须按 priorityAt 排序（降序=后点的排前），否则落到 sortKey(createdAt)
+    //    → 先创建/先点过优先的任务排前面，本次点的优先任务被顶掉（用户日志：点 519 优先
+    //    却派发更早点的 508）。
     candidates.sort((a, b) => {
       const ap = a.priorityAt ? 0 : 1;
       const bp = b.priorityAt ? 0 : 1;
       if (ap !== bp) return ap - bp;
+      if (a.priorityAt && b.priorityAt) return b.priorityAt - a.priorityAt; // 最新优先排最前
       return a.sortKey - b.sortKey;
     });
     log('debug', `[调度] 候选: ${candidates.map(c => `#${c.did}${c.priorityAt ? '(优先)' : ''}`).join(', ')}`);
