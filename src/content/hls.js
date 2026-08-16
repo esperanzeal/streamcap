@@ -26,9 +26,13 @@ window.VGP = window.VGP || {};
           // 超时（signal 未取消）：包装成普通错误按失败重试，不能被误判为用户取消
           err = new Error('下载超时（20s 无响应）');
         }
-        if (attempt === retries) throw err;
+        if (attempt === retries) {
+          // ★ 记录最终失败原因（之前只打"重试 X/Y"，看不出为何失败——403/CORS/超时）
+          VGP.log('error', `尝试 ${attempt}/${retries} 失败（放弃）: ${err.message}`);
+          throw err;
+        }
         const delay = Math.min(1000 * Math.pow(2, attempt - 1), 8000);
-        VGP.log('warn', `重试 ${attempt}/${retries}，等待 ${delay}ms`);
+        VGP.log('warn', `尝试 ${attempt}/${retries} 失败: ${err.message}，等待 ${delay}ms 重试`);
         await new Promise(r => setTimeout(r, delay));
       }
     }
