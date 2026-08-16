@@ -104,7 +104,7 @@ function renderList(data) {
         referer: btn.dataset.ref,
         resolution: btn.dataset.res,
         pageUrl: currentPageUrl,
-        pageTitle: pageFileName(),
+        pageTitle: data.pageTitle || pageFileName(), // ★ 优先嗅探到的页面标题，否则 URL 末段（review P2-5）
       }, resp => {
         if (resp?.ok) {
           btn.textContent = '✅ 已加入';
@@ -118,7 +118,7 @@ function renderList(data) {
               referer: btn.dataset.ref,
               resolution: btn.dataset.res,
               pageUrl: currentPageUrl,
-              pageTitle: pageFileName(),
+              pageTitle: data.pageTitle || pageFileName(),
               force: true,
             }, r2 => {
               if (r2?.ok) {

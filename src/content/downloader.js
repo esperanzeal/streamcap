@@ -717,7 +717,9 @@ window.VGP = window.VGP || {};
         case 'navigation': errText = '已暂停(页面刷新)'; break;
       }
       log('info', `[${taskLabel}] ${errText}${abortNote || '，分片已保留可续传'}`);
-      chrome.runtime.sendMessage({ type: 'DOWNLOAD_ERROR', downloadId, error: errText, done, total });
+      // ★ reason 结构化枚举：background 状态机判断只用 reason（不再解析中文文案），
+      //   error 文案只给人看，切断"文案=协议"耦合（review P0-1）
+      chrome.runtime.sendMessage({ type: 'DOWNLOAD_ERROR', downloadId, error: errText, reason: cancelReason, done, total });
     } else {
       log('error', `[${taskLabel}] 下载失败: ${err.message}`);
       chrome.runtime.sendMessage({

@@ -14,8 +14,3 @@ export function detectFormat(url = '', contentType = '') {
 
 // 格式显示标签
 export const FORMAT_LABEL = { hls: 'HLS', dash: 'DASH', mp4: 'MP4', flv: 'FLV', unknown: '?' };
-
-// 该格式是否可入队下载（阶段3 之前 hls 可下载；mp4/dash/flv 先嗅探展示，下载阶段3 接入）
-export function isDownloadableFormat(fmt) {
-  return fmt === 'hls' || fmt === 'mp4'; // mp4 直链阶段3 直接支持；dash/flv 阶段3 后续
-}

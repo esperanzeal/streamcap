@@ -306,3 +306,47 @@ export function cancelDownload(downloadId) {
   persist();
   broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
 }
+
+// ============ 状态机公共操作（消除 main.js/stalled.js 复制粘贴，review P0-2） ============
+
+// 被优先替换任务回队首：转 queued + unshift（priority 保持原值，优先任务必排最前）
+export function requeueToFront(d) {
+  d.status = 'queued';
+  d.error = null;
+  if (!state.tabQueues[d.tabId]) state.tabQueues[d.tabId] = [];
+  const q = state.tabQueues[d.tabId];
+  const qi = q.indexOf(d.id);
+  if (qi >= 0) q.splice(qi, 1);
+  q.unshift(d.id);
+  state.tabActive[d.tabId] = null;
+  persist();
+  broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
+  maybeDispatch();
+}
+
+// 停滞重排：累计 consecutiveFails（≤3 重排队尾 priority=++prioritySeq，超过标 failed 放弃）
+// timeout=true 时文案标注"停止确认超时"（content 无响应兜底路径）
+export function requeueStalled(d, timeout) {
+  const fails = (d.consecutiveFails || 0) + 1;
+  d.consecutiveFails = fails;
+  if (fails <= 3) {
+    d.status = 'queued';
+    d.error = timeout ? `停止确认超时，自动重排队尾（${fails}/3）` : `无进度自动重排（${fails}/3）`;
+    d.priority = ++state.prioritySeq;
+    if (!state.tabQueues[d.tabId]) state.tabQueues[d.tabId] = [];
+    if (!state.tabQueues[d.tabId].includes(d.id)) state.tabQueues[d.tabId].push(d.id);
+    state.tabActive[d.tabId] = null;
+    persist();
+    broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
+    log('warn', `[停滞] ${taskLabel(d.id)} ${timeout ? '停止确认超时' : '停止已确认'}，自动重排队尾（${fails}/3，priority=${d.priority}）`);
+    maybeDispatch();
+  } else {
+    d.status = 'failed';
+    d.error = `连续 ${fails} 次无进度，自动放弃（分片保留，可手动重试）`;
+    state.tabActive[d.tabId] = null;
+    persist();
+    broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
+    log('warn', `[停滞] ${taskLabel(d.id)} 连续 ${fails} 次无进度，标为失败`);
+    maybeDispatch();
+  }
+}

@@ -2,7 +2,7 @@
 import { state, persist, broadcast, taskLabel } from './state.js';
 import { maybeDispatch } from './scheduler.js';
 import { log } from './log.js';
-import { detectFormat, FORMAT_LABEL } from './formats.js';
+import { detectFormat } from './formats.js';
 
 export function guessResolution(url) {
   // 格式1：/1080p/、_1080p、-1080P、1080p.m3u8 等常见变体
