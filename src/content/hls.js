@@ -9,16 +9,14 @@ window.VGP = window.VGP || {};
       const timeoutSignal = AbortSignal.timeout(20000); // 20s 无响应 → 超时按失败重试
       const sig = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
       try {
-        // referrer: 完整页面 URL + unsafe-url 策略——部分 CDN（如 部分 CDN）校验
-        // 完整 Referer 而非 origin；credentials: 'include' 带跨域 CDN cookie
-        // （video 元素播放自动带 cookie，fetch 默认不带 → 403；webRequest 已注入
-        // 具体 origin 的 ACAO + Allow-Credentials 配合）
+        // ★ fetch 用浏览器默认参数（v3.1.4 验证可下）：不传 referrer/credentials，
+        //   请求特征与页面播放器（hls.js/video 元素）一致。曾加 referrer: unsafe-url +
+        //   credentials: include（为 部分 CDN 类 CDN），但导致 某 Cloudflare 视频站 等 Cloudflare 站
+        //   拦截"带完整 Referer + 跨域 cookie"的请求（页面能播、3.1.4 能下、v4 403）。
+        //   跨域 CORS 由 webRequest 注入 ACAO 解决，无需请求侧特殊参数。
         const resp = await fetch(url, {
           signal: sig,
           headers: extraHeaders,
-          referrer: location.href,
-          referrerPolicy: 'unsafe-url',
-          credentials: 'include',
         });
         if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
         return resp;

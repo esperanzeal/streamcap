@@ -46,7 +46,7 @@ window.VGP = window.VGP || {};
     // 从 content-range 解析总大小（部分站点等 CDN 防盗链校验 Referer，background 发会 403）
     if (msg.type === 'FETCH_SIZE') {
       try {
-        const r = await fetch(msg.url, { headers: { Range: 'bytes=0-0' }, referrer: location.href, referrerPolicy: 'unsafe-url', credentials: 'include' });
+        const r = await fetch(msg.url, { headers: { Range: 'bytes=0-0' } });
         if (r.status === 206) {
           const cr = r.headers.get('content-range');
           const m = cr && cr.match(/\/(\d+)$/);
