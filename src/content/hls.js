@@ -2,25 +2,6 @@
 'use strict';
 window.VGP = window.VGP || {};
 (function (VGP) {
-  // ★ 动态 fetch 策略：两个站需求相反——
-  //   某 Cloudflare 视频站 等 Cloudflare 站拦"带完整 Referer + 跨域 cookie"的请求（默认参数=播放器特征=放行）；
-  //   部分站点等防盗链 CDN 需要 Referer/cookie（默认参数 403）。
-  //   先默认参数，403/401 时同轮内带完整 Referer + credentials: include 重试一次。
-  async function smartFetch(url, { signal, headers } = {}) {
-    let resp = await fetch(url, { signal, headers });
-    if (resp.status === 403 || resp.status === 401) {
-      VGP.log('warn', `HTTP ${resp.status} 疑似防盗链，带完整 Referer + cookie 重试: ${String(url).slice(0, 80)}`);
-      resp = await fetch(url, {
-        signal,
-        headers,
-        referrer: location.href,
-        referrerPolicy: 'unsafe-url',
-        credentials: 'include',
-      });
-    }
-    return resp;
-  }
-
   // 重试 fetch（含 20s 超时，防 TCP 挂起卡死批次）
   async function fetchWithRetry(url, retries = 3, signal = null, extraHeaders = {}) {
     for (let attempt = 1; attempt <= retries; attempt++) {
@@ -28,8 +9,15 @@ window.VGP = window.VGP || {};
       const timeoutSignal = AbortSignal.timeout(20000); // 20s 无响应 → 超时按失败重试
       const sig = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
       try {
-        // smartFetch：默认参数（某 Cloudflare 视频站 类 CF 站友好）→ 403/401 时增强参数重试（部分站点类防盗链）
-        const resp = await smartFetch(url, { signal: sig, headers: extraHeaders });
+        // ★ fetch 用浏览器默认参数（v3.1.4 验证可下）：不传 referrer/credentials，
+        //   请求特征与页面播放器（hls.js/video 元素）一致。曾加 referrer: unsafe-url +
+        //   credentials: include（为 部分 CDN 类 CDN），但导致 某 Cloudflare 视频站 等 Cloudflare 站
+        //   拦截"带完整 Referer + 跨域 cookie"的请求（页面能播、3.1.4 能下、v4 403）。
+        //   跨域 CORS 由 webRequest 注入 ACAO 解决，无需请求侧特殊参数。
+        const resp = await fetch(url, {
+          signal: sig,
+          headers: extraHeaders,
+        });
         if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
         return resp;
       } catch (err) {
@@ -179,8 +167,6 @@ window.VGP = window.VGP || {};
 
   VGP.fetchWithRetry = fetchWithRetry;
   VGP.resolveUrl = resolveUrl;
-  VGP.fetchWithRetry = fetchWithRetry;
-  VGP.smartFetch = smartFetch;
   VGP.parseM3u8 = parseM3u8;
   VGP.selectBestVariant = selectBestVariant;
   VGP.parseKeySegments = parseKeySegments;
