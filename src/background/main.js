@@ -1,7 +1,7 @@
 // main.js — StreamCap background 入口（MV3 ES module）
 // import 各模块时副作用即生效（webRequest/alarms/downloads 监听器注册）。
 import { state, persist, broadcast, taskLabel } from './state.js';
-import { log, getLogs, clearLogs } from './log.js';
+import { log, getLogs, clearLogs, clearAllLogs } from './log.js';
 import { enqueue, maybeDispatch, pauseAll, resumeAll, pauseDownload, cancelDownload, prioritizeDownload, requeueToFront, requeueStalled } from './scheduler.js';
 import { storeVideos, openManager, fillSizes } from './sniffing.js';
 import { handleDownloadSignal, markLoaded, pendingDownloadSignals } from './signals.js';
@@ -177,6 +177,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
   if (msg.type === 'CLEAR_LOGS') {
     clearLogs(msg.date, () => sendResponse({ ok: true }));
+    return true;
+  }
+  if (msg.type === 'CLEAR_ALL_LOGS') {
+    clearAllLogs(() => sendResponse({ ok: true }));
     return true;
   }
 

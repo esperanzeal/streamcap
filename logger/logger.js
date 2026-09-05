@@ -59,4 +59,13 @@ $('btnClear').addEventListener('click', () => {
   chrome.runtime.sendMessage({ type: 'CLEAR_LOGS', date: curDate }, () => load());
 });
 
+$('btnClearAll').addEventListener('click', () => {
+  if (!confirm('确定清空全部日志（所有日期）？此操作不可恢复。')) return;
+  chrome.runtime.sendMessage({ type: 'CLEAR_ALL_LOGS' }, () => {
+    load();
+    const c = $('count');
+    if (c) c.textContent = `${curDate} · 0 条`;
+  });
+});
+
 load();

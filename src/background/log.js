@@ -39,3 +39,12 @@ export function getLogs(dateStr, callback) {
 export function clearLogs(dateStr, callback) {
   chrome.storage.local.remove('vgp_logs_' + dateStr, () => callback && callback());
 }
+
+// 清空所有日志（枚举 storage.local 中全部 vgp_logs_* key）
+export function clearAllLogs(callback) {
+  chrome.storage.local.get(null, data => {
+    const keys = Object.keys(data).filter(k => k.startsWith('vgp_logs_'));
+    if (keys.length === 0) { callback && callback(); return; }
+    chrome.storage.local.remove(keys, () => callback && callback());
+  });
+}
