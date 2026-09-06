@@ -7,6 +7,101 @@ import { storeVideos, openManager, fillSizes } from './sniffing.js';
 import { handleDownloadSignal, markLoaded, pendingDownloadSignals } from './signals.js';
 import { ensureKeepaliveAlarm, pingDeadTask } from './stalled.js';
 
+// ============ 重试智能接管（跨标签页续传） ============
+// 原则：正常任务零打扰——原 tab 活着就原地续传，不做任何多余操作。
+// 失败任务重试时的宿主选择链（只为续传已下分片，绝不抢占正在执行的任务）：
+//   原 tab(PING 存活) → 同源空闲 tab → 同源任意 tab → 自动开同源 tab(前台, 等 content 就绪)。
+function pingTabLive(tabId) {
+  if (tabId === undefined || tabId === null) return Promise.resolve(false);
+  return new Promise(resolve => {
+    try {
+      chrome.tabs.sendMessage(tabId, { type: 'PING' }, resp => {
+        resolve(!chrome.runtime.lastError && resp && resp.ok === true);
+      });
+    } catch { resolve(false); }
+  });
+}
+function originOf(u) {
+  try { return new URL(u).origin; } catch { return ''; }
+}
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+async function retryExisting(msg, sendResponse) {
+  const d = state.downloads[msg.retryId];
+  if (!d) { sendResponse({ ok: false, error: '任务不存在' }); return; }
+  // 状态守卫：正在下载/重试/导出/停止确认中的任务不接受重试请求（防双击/断线重发把 downloading 打回 queued）
+  if (d.status === 'downloading' || d.status === 'retrying' || d.status === 'exporting' || d.status === 'stopping') {
+    sendResponse({ ok: false, error: `任务正在${d.status === 'exporting' ? '导出' : d.status === 'stopping' ? '停止确认' : '下载'}，无需重试` });
+    return;
+  }
+  if (d.status === 'completed') {
+    // 已完成任务重试 = 重新下载：分片已清理，进度归零
+    d.done = 0; d.pct = 0; d.total = 0; d.fileName = '';
+  }
+
+  // 1) 原 tab（manager 传来的 tabId）存活 → 原地续传（与旧行为一致，零变化零打扰）
+  const preferId = msg.tabId ?? d.tabId;
+  let hostTabId = ((preferId !== undefined && preferId !== null) && await pingTabLive(preferId)) ? preferId : null;
+
+  // 2) 原 tab 失效 → 找同源活 tab（同一网站 origin → 同 OPFS → 已下分片直接续传）
+  if (hostTabId === null) {
+    const pageOrigin = originOf(d.pageUrl || '');
+    if (pageOrigin) {
+      try {
+        const tabs = await chrome.tabs.query({});
+        const sameOrigin = tabs.filter(t => t.id !== undefined && t.url && originOf(t.url) === pageOrigin);
+        // 空闲 tab 优先（立即跑）；忙的也能接管（入队等待，不抢占正在执行的任务）
+        const idleTab = sameOrigin.find(t => !state.tabActive[t.id]);
+        const busyTab = sameOrigin.find(t => state.tabActive[t.id] && state.tabActive[t.id] !== d.id);
+        hostTabId = (idleTab || busyTab)?.id ?? null;
+      } catch { /* tabs.query 失败 */ }
+    }
+  }
+
+  // 3) 无同源 tab → 自动开一个同源 tab（前台避免后台节流），等 content 注入就绪
+  if (hostTabId === null) {
+    const pageUrl = d.pageUrl || d.referer || '';
+    if (pageUrl) {
+      try {
+        const tab = await chrome.tabs.create({ url: pageUrl, active: true });
+        for (let i = 0; i < 40; i++) { // 最多 20s：页面加载 + content script(document_end) 注入
+          await sleep(500);
+          if (await pingTabLive(tab.id)) { hostTabId = tab.id; break; }
+        }
+        // 超时未就绪：不迁移不派发（任务保持原状态），tab 留着用户可手动再点重试（此时已就绪，走同源接管）
+      } catch { /* 开 tab 失败 */ }
+    }
+  }
+
+  if (hostTabId === null) {
+    sendResponse({ ok: false, error: '原标签页不可用且找不到同源页面（也无法自动打开），请先打开原视频网站页面再点重试' });
+    return;
+  }
+
+  // 迁移到宿主 tab：从旧队列/槽摘除 → 绑新 tabId → 入队（queued，并发有空位才跑，不抢活跃任务）
+  migrateTaskToTab(d, hostTabId);
+  persist();
+  broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
+  maybeDispatch();
+  sendResponse({ ok: true, downloadId: d.id });
+  log('info', `[重试] ${taskLabel(d.id)} 由 tab${d.tabId} 接管续传（分片保留，跳过已下载批次）`);
+}
+
+function migrateTaskToTab(d, hostTabId) {
+  const oldQ = state.tabQueues[d.tabId];
+  if (oldQ) {
+    const i = oldQ.indexOf(d.id);
+    if (i >= 0) oldQ.splice(i, 1);
+  }
+  if (state.tabActive[d.tabId] === d.id) state.tabActive[d.tabId] = null;
+  d.tabId = hostTabId;
+  if (!state.tabQueues[hostTabId]) state.tabQueues[hostTabId] = [];
+  if (!state.tabQueues[hostTabId].includes(d.id)) state.tabQueues[hostTabId].push(d.id);
+  d.status = 'queued';
+  d.error = null;
+  d.consecutiveFails = 0; // 手动重试 = 新的尝试周期（保留 createdAt 保持 FIFO 原位置）
+}
+
 // ============ 消息路由 ============
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
@@ -33,29 +128,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   // 入队
   if (msg.type === 'ENQUEUE') {
     if (msg.retryId && state.downloads[msg.retryId]) {
-      // 重试：优先用 manager 传来的 tabId，fallback 到 active tab
-      const d = state.downloads[msg.retryId];
-      const tabId = msg.tabId || d.tabId;
-      // 状态守卫：正在下载/重试/导出/停止确认中的任务不接受重试请求（防双击/断线重发把 downloading 打回 queued）
-      if (d.status === 'downloading' || d.status === 'retrying' || d.status === 'exporting' || d.status === 'stopping') {
-        sendResponse({ ok: false, error: `任务正在${d.status === 'exporting' ? '导出' : d.status === 'stopping' ? '停止确认' : '下载'}，无需重试` });
-        return true;
-      }
-      if (d.status === 'completed') {
-        // 已完成任务重试 = 重新下载：分片已清理，进度归零
-        d.done = 0; d.pct = 0; d.total = 0; d.fileName = '';
-      }
-      d.status = 'queued';
-      d.error = null;
-      // 重试任务：重置连续失败计数与停滞标记（保留 createdAt 保持 FIFO 原位置）
-      d.consecutiveFails = 0;
-      // 手动重试 = 新的尝试周期，priority 保持原 FIFO 位置
-      if (!state.tabQueues[tabId]) state.tabQueues[tabId] = [];
-      if (!state.tabQueues[tabId].includes(msg.retryId)) state.tabQueues[tabId].push(msg.retryId);
-      persist();
-      broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
-      maybeDispatch();
-      sendResponse({ ok: true, downloadId: msg.retryId });
+      // 重试：智能接管宿主 tab（原 tab 存活零打扰；失效则同源接管或自动开 tab），
+      // 同 downloadId 入队 → OPFS 断点续传跳过已下载批次，进度不浪费
+      retryExisting(msg, sendResponse);
+      return true; // 异步响应
     } else {
       // 新下载：用当前 active tab
       chrome.tabs.query({ active: true, currentWindow: true }, tabs => {

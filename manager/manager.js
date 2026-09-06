@@ -128,7 +128,10 @@ function render() {
         if (d.status === 'completed') {
           if (!confirm(`该任务已完成，重新下载将清空进度从头开始（约 ${(d.total || 0)} 个分片），确定？`)) return;
         }
-        act({ type: 'ENQUEUE', tabId: d.tabId, url: d.url, referer: d.referer, resolution: d.resolution, pageUrl: d.pageUrl, pageTitle: d.pageTitle, retryId: d.id });
+        // 带响应：原标签页已失效时后台会自动找同源页面接管或新开标签页续传；彻底失败则提示
+        chrome.runtime.sendMessage({ type: 'ENQUEUE', tabId: d.tabId, url: d.url, referer: d.referer, resolution: d.resolution, pageUrl: d.pageUrl, pageTitle: d.pageTitle, retryId: d.id }, resp => {
+          if (resp && resp.ok === false) alert(resp.error || '重试失败，请稍后再试');
+        });
       }
     });
   });
