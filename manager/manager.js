@@ -153,7 +153,7 @@ $$('.tab-btn').forEach(b => {
 $('#btnClearDone').addEventListener('click', () => {
   const targets = Object.values(downloads).filter(d => d.status === 'completed');
   if (targets.length === 0) return;
-  if (!confirm(`确定清空 ${targets.length} 个已完成任务？\n\n分片缓存也将一并清理，无法恢复。`)) return;
+  if (!confirm(`确定清空 ${targets.length} 个已完成任务？\n\n分片缓存与对应的来源标签页将一并清理，无法恢复。`)) return;
   targets.forEach(d => act({ type: 'DELETE_DOWNLOAD', downloadId: d.id }));
 });
 // 线程数设置 + 并发任务数设置
@@ -166,8 +166,6 @@ chrome.storage.local.get('vgp_settings', s => {
   maxConcSelect.value = (settings.maxConcurrent === undefined || settings.maxConcurrent === null) ? 4 : settings.maxConcurrent;
   // 页面合并按钮开关：默认开（undefined 视为 true）
   $('#mergeBtnToggle').checked = settings.mergeButton !== false;
-  // 完成后自动关闭来源标签页：默认开（undefined 视为 true）
-  $('#autoCloseTabToggle').checked = settings.autoCloseTab !== false;
 });
 function saveSettings(patch) {
   chrome.storage.local.get('vgp_settings', s => {
@@ -186,10 +184,6 @@ maxConcSelect.addEventListener('change', () => {
 // 页面合并按钮开关：只写 settings，content script 监听 storage 变化实时显示/隐藏
 $('#mergeBtnToggle').addEventListener('change', () => {
   saveSettings({ mergeButton: $('#mergeBtnToggle').checked });
-});
-// 完成后自动关闭来源标签页开关：只写 settings，background 在任务完成时读取
-$('#autoCloseTabToggle').addEventListener('change', () => {
-  saveSettings({ autoCloseTab: $('#autoCloseTabToggle').checked });
 });
 
 // 打开日志页

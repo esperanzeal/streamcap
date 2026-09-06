@@ -102,6 +102,26 @@ function migrateTaskToTab(d, hostTabId) {
   d.consecutiveFails = 0; // 手动重试 = 新的尝试周期（保留 createdAt 保持 FIFO 原位置）
 }
 
+// ============ 删除已完成任务 → 关闭对应来源标签页 ============
+// 判据：tab 仍存在 + 该 tab 无存活任务。completed/failed/cancelled 不算存活
+//（failed 任务后续可走"重试智能接管"自动开/接管标签页续传，不依赖原 tab 活着）。
+const TAB_ALIVE_STATUS = new Set(['queued', 'paused', 'downloading', 'retrying', 'exporting', 'stopping']);
+async function closeTabIfIdle(tabId) {
+  if (tabId === undefined || tabId === null) return;
+  try {
+    await chrome.tabs.get(tabId); // tab 已不存在会 throw → 跳过
+    const q = state.tabQueues[tabId] || [];
+    const hasAlive = q.some(id => {
+      const dl = state.downloads[id];
+      return dl && TAB_ALIVE_STATUS.has(dl.status);
+    });
+    if (hasAlive) return; // 该 tab 还有存活任务（其他排队/下载/暂停任务靠它的 content 执行），不能关
+    if (state.tabActive[tabId]) return; // 双保险：调度槽仍被占用
+    await chrome.tabs.remove(tabId);
+    log('info', `[清理] 已删除完成任务，关闭来源标签页 tab${tabId} 释放内存`);
+  } catch { /* tab 已关闭等：静默 */ }
+}
+
 // ============ 消息路由 ============
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
@@ -193,12 +213,15 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.type === 'DELETE_DOWNLOAD') {
     const d = state.downloads[msg.downloadId];
     if (d) {
+      const wasCompleted = d.status === 'completed'; // 删除前记录（completed → 关来源标签页）
       if (d.status === 'downloading') cancelDownload(msg.downloadId);
       delete state.downloads[msg.downloadId];
       persist();
       // 通知该任务所在页面清理其分片（任务已删，分片视为孤儿）
       chrome.tabs.sendMessage(d.tabId, { type: 'CLEANUP_OPFS', activeDownloadIds: Object.values(state.downloads).map(x => x.id) }).catch(() => {});
       broadcast({ type: 'DOWNLOAD_REMOVED', downloadId: msg.downloadId });
+      // 删除已完成任务 → 同步关闭其来源标签页（该 tab 无其他存活任务时才关）
+      if (wasCompleted) closeTabIfIdle(d.tabId);
     }
     sendResponse({ ok: true });
     return true;
