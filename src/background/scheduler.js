@@ -8,7 +8,7 @@ export function enqueue(tabId, url, referer, resolution, pageUrl, pageTitle, for
   // 重复检测：同一 URL 已有未取消任务 → 除非 force 确认，否则拒绝入队
   const existing = Object.values(downloads).find(x => x.url === url && x.status !== 'cancelled');
   if (existing && !force) {
-    return { ok: false, duplicate: true, existingId: existing.id, existingStatus: existing.status };
+    return { ok: false, duplicate: true, existingId: existing.id, existingStatus: existing.status, existingPct: existing.pct };
   }
   // force 双保险：2s 内同 URL 只允许 force 入队一次（防双击/重发绕过 UI 禁用产生重复任务）
   if (force && existing) {

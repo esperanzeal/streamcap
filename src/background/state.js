@@ -16,11 +16,13 @@ export function persist() {
     status: d.status, pct: d.pct, done: d.done, total: d.total,
     speed: d.speed, error: d.error, createdAt: d.createdAt, tabId: d.tabId,
     fileName: d.fileName, pageTitle: d.pageTitle, dupIndex: d.dupIndex,
+    pageUrl: d.pageUrl, // ★ 必须持久化：浏览器重启后重试要靠它找同源宿主/自动开原页面
     retryCount: d.retryCount, consecutiveFails: d.consecutiveFails,
+    stallCount: d.stallCount, // 停滞计数持久化：重启后不归零，避免又从头循环
     priority: d.priority, replacedFlag: d.replacedFlag,
     format: d.format,
     lastProgressAt: d.lastProgressAt, lastDone: d.lastDone, lastDoneAt: d.lastDoneAt,
-    stopPendingAt: d.stopPendingAt,
+    lastPing: d.lastPing, stopPendingAt: d.stopPendingAt,
   }));
   chrome.storage.local.set({ vgp_downloads: list });
 }

@@ -109,8 +109,14 @@ function renderList(data) {
         if (resp?.ok) {
           btn.textContent = '✅ 已加入';
         } else if (resp?.duplicate) {
-          // 该 URL 已在任务列表：询问是否强制重复下载（默认拒绝，防误操作产生重复文件）
-          const force = confirm(`该视频已在下载任务列表中（状态：${resp.existingStatus || '?'}）。\n\n确定要重复下载一份吗？`);
+          // 该 URL 已在任务列表：failed/paused → 提供"续传"（沿用原任务 id 断点续传，
+          // 走重试智能接管自动找宿主 tab）；其他状态 → 询问是否强制重复下载（默认拒绝）
+          const st = resp.existingStatus || '?';
+          const retryable = st === 'failed' || st === 'cancelled' || st === 'paused';
+          const pctTxt = resp.existingPct != null ? `（已下载 ${Math.round(resp.existingPct)}%）` : '';
+          const force = confirm(retryable
+            ? `检测到同一视频的${st === 'paused' ? '已暂停' : st === 'cancelled' ? '已取消' : '失败'}任务${pctTxt}，分片已保留，可直接续传不重复下载。\n\n续传该任务？`
+            : `该视频已在下载任务列表中（状态：${st}${pctTxt}）。\n\n确定要重复下载一份吗？`);
           if (force) {
             chrome.runtime.sendMessage({
               type: 'ENQUEUE',
@@ -119,11 +125,15 @@ function renderList(data) {
               resolution: btn.dataset.res,
               pageUrl: currentPageUrl,
               pageTitle: data.pageTitle || pageFileName(),
-              force: true,
+              // 续传：沿用原任务 id（OPFS 分片跳过）走重试智能接管；否则 force 新建重复任务
+              retryId: retryable ? resp.existingId : undefined,
+              force: retryable ? undefined : true,
             }, r2 => {
               if (r2?.ok) {
-                btn.textContent = '✅ 已加入';
+                btn.textContent = retryable ? '✅ 已续传' : '✅ 已加入';
               } else {
+                // 续传也可能失败（如找不到宿主页），提示用户去下载管理点重试
+                if (retryable && r2 && r2.ok === false) alert(r2.error || '续传失败，请到下载管理点「重试」');
                 btn.disabled = false;
               }
             });

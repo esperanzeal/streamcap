@@ -44,8 +44,9 @@ async function retryExisting(msg, sendResponse) {
   let hostTabId = ((preferId !== undefined && preferId !== null) && await pingTabLive(preferId)) ? preferId : null;
 
   // 2) 原 tab 失效 → 找同源活 tab（同一网站 origin → 同 OPFS → 已下分片直接续传）
+  //    pageUrl || referer 兜底：旧任务/浏览器重启后 pageUrl 可能缺失，referer 一般是页面 URL
   if (hostTabId === null) {
-    const pageOrigin = originOf(d.pageUrl || '');
+    const pageOrigin = originOf(d.pageUrl || d.referer || '');
     if (pageOrigin) {
       try {
         const tabs = await chrome.tabs.query({});
@@ -161,7 +162,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         const r = enqueue(tabId, msg.url, msg.referer, msg.resolution, msg.pageUrl, msg.pageTitle, msg.force === true);
         if (!r.ok && r.duplicate) {
           // 重复 URL：返回重复状态，由发起方（popup/页面）弹确认框
-          sendResponse({ ok: false, duplicate: true, existingId: r.existingId, existingStatus: r.existingStatus, url: msg.url });
+          sendResponse({ ok: false, duplicate: true, existingId: r.existingId, existingStatus: r.existingStatus, existingPct: r.existingPct, url: msg.url });
         } else {
           sendResponse({ ok: true, downloadId: r.downloadId });
         }
