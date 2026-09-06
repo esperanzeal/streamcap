@@ -39,14 +39,18 @@ async function retryExisting(msg, sendResponse) {
     d.done = 0; d.pct = 0; d.total = 0; d.fileName = '';
   }
 
+  // ★ 宿主查找的页面依据，优先级：msg.pageUrl（调用方实时提供——popup/页面续传时
+  //   就是用户当前打开的原视频页 URL）→ 任务持久化的 pageUrl → referer（旧数据兜底）。
+  //   之前只查 d.pageUrl，续传时 popup 明明传了当前页 URL 却被忽略 → 找不到同源宿主。
+  const pageUrlHint = msg.pageUrl || d.pageUrl || d.referer || '';
+
   // 1) 原 tab（manager 传来的 tabId）存活 → 原地续传（与旧行为一致，零变化零打扰）
   const preferId = msg.tabId ?? d.tabId;
   let hostTabId = ((preferId !== undefined && preferId !== null) && await pingTabLive(preferId)) ? preferId : null;
 
   // 2) 原 tab 失效 → 找同源活 tab（同一网站 origin → 同 OPFS → 已下分片直接续传）
-  //    pageUrl || referer 兜底：旧任务/浏览器重启后 pageUrl 可能缺失，referer 一般是页面 URL
   if (hostTabId === null) {
-    const pageOrigin = originOf(d.pageUrl || d.referer || '');
+    const pageOrigin = originOf(pageUrlHint);
     if (pageOrigin) {
       try {
         const tabs = await chrome.tabs.query({});
@@ -61,10 +65,9 @@ async function retryExisting(msg, sendResponse) {
 
   // 3) 无同源 tab → 自动开一个同源 tab（前台避免后台节流），等 content 注入就绪
   if (hostTabId === null) {
-    const pageUrl = d.pageUrl || d.referer || '';
-    if (pageUrl) {
+    if (pageUrlHint) {
       try {
-        const tab = await chrome.tabs.create({ url: pageUrl, active: true });
+        const tab = await chrome.tabs.create({ url: pageUrlHint, active: true });
         for (let i = 0; i < 40; i++) { // 最多 20s：页面加载 + content script(document_end) 注入
           await sleep(500);
           if (await pingTabLive(tab.id)) { hostTabId = tab.id; break; }
@@ -75,7 +78,12 @@ async function retryExisting(msg, sendResponse) {
   }
 
   if (hostTabId === null) {
-    sendResponse({ ok: false, error: '原标签页不可用且找不到同源页面（也无法自动打开），请先打开原视频网站页面再点重试' });
+    sendResponse({
+      ok: false,
+      error: pageUrlHint
+        ? '打开的页面 20 秒内未就绪，或找不到同源可用页面，请稍后在原视频网站页面重试'
+        : '任务缺少来源页面信息，请打开原视频网站页面后到下载管理点「重试」（续传可保留进度）',
+    });
     return;
   }
 
