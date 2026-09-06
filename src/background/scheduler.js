@@ -243,6 +243,7 @@ export async function resumeAll() {
     d.error = null;
     d.consecutiveFails = 0;
     d.retryCount = 0;
+    d.stallCount = 0; // 手动恢复 = 新的尝试周期
     // 手动恢复 = 新的尝试周期，priority 保持原 FIFO 位置
     if (!state.tabQueues[d.tabId]) state.tabQueues[d.tabId] = [];
     if (!state.tabQueues[d.tabId].includes(d.id)) state.tabQueues[d.tabId].push(d.id);
@@ -328,27 +329,32 @@ export function requeueToFront(d) {
 
 // 停滞重排：累计 consecutiveFails（≤3 重排队尾 priority=++prioritySeq，超过标 failed 放弃）
 // timeout=true 时文案标注"停止确认超时"（content 无响应兜底路径）
+// 停滞重排：用独立 stallCount 控制"停滞→重排"循环次数。
+// 原则（用户确认）：失败先丢 fail 队列，别让一个卡住的任务反复循环重试占用并发槽、
+// 拖累其他任务（会把后续任务拖到签名 URL 过期）。停滞只自动重排 1 次
+//（可能是瞬时卡顿，新循环可救回）；第 2 次停滞直接 failed——不再 3 次循环。
+// timeout=true 时文案标注"停止确认超时"（content 无响应兜底路径，调用方已先判 tab 死活）
 export function requeueStalled(d, timeout) {
-  const fails = (d.consecutiveFails || 0) + 1;
-  d.consecutiveFails = fails;
-  if (fails <= 3) {
+  const stuck = (d.stallCount || 0) + 1;
+  d.stallCount = stuck;
+  if (stuck <= 1) {
     d.status = 'queued';
-    d.error = timeout ? `停止确认超时，自动重排队尾（${fails}/3）` : `无进度自动重排（${fails}/3）`;
+    d.error = timeout ? '停止确认超时，自动重排队尾（仅此 1 次）' : '无进度自动重排（仅此 1 次，再停滞将放弃）';
     d.priority = ++state.prioritySeq;
     if (!state.tabQueues[d.tabId]) state.tabQueues[d.tabId] = [];
     if (!state.tabQueues[d.tabId].includes(d.id)) state.tabQueues[d.tabId].push(d.id);
     state.tabActive[d.tabId] = null;
     persist();
     broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
-    log('warn', `[停滞] ${taskLabel(d.id)} ${timeout ? '停止确认超时' : '停止已确认'}，自动重排队尾（${fails}/3，priority=${d.priority}）`);
+    log('warn', `[停滞] ${taskLabel(d.id)} ${timeout ? '停止确认超时' : '停止已确认'}，自动重排队尾（1/1，priority=${d.priority}）`);
     maybeDispatch();
   } else {
     d.status = 'failed';
-    d.error = `连续 ${fails} 次无进度，自动放弃（分片保留，可手动重试）`;
+    d.error = `连续停滞 ${stuck} 次，自动放弃（分片保留，可手动重试自动续传）`;
     state.tabActive[d.tabId] = null;
     persist();
     broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
-    log('warn', `[停滞] ${taskLabel(d.id)} 连续 ${fails} 次无进度，标为失败`);
+    log('warn', `[停滞] ${taskLabel(d.id)} 连续停滞 ${stuck} 次，标为失败不再循环重试`);
     maybeDispatch();
   }
 }

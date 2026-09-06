@@ -100,6 +100,7 @@ function migrateTaskToTab(d, hostTabId) {
   d.status = 'queued';
   d.error = null;
   d.consecutiveFails = 0; // 手动重试 = 新的尝试周期（保留 createdAt 保持 FIFO 原位置）
+  d.stallCount = 0; // 停滞计数同样清零：手动重试是全新的尝试
 }
 
 // ============ 删除已完成任务 → 关闭对应来源标签页 ============
@@ -243,6 +244,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       // 保留 done 进度 → OPFS 断点续传生效；仅 completed 类重下才归零（见 ENQUEUE retryId 分支）
       d.consecutiveFails = 0;
       d.retryCount = 0;
+      d.stallCount = 0; // 手动全部重试 = 新的尝试周期
       if (!state.tabQueues[d.tabId]) state.tabQueues[d.tabId] = [];
       if (!state.tabQueues[d.tabId].includes(d.id)) state.tabQueues[d.tabId].push(d.id);
     }
@@ -484,14 +486,27 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           // 退避期间用户可能已暂停/取消/重新调度该任务：只有仍处于 retrying
           // （未被用户干预）才自动重派，避免双派发
           if (d.status !== 'retrying') return;
-          d.status = 'queued';
-          d.error = null;
-          persist();
-          broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
-          // 放回原 tab 队列（保留 createdAt → FIFO 原位置），由 maybeDispatch 统一调度
-          if (!state.tabQueues[d.tabId]) state.tabQueues[d.tabId] = [];
-          if (!state.tabQueues[d.tabId].includes(d.id)) state.tabQueues[d.tabId].push(d.id);
-          maybeDispatch();
+          // ★ 退避期间宿主 tab 已死（页面被关）：直接 failed，不入队空转重试
+          //   （死 tab 上重试必然失败，浪费退避+派发+一个下载周期，且占调度）
+          chrome.tabs.get(d.tabId, t => {
+            if (chrome.runtime.lastError || !t) {
+              d.status = 'failed';
+              d.error = '页面已关闭，放弃自动重试（分片保留，可手动重试自动续传）';
+              persist();
+              broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
+              log('warn', `[重试] ${taskLabel(d.id)} 宿主页面已关闭，放弃自动重试`);
+              maybeDispatch();
+              return;
+            }
+            d.status = 'queued';
+            d.error = null;
+            persist();
+            broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
+            // 放回原 tab 队列（保留 createdAt → FIFO 原位置），由 maybeDispatch 统一调度
+            if (!state.tabQueues[d.tabId]) state.tabQueues[d.tabId] = [];
+            if (!state.tabQueues[d.tabId].includes(d.id)) state.tabQueues[d.tabId].push(d.id);
+            maybeDispatch();
+          });
         }, delay);
       } else {
         d.status = 'failed';

@@ -6,6 +6,37 @@ import { log } from './log.js';
 const KEEPALIVE_ALARM = 'vgp_keepalive';
 const CLEANUP_ALARM = 'vgp_cleanup';
 
+// ============ 宿主 tab 存活检测 + 快速失败 ============
+// 原则（用户确认）：失败先丢 fail 队列，别让死 tab 的任务反复重试/重排空转浪费时间、
+// 占用并发槽拖累其他任务。识别到宿主 tab 已死（关闭/冻结无响应）→ 直接 failed。
+function pingContent(tabId) {
+  return new Promise(resolve => {
+    try {
+      chrome.tabs.sendMessage(tabId, { type: 'PING' }, r => resolve(!chrome.runtime.lastError && r && r.ok === true));
+    } catch { resolve(false); }
+  });
+}
+// 判定宿主 tab 是否真死：tab 已关闭（tabs.get 失败）或 content 无响应
+//（PING 2s 不通，且最近 60s 无心跳——心跳 10s 一次，60s 无 = content 消息循环已停）。
+// PING 不通但心跳新鲜：可能只是后台节流消息延迟，保守不算死（交给心跳路径处理）。
+async function hostTabDead(d) {
+  if (!d.tabId) return true;
+  try { await chrome.tabs.get(d.tabId); } catch { return true; }
+  const alive = await pingContent(d.tabId);
+  if (alive) return false;
+  return !(d.lastPing && Date.now() - d.lastPing < 60000);
+}
+// 快速失败：直接 failed 丢 fail 队列并释放并发槽（分片保留，手动重试走接管续传）
+function failTaskQuick(d, reason) {
+  d.status = 'failed';
+  d.error = `${reason}（分片保留，可手动重试自动续传）`;
+  state.tabActive[d.tabId] = null;
+  persist();
+  broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
+  log('warn', `[停滞] ${taskLabel(d.id)} ${reason}，标为失败不再重试`);
+}
+
+
 export function ensureKeepaliveAlarm() {
   chrome.alarms.get(KEEPALIVE_ALARM, a => {
     if (!a) {
@@ -22,7 +53,7 @@ export function ensureKeepaliveAlarm() {
   });
 }
 
-chrome.alarms.onAlarm.addListener((alarm) => {
+chrome.alarms.onAlarm.addListener(async (alarm) => {
   if (alarm.name === CLEANUP_ALARM) {
     // 定期清理：通知所有打开的 tab 删除孤儿 OPFS 分片
     const activeIds = Object.values(state.downloads).map(d => d.id);
@@ -87,6 +118,12 @@ chrome.alarms.onAlarm.addListener((alarm) => {
   for (const d of stalled) {
     // tabActive 归属校验：只有当前仍由本任务占用并发槽时才释放，避免误清该 tab 其他任务的槽
     if (state.tabActive[d.tabId] !== d.id) continue;
+    // ★ 宿主 tab 已死（关闭/冻结无响应）：直接 failed 丢 fail 队列，不再走
+    //   stopping 等待/重排循环——死 tab 上重排必然再卡，纯浪费时间且占槽。
+    if (await hostTabDead(d)) {
+      failTaskQuick(d, '页面已关闭或无响应，停止重试');
+      continue;
+    }
     // 两阶段停止：先发 CANCEL 通知 content 停止下载循环，任务进入 stopping 状态
     // （占槽但不算 downloading、不参与重派），等 content 上报 DOWNLOAD_ERROR 确认
     // 旧循环已退出后，才转 queued 重新入队由调度器重派。避免"不等确认就重派"
@@ -101,10 +138,15 @@ chrome.alarms.onAlarm.addListener((alarm) => {
     log('warn', `[停滞] ${taskLabel(d.id)} 无进度超过 ${DONE_TIMEOUT / 1000}s，已发送停止信号，等待确认后自动重排`);
   }
   // stopping 超时兜底：content 已死（页面关闭/冻结无响应）→ 收不到 DOWNLOAD_ERROR 确认，
-  // 30s 后强制转 queued 重派（此时旧循环必然已随页面销毁，无竞态）
+  // 30s 后强制处理（此时旧循环必然已随页面销毁，无竞态）。
   const now2 = Date.now();
   const stuck = Object.values(state.downloads).filter(d => d.status === 'stopping' && d.stopPendingAt && now2 - d.stopPendingAt > 30000);
   for (const d of stuck) {
+    // ★ 30s 无确认 = content 没收到/没处理 CANCEL → 宿主大概率已死 → 直接 failed 不再重排空转
+    if (await hostTabDead(d)) {
+      failTaskQuick(d, '停止确认超时（页面无响应），放弃重试');
+      continue;
+    }
     // 释放并发槽：stopping 一直占着槽（等待确认），超时兜底转 queued 时必须释放，
     // 否则 maybeDispatch 因 tabActive[tabId] 非空永久跳过该 tab，任务卡死永不重派
     state.tabActive[d.tabId] = null;
@@ -115,7 +157,7 @@ chrome.alarms.onAlarm.addListener((alarm) => {
       log('warn', `[优先] ${taskLabel(d.id)} 停止确认超时（content 无响应），回队列（priority=${d.priority}）`);
       continue;
     }
-    // 与确认路径一致：超时兜底也累计 consecutiveFails（≤3 次自动重派，超过标 failed 放弃）——统一 requeueStalled
+    // 与确认路径一致：超时兜底也累计停滞次数（仅 1 次自动重排，超过标 failed 放弃）——统一 requeueStalled
     requeueStalled(d, true);
   }
   if (stalled.length > 0 || stuck.length > 0) maybeDispatch();
