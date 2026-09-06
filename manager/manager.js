@@ -104,6 +104,7 @@ function render() {
         ${d.status === 'queued' ? `<button class="btn-act prioritize" data-act="prioritize" data-id="${d.id}" title="立即开始下载；并发已满时替换进度最少的下载中任务">⚡ 优先</button>` : ''}
         ${isRetryable ? `<button class="btn-act retry" data-act="retry" data-id="${d.id}">${retryLabel}</button>` : ''}
         ${!isActive && !isExporting ? `<button class="btn-act danger" data-act="delete" data-id="${d.id}">删除</button>` : ''}
+        ${d.tabId && d.status !== 'completed' ? `<button class="btn-act" data-act="locate" data-id="${d.id}" title="跳到来源标签页">📍 定位</button>` : ''}
       </div>
     </div>`;
   }).join('');
@@ -116,6 +117,11 @@ function render() {
       if (btn.dataset.act === 'pause') act({ type: 'PAUSE', downloadId: id });
       if (btn.dataset.act === 'delete') act({ type: 'DELETE_DOWNLOAD', downloadId: id });
       if (btn.dataset.act === 'prioritize') act({ type: 'PRIORITIZE_DOWNLOAD', downloadId: id });
+      if (btn.dataset.act === 'locate') {
+        chrome.runtime.sendMessage({ type: 'LOCATE_TAB', tabId: d.tabId }, resp => {
+          if (resp && resp.ok === false) alert(resp.error || '无法定位该标签页');
+        });
+      }
       if (btn.dataset.act === 'resume' || btn.dataset.act === 'retry') {
         if (!d) return;
         // 已完成任务的重试 = 进度归零从头重新下载（分片已清理），需确认防误触
@@ -157,6 +163,8 @@ chrome.storage.local.get('vgp_settings', s => {
   maxConcSelect.value = (settings.maxConcurrent === undefined || settings.maxConcurrent === null) ? 4 : settings.maxConcurrent;
   // 页面合并按钮开关：默认开（undefined 视为 true）
   $('#mergeBtnToggle').checked = settings.mergeButton !== false;
+  // 完成后自动关闭来源标签页：默认开（undefined 视为 true）
+  $('#autoCloseTabToggle').checked = settings.autoCloseTab !== false;
 });
 function saveSettings(patch) {
   chrome.storage.local.get('vgp_settings', s => {
@@ -175,6 +183,10 @@ maxConcSelect.addEventListener('change', () => {
 // 页面合并按钮开关：只写 settings，content script 监听 storage 变化实时显示/隐藏
 $('#mergeBtnToggle').addEventListener('change', () => {
   saveSettings({ mergeButton: $('#mergeBtnToggle').checked });
+});
+// 完成后自动关闭来源标签页开关：只写 settings，background 在任务完成时读取
+$('#autoCloseTabToggle').addEventListener('change', () => {
+  saveSettings({ autoCloseTab: $('#autoCloseTabToggle').checked });
 });
 
 // 打开日志页

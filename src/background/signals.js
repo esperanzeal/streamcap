@@ -15,6 +15,34 @@ export let loaded = false;
 export function markLoaded() { loaded = true; }
 export const pendingDownloadSignals = [];
 
+// ============ 下载完成自动关闭来源标签页 ============
+// 条件：设置 autoCloseTab 未关闭（默认开）+ tab 仍存在 + 该 tab 无存活任务。
+// 注意：completed/failed/cancelled 任务不算"存活"（tabQueues 里的终态任务不拦关闭）。
+const ALIVE_STATUS = new Set(['queued', 'paused', 'downloading', 'retrying', 'exporting', 'stopping']);
+async function maybeCloseTab(tabId) {
+  if (!tabId) return;
+  try {
+    const s = await chrome.storage.local.get('vgp_settings');
+    if (s.vgp_settings && s.vgp_settings.autoCloseTab === false) return;
+    await chrome.tabs.get(tabId); // tab 已不存在会 throw → 静默返回
+    const q = state.tabQueues[tabId] || [];
+    const hasAlive = q.some(id => {
+      const d = state.downloads[id];
+      return d && ALIVE_STATUS.has(d.status);
+    });
+    if (hasAlive) return; // 还有排队/进行中的任务，不能关（content 是它们的宿主）
+    if (state.tabActive[tabId]) return; // 双保险：调度槽仍被占用
+    await chrome.tabs.remove(tabId);
+    log('info', `[自动关页] 任务完成且无后续任务，已关闭来源标签页 tab${tabId} 释放内存`);
+  } catch { /* tab 已关闭或已被用户导航走：不处理 */ }
+}
+
+// 失败置顶：把来源 tab 移到所在窗口标签栏最前（不激活），几十个标签页里一眼可定位
+function pinFailedTab(tabId) {
+  if (!tabId) return;
+  chrome.tabs.move(tabId, { index: 0 }).catch(() => {});
+}
+
 export function handleDownloadSignal(delta) {
   chrome.storage.session.get('blob_map', s => {
     const m = s.blob_map || {};
@@ -40,8 +68,14 @@ export function handleDownloadSignal(delta) {
       persist();
       broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
       log('info', `[下载器] Chrome 下载项 #${delta.id} 完成 → ${taskLabel(rec.downloadId)} 标为已完成`);
-      // 通知 content：revoke blob + 清理分片
-      chrome.tabs.sendMessage(rec.tabId, { type: 'FINALIZE_DOWNLOAD', downloadId: rec.downloadId, blobUrl: rec.blobUrl }).catch(() => {});
+      // 通知 content：revoke blob + 清理分片；content 清理完成回 ack 后再尝试自动关标签页
+      // （必须先清 OPFS 分片再关——分片按网站 origin 隔离，只有该页面的 content 能清，tab 关了会永久残留）
+      try {
+        chrome.tabs.sendMessage(rec.tabId, { type: 'FINALIZE_DOWNLOAD', downloadId: rec.downloadId, blobUrl: rec.blobUrl }, () => {
+          void chrome.runtime.lastError; // 吞"接收端不存在"（页面已关/已导航走 → tab 不该关或已不在）
+          maybeCloseTab(rec.tabId);
+        });
+      } catch { /* tab 已关闭等极端情况 */ }
       maybeDispatch();
     } else if (delta.state.current === 'interrupted') {
       if (!d) {
@@ -72,6 +106,7 @@ export function handleDownloadSignal(delta) {
             persist();
             broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
             log('error', `[下载器] ${taskLabel(rec.downloadId)} 导出重试失败: ${chrome.runtime.lastError?.message || '未知'}`);
+            pinFailedTab(rec.tabId); // 失败置顶：来源标签页移到最前，方便定位重试
             maybeDispatch();
           } else {
             m[itemId2] = rec;
@@ -88,6 +123,7 @@ export function handleDownloadSignal(delta) {
       persist();
       broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
       log('warn', `[下载器] Chrome 下载项 #${delta.id} 中断(${errCode}) → ${taskLabel(rec.downloadId)} 标为失败（blob 保留可重试）`);
+      pinFailedTab(rec.tabId); // 失败置顶：来源标签页移到最前，方便定位重试
       maybeDispatch();
     } else {
       log('debug', `[下载器] Chrome 下载项 #${delta.id} 状态变化: ${delta.state.current}（未处理）`);

@@ -170,6 +170,24 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true;
   }
 
+  // 定位任务来源标签页（manager "📍 定位"按钮）：激活 tab + 聚焦所在窗口
+  if (msg.type === 'LOCATE_TAB') {
+    const tabId = msg.tabId;
+    chrome.tabs.get(tabId, tab => {
+      if (chrome.runtime.lastError || !tab) {
+        sendResponse({ ok: false, error: '原标签页已关闭' });
+        return;
+      }
+      chrome.tabs.update(tabId, { active: true }, () => {
+        if (!chrome.runtime.lastError && tab.windowId !== undefined) {
+          chrome.windows.update(tab.windowId, { focused: true });
+        }
+        sendResponse({ ok: true });
+      });
+    });
+    return true; // 异步响应
+  }
+
   // 日志查询 / 清空（logger 页用）
   if (msg.type === 'GET_LOGS') {
     getLogs(msg.date, lines => sendResponse({ lines }));
