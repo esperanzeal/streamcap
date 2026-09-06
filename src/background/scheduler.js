@@ -25,7 +25,9 @@ export function enqueue(tabId, url, referer, resolution, pageUrl, pageTitle, for
   const taskFormat = sniffed?.format || detectFormat(url);
   downloads[id] = {
     id, url, referer, resolution,
-    pageUrl: pageUrl || referer || '',
+    // pageUrl 兜底链：调用方传入 → 同 tab 嗅探记录（webRequest 记录/主动上报）→ referer。
+    // 尽量让任务带上来源页面地址——失败后重试靠它找同源宿主/自动开原页续传。
+    pageUrl: pageUrl || (state.sniffStore[tabId] && state.sniffStore[tabId].pageUrl) || referer || '',
     pageTitle: pageTitle || '',
     status: 'queued', pct: 0, done: 0, total: 0,
     speed: '', error: null, createdAt: Date.now(), tabId,

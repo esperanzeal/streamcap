@@ -48,7 +48,21 @@ async function retryExisting(msg, sendResponse) {
   const preferId = msg.tabId ?? d.tabId;
   let hostTabId = ((preferId !== undefined && preferId !== null) && await pingTabLive(preferId)) ? preferId : null;
 
-  // 2) 原 tab 失效 → 找同源活 tab（同一网站 origin → 同 OPFS → 已下分片直接续传）
+  // 2) 原 tab 失效 → sniffStore 反查：哪个 tab 嗅探到过与任务**完全相同**的 URL，
+  //    那个 tab 就是源页（referer/pageUrl 都无页面信息时这是唯一可靠线索——
+  //    用户失败页面还开着时最常用：直接对任务点重试即可续传，无需重新嗅探）。
+  //    content 无响应（PING 死）的 tab 跳过。
+  if (hostTabId === null) {
+    for (const [tid, store] of Object.entries(state.sniffStore)) {
+      const tidN = Number(tid);
+      if (!tidN) continue;
+      if (store && Array.isArray(store.videos) && store.videos.some(v => v.url === d.url)) {
+        if (await pingTabLive(tidN)) { hostTabId = tidN; break; }
+      }
+    }
+  }
+
+  // 3) 仍无宿主 → 找同源活 tab（按页面地址 origin 匹配；同 origin → 同 OPFS → 分片直接续传）
   if (hostTabId === null) {
     const pageOrigin = originOf(pageUrlHint);
     if (pageOrigin) {
@@ -63,7 +77,7 @@ async function retryExisting(msg, sendResponse) {
     }
   }
 
-  // 3) 无同源 tab → 自动开一个同源 tab（前台避免后台节流），等 content 注入就绪
+  // 4) 无同源 tab → 自动开一个同源 tab（前台避免后台节流），等 content 注入就绪
   if (hostTabId === null) {
     if (pageUrlHint) {
       try {
