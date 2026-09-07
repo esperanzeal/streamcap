@@ -24,12 +24,14 @@ function load() {
 }
 
 function render() {
-  $('count').textContent = `${curDate} · ${lines.length} 条`;
-  if (lines.length === 0) {
-    $('lines').innerHTML = '<div class="empty">📭 当天暂无日志</div>';
+  const kw = ($('#filter').value || '').trim();
+  const shown = kw ? lines.filter(l => l.includes(kw)) : lines;
+  $('count').textContent = `${curDate} · ${shown.length}${kw ? ' / ' + lines.length : ''} 条`;
+  if (shown.length === 0) {
+    $('lines').innerHTML = `<div class="empty">${kw ? `🔍 无匹配「${esc(kw)}」的记录` : '📭 当天暂无日志'}</div>`;
     return;
   }
-  $('lines').innerHTML = lines.map(l => {
+  $('lines').innerHTML = shown.map(l => {
     const m = l.match(/\[(\w+)\]/);
     const cls = m ? 'l-' + m[1].toLowerCase() : 'l-info';
     return `<span class="${cls}">${esc(l)}</span>\n`;
@@ -67,5 +69,8 @@ $('btnClearAll').addEventListener('click', () => {
     if (c) c.textContent = `${curDate} · 0 条`;
   });
 });
+
+// 关键字筛选：视图级过滤（导出仍导出当天全量）
+$('filter').addEventListener('input', render);
 
 load();
