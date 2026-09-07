@@ -86,6 +86,27 @@ window.VGP = window.VGP || {};
       sendResponse({ ok: true, removed });
       return;
     }
+    // 迁移前健康探测（background 重试接管用）：测本页面能否正常拉取该任务的媒体。
+    // 走真实下载路径（同页面 context/cookie/CORS 注入），Range 1KB 轻量请求，
+    // 8s 超时——比 PING 可靠：页面活着但网络卡时 fetch 会挂/超时。
+    if (msg.type === 'PROBE_URL') {
+      try {
+        const t0 = performance.now();
+        const r = await fetch(msg.url, {
+          headers: { Range: 'bytes=0-1023' },
+          signal: AbortSignal.timeout(8000),
+        });
+        if (!r.ok) {
+          sendResponse({ ok: false, status: r.status });
+          return true;
+        }
+        await r.arrayBuffer(); // Range 只回 1KB，读完即释放连接
+        sendResponse({ ok: true, ms: Math.round(performance.now() - t0) });
+      } catch (e) {
+        sendResponse({ ok: false, error: String((e && e.name) || e) });
+      }
+      return true; // 异步响应
+    }
   });
 
   // ============ 初次扫描（500ms debounce） ============

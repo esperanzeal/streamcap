@@ -21,7 +21,11 @@ function pingContent(tabId) {
 // PING 不通但心跳新鲜：可能只是后台节流消息延迟，保守不算死（交给心跳路径处理）。
 async function hostTabDead(d) {
   if (!d.tabId) return true;
-  try { await chrome.tabs.get(d.tabId); } catch { return true; }
+  let tab;
+  try { tab = await chrome.tabs.get(d.tabId); } catch { return true; }
+  // ★ Memory Saver 丢弃的 tab：页面已冻结、content 不运行，下载必然无法推进
+  //   → 直接判死（此前 PING 超时后 60s 心跳豁免可能让它多等一分钟才判死）
+  if (tab.discarded) return true;
   const alive = await pingContent(d.tabId);
   if (alive) return false;
   return !(d.lastPing && Date.now() - d.lastPing < 60000);

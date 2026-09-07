@@ -41,6 +41,24 @@ function hostIsHealthy(tabId) {
   return d2.lastDoneAt && (Date.now() - d2.lastDoneAt) < HOST_HEALTH_MS;
 }
 
+// 迁移前真实探测：让候选 tab 的 content 对该任务媒体 URL 发 Range 1KB 请求
+//（content PROBE_URL 处理，8s 超时）——走真实下载路径（同页面 context/cookie/
+// CORS 注入），比 PING 可靠：页面活着但网络卡时 fetch 会挂/超时。
+// background 侧 10s 兜底：content 若消息处理卡住不能无限等。
+function probeHost(tabId, url) {
+  return Promise.race([
+    new Promise(resolve => {
+      try {
+        chrome.tabs.sendMessage(tabId, { type: 'PROBE_URL', url }, r => {
+          if (chrome.runtime.lastError || !r) resolve(false);
+          else resolve(!!r.ok && r.ms < 8000);
+        });
+      } catch { resolve(false); }
+    }),
+    new Promise(resolve => setTimeout(() => resolve(false), 10000)),
+  ]);
+}
+
 async function retryExisting(msg, sendResponse) {
   const d = state.downloads[msg.retryId];
   if (!d) { sendResponse({ ok: false, error: '任务不存在' }); return; }
@@ -61,10 +79,12 @@ async function retryExisting(msg, sendResponse) {
 
   // ★ 曾卡过的任务（停滞史）不再原地回原 tab：原 tab PING 活着 ≠ 下载能推进
   //   （用户实测：卡死页 content 活着，手动关掉页任务才 failed；原地续传=继续卡）。
-  //   曾停滞 → 原 tab 进"排除集"，优先迁到有实际下载推进证据的同源 tab。
+  //   曾停滞 → 原 tab 进排除集，优先迁到有"实际下载推进证据"的同源 tab，
+  //   且每个候选须通过真实网络探测（probeHost）——不猜，测过才用。
   const wasStalled = (d.stallCount || 0) > 0 || /停滞|无进度|无响应/.test(d.error || '');
-  const excludeId = wasStalled ? (msg.tabId ?? d.tabId) : null;
+  const origId = msg.tabId ?? d.tabId;
   const pageOrigin = originOf(pageUrlHint);
+  const needProbe = wasStalled; // 卡过的任务候选必须探测通过；正常任务 trust PING（零打扰）
   let hostTabId = null;
 
   // 收集候选：同源 tab + sniffStore URL 反查命中的 tab（源页）
@@ -80,43 +100,55 @@ async function retryExisting(msg, sendResponse) {
     }
   }
   const isSameOrigin = t => pageOrigin && t.url && originOf(t.url) === pageOrigin;
+  // 卡过的原 tab 不作为候选（原地续传=继续卡，宁开新 tab 也不回）
+  const notStalledOrig = t => !wasStalled || t.id !== origId;
+  // 命中候选（needProbe 时须真实探测通过才采用）
+  const adopt = async (t) => {
+    if (!notStalledOrig(t)) return false;
+    if (!needProbe) return true;
+    return probeHost(t.id, d.url);
+  };
 
-  // 1) 健康宿主：同源 tab 正在下载且 60s 内有进度（网络环境被证明能跑——最高优先级）
-  //    busy 也接管：入队等它当前任务完成即用它的网络环境，比原地续传卡死强
+  // A) 无卡史任务：原 tab 活着 → 原地续传（零打扰默认，不探测不折腾）
+  if (!wasStalled && origId !== undefined && origId !== null && await pingTabLive(origId)) {
+    hostTabId = origId;
+  }
+  // B) 健康宿主：同源 tab 正在下载且 60s 内有进度（网络环境被证明能跑——最高优先级）
+  //    busy 也接管：入队等它当前任务完成即用它的网络环境
   if (hostTabId === null) {
     for (const t of cands.values()) {
-      if (t.id !== excludeId && isSameOrigin(t) && hostIsHealthy(t.id)) { hostTabId = t.id; break; }
+      if (isSameOrigin(t) && hostIsHealthy(t.id) && await adopt(t)) { hostTabId = t.id; break; }
     }
   }
-  // 2) 同源空闲活宿主（无任务、PING 通 → 立即跑）
+  // C) 同源空闲活宿主（无任务、PING 通 → 立即跑）
   if (hostTabId === null) {
     for (const t of cands.values()) {
-      if (t.id !== excludeId && isSameOrigin(t) && !state.tabActive[t.id] && await pingTabLive(t.id)) { hostTabId = t.id; break; }
+      if (isSameOrigin(t) && !state.tabActive[t.id] && await pingTabLive(t.id) && await adopt(t)) { hostTabId = t.id; break; }
     }
   }
-  // 3) sniffStore 反查的源页（URL 精确匹配；卡过的原 tab 已在排除集）
+  // D) sniffStore 反查的源页（URL 精确匹配）
   if (hostTabId === null) {
     for (const n of cands.keys()) {
-      if (n !== excludeId && await pingTabLive(n)) { hostTabId = n; break; }
+      if (await adopt({ id: n })) { hostTabId = n; break; }
     }
   }
-  // 4) 原 tab 兜底（仅无卡史；卡过的宁开新 tab 也不回）
-  if (hostTabId === null && !wasStalled) {
-    const preferId = msg.tabId ?? d.tabId;
-    if (preferId !== undefined && preferId !== null && await pingTabLive(preferId)) hostTabId = preferId;
-  }
-
-  // 5) 仍无宿主 → 自动开一个同源 tab（前台避免后台节流），等 content 注入就绪
+  // E) 自动开一个同源 tab（前台避免后台节流），等 content 注入就绪
+  //    卡过的任务：新开 tab 也探测一次，失败即关掉不留废页
   if (hostTabId === null) {
     if (pageUrlHint) {
+      let opened = null;
       try {
-        const tab = await chrome.tabs.create({ url: pageUrlHint, active: true });
+        opened = await chrome.tabs.create({ url: pageUrlHint, active: true });
+        let ready = false;
         for (let i = 0; i < 40; i++) { // 最多 20s：页面加载 + content script(document_end) 注入
           await sleep(500);
-          if (await pingTabLive(tab.id)) { hostTabId = tab.id; break; }
+          if (await pingTabLive(opened.id)) { ready = true; break; }
         }
-        // 超时未就绪：不迁移不派发（任务保持原状态），tab 留着用户可手动再点重试（此时已就绪，走同源接管）
+        if (ready && (!needProbe || await probeHost(opened.id, d.url))) hostTabId = opened.id;
       } catch { /* 开 tab 失败 */ }
+      if (hostTabId === null && opened !== null) {
+        try { await chrome.tabs.remove(opened.id); } catch {} // 未就绪/探测失败：不留废 tab
+      }
     }
   }
 
@@ -124,7 +156,9 @@ async function retryExisting(msg, sendResponse) {
     sendResponse({
       ok: false,
       error: pageUrlHint
-        ? '打开的页面 20 秒内未就绪，或找不到同源可用页面，请稍后在原视频网站页面重试'
+        ? (needProbe
+          ? '候选页面均无法正常拉取媒体（网络探测失败），请稍后重试或在原视频网站页面重试'
+          : '找不到同源可用页面，请稍后在原视频网站页面重试')
         : '任务缺少来源页面信息，请打开原视频网站页面后到下载管理点「重试」（续传可保留进度）',
     });
     return;
