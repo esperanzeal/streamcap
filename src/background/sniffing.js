@@ -161,16 +161,7 @@ chrome.webRequest.onHeadersReceived.addListener(
   (details) => {
     // 【诊断】所有响应都打日志，确认 listener 是否被调用（MV3 blocking 是否生效）
     log('debug', `[webReq] ${details.method} ${details.url.substring(0, 60)} → ${details.statusCode} initiator=${details.initiator || '?'}`);
-    const headers = details.responseHeaders || [];
-    // ★ 服务器已返回原生 ACAO（非 "null"）：信任服务器、不再覆盖注入。
-    //   原因：之前无条件"删掉原生 ACAO 再注入自己的"，若注入结果因故未落到响应上
-    //   （blocking 未生效等），原生 CORS 也被删了 → 浏览器报 No ACAO（实测：
-    //   服务器原生动态回显 ACAO 的站仍 Failed to fetch，日志却无注入记录）。
-    //   默认 fetch 不带跨域凭据，服务器原生 ACAO（* 或具体 origin）已足够放行。
-    const existingACAO = headers.find(h => h.name.toLowerCase() === 'access-control-allow-origin');
-    if (existingACAO && existingACAO.value && existingACAO.value.trim().toLowerCase() !== 'null') {
-      return;
-    }
+    const headers = details.responseHeaders;
     // 页面 origin（请求发起者）：credentials: include 时 ACAO 必须是具体 origin 而非 *，
     // 且必须有 Allow-Credentials: true，否则浏览器拒绝响应。
     let origin = '';
