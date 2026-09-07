@@ -216,6 +216,20 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.type === 'GET_M3U8S') {
     chrome.tabs.query({ active: true, currentWindow: true }, async tabs => {
       const tabId = tabs[0]?.id;
+      // ★ popup 打开即实时刷新：页面懒加载/动态注入视频时，嗅探缓存可能还没写入
+      //   pageTitle/videos（用户反映首次打开只有 URL 末段名，要点刷新才有标题）。
+      //   直接向页面 content 要一次实时扫描（与"刷新按钮"同一路径：SCAN_VIDEOS
+      //   → storeVideos 合并，保留已有记录字段、空 pageTitle 不覆盖）。
+      if (tabId) {
+        try {
+          const live = await chrome.tabs.sendMessage(tabId, { type: 'SCAN_VIDEOS' });
+          if (live && !chrome.runtime.lastError && (live.urls?.length || live.pageTitle)) {
+            if (!state.sniffStore[tabId]) state.sniffStore[tabId] = { videos: [], pageUrl: '', pageTitle: '' };
+            if (live.pageUrl && !state.sniffStore[tabId].pageUrl) state.sniffStore[tabId].pageUrl = live.pageUrl;
+            storeVideos(tabId, live.urls || [], live.pageTitle || '');
+          }
+        } catch { /* content 无响应（扩展页/浏览器内部页）：直接用缓存 */ }
+      }
       const store = state.sniffStore[tabId];
       if (store && tabId) await fillSizes(store, tabId); // 让页面 content 探测 mp4 大小
       sendResponse(store || { videos: [], pageUrl: '' });
