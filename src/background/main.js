@@ -9,8 +9,11 @@ import { ensureKeepaliveAlarm, pingDeadTask } from './stalled.js';
 
 // ============ 重试智能接管（跨标签页续传） ============
 // 原则：正常任务零打扰——原 tab 活着就原地续传，不做任何多余操作。
-// 失败任务重试时的宿主选择链（只为续传已下分片，绝不抢占正在执行的任务）：
-//   原 tab(PING 存活) → 同源空闲 tab → 同源任意 tab → 自动开同源 tab(前台, 等 content 就绪)。
+// 失败任务重试时的宿主选择链（只认"能推进下载"的宿主，绝不回已证明卡死的 tab）：
+//   ① 同源且正下载有进度的 tab（健康证明，最高优先，busy 也接管排队）
+//   ② 同源空闲活 tab → ③ sniffStore URL 反查源页 → ④ 原 tab（仅无卡史）
+//   ⑤ 自动开同源 tab（前台, 等 content 就绪）。
+// 注意：PING/心跳只证明 content 活着，不证明下载能跑——曾停滞的任务绝不原地续传。
 function pingTabLive(tabId) {
   if (tabId === undefined || tabId === null) return Promise.resolve(false);
   return new Promise(resolve => {
@@ -25,6 +28,18 @@ function originOf(u) {
   try { return new URL(u).origin; } catch { return ''; }
 }
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+// 宿主健康度：PING/心跳只证明"content 消息循环活着"，不证明"下载能推进"——
+// 页面活着但网络卡死时 PING 照通（用户实测：手动关掉卡死页任务才失败）。
+// 健康 = 该 tab 当前正在下载的任务在 60s 内有实际进度（done 增长）→ 该 tab 网络能跑。
+const HOST_HEALTH_MS = 60000;
+function hostIsHealthy(tabId) {
+  const runningId = state.tabActive[tabId];
+  if (runningId === undefined || runningId === null) return false;
+  const d2 = state.downloads[runningId];
+  if (!d2 || (d2.status !== 'downloading' && d2.status !== 'retrying')) return false;
+  return d2.lastDoneAt && (Date.now() - d2.lastDoneAt) < HOST_HEALTH_MS;
+}
 
 async function retryExisting(msg, sendResponse) {
   const d = state.downloads[msg.retryId];
@@ -44,40 +59,54 @@ async function retryExisting(msg, sendResponse) {
   //   之前只查 d.pageUrl，续传时 popup 明明传了当前页 URL 却被忽略 → 找不到同源宿主。
   const pageUrlHint = msg.pageUrl || d.pageUrl || d.referer || '';
 
-  // 1) 原 tab（manager 传来的 tabId）存活 → 原地续传（与旧行为一致，零变化零打扰）
-  const preferId = msg.tabId ?? d.tabId;
-  let hostTabId = ((preferId !== undefined && preferId !== null) && await pingTabLive(preferId)) ? preferId : null;
+  // ★ 曾卡过的任务（停滞史）不再原地回原 tab：原 tab PING 活着 ≠ 下载能推进
+  //   （用户实测：卡死页 content 活着，手动关掉页任务才 failed；原地续传=继续卡）。
+  //   曾停滞 → 原 tab 进"排除集"，优先迁到有实际下载推进证据的同源 tab。
+  const wasStalled = (d.stallCount || 0) > 0 || /停滞|无进度|无响应/.test(d.error || '');
+  const excludeId = wasStalled ? (msg.tabId ?? d.tabId) : null;
+  const pageOrigin = originOf(pageUrlHint);
+  let hostTabId = null;
 
-  // 2) 原 tab 失效 → sniffStore 反查：哪个 tab 嗅探到过与任务**完全相同**的 URL，
-  //    那个 tab 就是源页（referer/pageUrl 都无页面信息时这是唯一可靠线索——
-  //    用户失败页面还开着时最常用：直接对任务点重试即可续传，无需重新嗅探）。
-  //    content 无响应（PING 死）的 tab 跳过。
-  if (hostTabId === null) {
-    for (const [tid, store] of Object.entries(state.sniffStore)) {
-      const tidN = Number(tid);
-      if (!tidN) continue;
-      if (store && Array.isArray(store.videos) && store.videos.some(v => v.url === d.url)) {
-        if (await pingTabLive(tidN)) { hostTabId = tidN; break; }
-      }
+  // 收集候选：同源 tab + sniffStore URL 反查命中的 tab（源页）
+  const cands = new Map(); // tabId -> { id, url }
+  try {
+    const allTabs = await chrome.tabs.query({});
+    for (const t of allTabs) if (t.id !== undefined) cands.set(t.id, { id: t.id, url: t.url || '' });
+  } catch { /* tabs.query 失败 */ }
+  for (const [tid, store] of Object.entries(state.sniffStore)) {
+    const n = Number(tid);
+    if (n && store && Array.isArray(store.videos) && store.videos.some(v => v.url === d.url)) {
+      if (!cands.has(n)) cands.set(n, { id: n, url: '' });
     }
   }
+  const isSameOrigin = t => pageOrigin && t.url && originOf(t.url) === pageOrigin;
 
-  // 3) 仍无宿主 → 找同源活 tab（按页面地址 origin 匹配；同 origin → 同 OPFS → 分片直接续传）
+  // 1) 健康宿主：同源 tab 正在下载且 60s 内有进度（网络环境被证明能跑——最高优先级）
+  //    busy 也接管：入队等它当前任务完成即用它的网络环境，比原地续传卡死强
   if (hostTabId === null) {
-    const pageOrigin = originOf(pageUrlHint);
-    if (pageOrigin) {
-      try {
-        const tabs = await chrome.tabs.query({});
-        const sameOrigin = tabs.filter(t => t.id !== undefined && t.url && originOf(t.url) === pageOrigin);
-        // 空闲 tab 优先（立即跑）；忙的也能接管（入队等待，不抢占正在执行的任务）
-        const idleTab = sameOrigin.find(t => !state.tabActive[t.id]);
-        const busyTab = sameOrigin.find(t => state.tabActive[t.id] && state.tabActive[t.id] !== d.id);
-        hostTabId = (idleTab || busyTab)?.id ?? null;
-      } catch { /* tabs.query 失败 */ }
+    for (const t of cands.values()) {
+      if (t.id !== excludeId && isSameOrigin(t) && hostIsHealthy(t.id)) { hostTabId = t.id; break; }
     }
   }
+  // 2) 同源空闲活宿主（无任务、PING 通 → 立即跑）
+  if (hostTabId === null) {
+    for (const t of cands.values()) {
+      if (t.id !== excludeId && isSameOrigin(t) && !state.tabActive[t.id] && await pingTabLive(t.id)) { hostTabId = t.id; break; }
+    }
+  }
+  // 3) sniffStore 反查的源页（URL 精确匹配；卡过的原 tab 已在排除集）
+  if (hostTabId === null) {
+    for (const n of cands.keys()) {
+      if (n !== excludeId && await pingTabLive(n)) { hostTabId = n; break; }
+    }
+  }
+  // 4) 原 tab 兜底（仅无卡史；卡过的宁开新 tab 也不回）
+  if (hostTabId === null && !wasStalled) {
+    const preferId = msg.tabId ?? d.tabId;
+    if (preferId !== undefined && preferId !== null && await pingTabLive(preferId)) hostTabId = preferId;
+  }
 
-  // 4) 无同源 tab → 自动开一个同源 tab（前台避免后台节流），等 content 注入就绪
+  // 5) 仍无宿主 → 自动开一个同源 tab（前台避免后台节流），等 content 注入就绪
   if (hostTabId === null) {
     if (pageUrlHint) {
       try {
