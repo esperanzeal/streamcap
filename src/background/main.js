@@ -7,58 +7,12 @@ import { storeVideos, openManager, fillSizes } from './sniffing.js';
 import { handleDownloadSignal, markLoaded, pendingDownloadSignals } from './signals.js';
 import { ensureKeepaliveAlarm, pingDeadTask } from './stalled.js';
 
-// ============ 重试智能接管（跨标签页续传） ============
-// 原则：正常任务零打扰——原 tab 活着就原地续传，不做任何多余操作。
-// 失败任务重试时的宿主选择链（只认"能推进下载"的宿主，绝不回已证明卡死的 tab）：
-//   ① 同源且正下载有进度的 tab（健康证明，最高优先，busy 也接管排队）
-//   ② 同源空闲活 tab → ③ sniffStore URL 反查源页 → ④ 原 tab（仅无卡史）
-//   ⑤ 自动开同源 tab（前台, 等 content 就绪）。
-// 注意：PING/心跳只证明 content 活着，不证明下载能跑——曾停滞的任务绝不原地续传。
-function pingTabLive(tabId) {
-  if (tabId === undefined || tabId === null) return Promise.resolve(false);
-  return new Promise(resolve => {
-    try {
-      chrome.tabs.sendMessage(tabId, { type: 'PING' }, resp => {
-        resolve(!chrome.runtime.lastError && resp && resp.ok === true);
-      });
-    } catch { resolve(false); }
-  });
-}
-function originOf(u) {
-  try { return new URL(u).origin; } catch { return ''; }
-}
-function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+import { pingTabLive, findHostForTask, migrateTaskToTab } from './host.js';
 
-// 宿主健康度：PING/心跳只证明"content 消息循环活着"，不证明"下载能推进"——
-// 页面活着但网络卡死时 PING 照通（用户实测：手动关掉卡死页任务才失败）。
-// 健康 = 该 tab 当前正在下载的任务在 60s 内有实际进度（done 增长）→ 该 tab 网络能跑。
-const HOST_HEALTH_MS = 60000;
-function hostIsHealthy(tabId) {
-  const runningId = state.tabActive[tabId];
-  if (runningId === undefined || runningId === null) return false;
-  const d2 = state.downloads[runningId];
-  if (!d2 || (d2.status !== 'downloading' && d2.status !== 'retrying')) return false;
-  return d2.lastDoneAt && (Date.now() - d2.lastDoneAt) < HOST_HEALTH_MS;
-}
-
-// 迁移前真实探测：让候选 tab 的 content 对该任务媒体 URL 发 Range 1KB 请求
-//（content PROBE_URL 处理，8s 超时）——走真实下载路径（同页面 context/cookie/
-// CORS 注入），比 PING 可靠：页面活着但网络卡时 fetch 会挂/超时。
-// background 侧 10s 兜底：content 若消息处理卡住不能无限等。
-function probeHost(tabId, url) {
-  return Promise.race([
-    new Promise(resolve => {
-      try {
-        chrome.tabs.sendMessage(tabId, { type: 'PROBE_URL', url }, r => {
-          if (chrome.runtime.lastError || !r) resolve(false);
-          else resolve(!!r.ok && r.ms < 8000);
-        });
-      } catch { resolve(false); }
-    }),
-    new Promise(resolve => setTimeout(() => resolve(false), 10000)),
-  ]);
-}
-
+// ============ 任务重试（手动路径） ============
+// 宿主选择统一在 host.js findHostForTask：
+//   无卡史 + 原 tab 活 → 原地；否则负载均衡选活同源宿主（分散、满负荷排队等待不 fail）；
+//   无活宿主 → 手动路径自动开同源页承接。forceHostTab（页面续传）= 直接绑当前活跃页。
 async function retryExisting(msg, sendResponse) {
   const d = state.downloads[msg.retryId];
   if (!d) { sendResponse({ ok: false, error: '任务不存在' }); return; }
@@ -72,137 +26,44 @@ async function retryExisting(msg, sendResponse) {
     d.done = 0; d.pct = 0; d.total = 0; d.fileName = '';
   }
 
-  // ★ 宿主查找的页面依据，优先级：msg.pageUrl（调用方实时提供——popup/页面续传时
-  //   就是用户当前打开的原视频页 URL）→ 任务持久化的 pageUrl → referer（旧数据兜底）。
-  //   之前只查 d.pageUrl，续传时 popup 明明传了当前页 URL 却被忽略 → 找不到同源宿主。
+  // 宿主查找的页面依据：msg.pageUrl（调用方实时提供，popup/页面续传=用户当前页）
+  // → 任务持久化 pageUrl → referer（旧数据兜底）
   const pageUrlHint = msg.pageUrl || d.pageUrl || d.referer || '';
 
-  // ★ 曾卡过的任务（停滞史）不再原地回原 tab：原 tab PING 活着 ≠ 下载能推进
-  //   （用户实测：卡死页 content 活着，手动关掉页任务才 failed；原地续传=继续卡）。
-  //   曾停滞 → 原 tab 进排除集，优先迁到有"实际下载推进证据"的同源 tab，
-  //   且每个候选须通过真实网络探测（probeHost）——不猜，测过才用。
-  const wasStalled = (d.stallCount || 0) > 0 || /停滞|无进度|无响应/.test(d.error || '');
-  const origId = msg.tabId ?? d.tabId;
-  const pageOrigin = originOf(pageUrlHint);
-  const needProbe = wasStalled; // 卡过的任务候选必须探测通过；正常任务 trust PING（零打扰）
   let hostTabId = null;
-
-  // 收集候选：同源 tab + sniffStore URL 反查命中的 tab（源页）
-  const cands = new Map(); // tabId -> { id, url }
-  try {
-    const allTabs = await chrome.tabs.query({});
-    for (const t of allTabs) if (t.id !== undefined) cands.set(t.id, { id: t.id, url: t.url || '' });
-  } catch { /* tabs.query 失败 */ }
-  for (const [tid, store] of Object.entries(state.sniffStore)) {
-    const n = Number(tid);
-    if (n && store && Array.isArray(store.videos) && store.videos.some(v => v.url === d.url)) {
-      if (!cands.has(n)) cands.set(n, { id: n, url: '' });
-    }
-  }
-  const isSameOrigin = t => pageOrigin && t.url && originOf(t.url) === pageOrigin;
-  // 卡过的原 tab 不作为候选（原地续传=继续卡，宁开新 tab 也不回）
-  const notStalledOrig = t => !wasStalled || t.id !== origId;
-
-  // A) 页面嗅探续传（popup forceHostTab）：用户就在当前活跃页操作，页面必然活着，
-  //    直接绑它续传——不走接管链（探测/负载均衡对刚刷新的页面是多余绕路，
-  //    且可能把任务绑到其他同源 tab 而非用户正在操作的这一个）。
+  // 页面嗅探续传（popup forceHostTab）：用户就在当前活跃页操作，页面必然活着，
+  // 直接绑它续传——不走接管链（探测/负载均衡对刚刷新的页面是多余绕路，且可能
+  // 绑到其他同源 tab 而非用户正在操作的这一个）
   if (msg.forceHostTab && msg.tabId !== undefined && msg.tabId !== null && await pingTabLive(msg.tabId)) {
     hostTabId = msg.tabId;
   }
-  // A2) 无卡史任务：原 tab 活着 → 原地续传（零打扰默认，不探测不折腾）
-  if (hostTabId === null && !wasStalled && origId !== undefined && origId !== null && await pingTabLive(origId)) {
-    hostTabId = origId;
-  }
-
-  // ★ 候选负载：活动任务(1) + 排队任务数。排队任务(queued)不占 tabActive，
-  //   旧逻辑只看 tabActive → 已排队的 tab 仍显示"空闲" → 多个续传任务全堆
-  //   第一个 tab（用户实测：5 个任务全绑 tab1，其余 4 个 tab 空置排队等）。
-  //   选宿主按 (负载升序 → 正在下载健康优先)，且负载 < MAX_PER_TAB 才用——
-  //   让多个续传任务自动分散到不同同源 tab，不堆叠。
-  const MAX_PER_TAB = 2; // 每 tab：1 活动 + 1 排队（用户建议上限）
-  const tabLoad = tid => (state.tabActive[tid] ? 1 : 0) + (state.tabQueues[tid] ? state.tabQueues[tid].length : 0);
-
-  // B) 负载均衡选宿主：同源候选（无同源依据时用全部候选=sniffStore 源页）逐个
-  //    PING/adopt 后按负载排序，取负载最小的活候选（负载 < MAX_PER_TAB 才定）
-  let bestRanked = null; // 负载最小活候选（含满负荷），供新 tab 失败时兜底
+  // 其余手动重试：统一宿主选择（findHostForTask：原地→负载均衡活宿主→自动开新页）
   if (hostTabId === null) {
-    const pool = [...cands.values()].filter(t => isSameOrigin(t));
-    const ranked = [];
-    for (const t of (pool.length ? pool : [...cands.values()])) {
-      if (!notStalledOrig(t)) continue;
-      if (!(await pingTabLive(t.id))) continue;
-      if (needProbe && !(await probeHost(t.id, d.url))) continue;
-      ranked.push({ t, load: tabLoad(t.id), healthy: hostIsHealthy(t.id) });
-    }
-    ranked.sort((a, b) => (a.load - b.load) || ((b.healthy ? 1 : 0) - (a.healthy ? 1 : 0)));
-    bestRanked = ranked[0] || null;
-    if (bestRanked && bestRanked.load < MAX_PER_TAB) hostTabId = bestRanked.t.id;
-  }
-
-  // C) 自动开同源 tab 分散：宿主未定，或同源候选都已满负荷（负载 ≥ MAX_PER_TAB）
-  //    → 开新 tab 承接而不是继续堆叠到已满的 tab
-  if (hostTabId === null || (bestRanked && bestRanked.load >= MAX_PER_TAB)) {
-    if (pageUrlHint && hostTabId === null) {
-      let opened = null;
-      try {
-        opened = await chrome.tabs.create({ url: pageUrlHint, active: true });
-        let ready = false;
-        for (let i = 0; i < 40; i++) { // 最多 20s：页面加载 + content script(document_end) 注入
-          await sleep(500);
-          if (await pingTabLive(opened.id)) { ready = true; break; }
-        }
-        if (ready && (!needProbe || await probeHost(opened.id, d.url))) hostTabId = opened.id;
-      } catch { /* 开 tab 失败 */ }
-      if (hostTabId === null && opened !== null) {
-        try { await chrome.tabs.remove(opened.id); } catch {} // 未就绪/探测失败：不留废 tab
-      }
-    }
-  }
-
-  // D) 兜底：开新 tab 不可用（无页面地址/未就绪）→ 用负载最小的活候选
-  //    （即便已满负荷也接受——排队总比失败强）
-  if (hostTabId === null && bestRanked) {
-    hostTabId = bestRanked.t.id;
+    hostTabId = await findHostForTask(d, {
+      origId: msg.tabId ?? d.tabId,
+      pageUrlHint: pageUrlHint,
+      openNewTab: true, // 手动路径：失败是少数，无宿主时自动开同源页承接
+    });
   }
 
   if (hostTabId === null) {
     sendResponse({
       ok: false,
       error: pageUrlHint
-        ? (needProbe
-          ? '候选页面均无法正常拉取媒体（网络探测失败），请稍后重试或在原视频网站页面重试'
-          : '找不到同源可用页面，请稍后在原视频网站页面重试')
+        ? '找不到可用的同源页面（候选均无法拉取媒体），请稍后重试或在原视频网站页面重试'
         : '任务缺少来源页面信息，请打开原视频网站页面后到下载管理点「重试」（续传可保留进度）',
     });
     return;
   }
 
-  // 迁移到宿主 tab：从旧队列/槽摘除 → 绑新 tabId → 入队（queued，并发有空位才跑，不抢活跃任务）
-  migrateTaskToTab(d, hostTabId);
+  // 迁移到宿主 tab 并入队（queued → 并发有空位才跑）；手动重试 = 新尝试周期（计数清零）
+  migrateTaskToTab(d, hostTabId, true);
   persist();
   broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
   maybeDispatch();
   sendResponse({ ok: true, downloadId: d.id });
   log('info', `[重试] ${taskLabel(d.id)} 由 tab${d.tabId} 接管续传（分片保留，跳过已下载批次）`);
 }
-
-function migrateTaskToTab(d, hostTabId) {
-  const oldQ = state.tabQueues[d.tabId];
-  if (oldQ) {
-    const i = oldQ.indexOf(d.id);
-    if (i >= 0) oldQ.splice(i, 1);
-  }
-  if (state.tabActive[d.tabId] === d.id) state.tabActive[d.tabId] = null;
-  d.tabId = hostTabId;
-  if (!state.tabQueues[hostTabId]) state.tabQueues[hostTabId] = [];
-  if (!state.tabQueues[hostTabId].includes(d.id)) state.tabQueues[hostTabId].push(d.id);
-  d.status = 'queued';
-  d.error = null;
-  d.consecutiveFails = 0; // 手动重试 = 新的尝试周期（保留 createdAt 保持 FIFO 原位置）
-  d.stallCount = 0; // 停滞计数同样清零：手动重试是全新的尝试
-  d.retryCount = 0;
-}
-
 // ============ 删除已完成任务 → 关闭对应来源标签页 ============
 // 判据：tab 仍存在 + 该 tab 无存活任务。completed/failed/cancelled 不算存活
 //（failed 任务后续可走"重试智能接管"自动开/接管标签页续传，不依赖原 tab 活着）。
