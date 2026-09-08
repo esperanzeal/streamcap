@@ -103,8 +103,14 @@ async function retryExisting(msg, sendResponse) {
   // 卡过的原 tab 不作为候选（原地续传=继续卡，宁开新 tab 也不回）
   const notStalledOrig = t => !wasStalled || t.id !== origId;
 
-  // A) 无卡史任务：原 tab 活着 → 原地续传（零打扰默认，不探测不折腾）
-  if (!wasStalled && origId !== undefined && origId !== null && await pingTabLive(origId)) {
+  // A) 页面嗅探续传（popup forceHostTab）：用户就在当前活跃页操作，页面必然活着，
+  //    直接绑它续传——不走接管链（探测/负载均衡对刚刷新的页面是多余绕路，
+  //    且可能把任务绑到其他同源 tab 而非用户正在操作的这一个）。
+  if (msg.forceHostTab && msg.tabId !== undefined && msg.tabId !== null && await pingTabLive(msg.tabId)) {
+    hostTabId = msg.tabId;
+  }
+  // A2) 无卡史任务：原 tab 活着 → 原地续传（零打扰默认，不探测不折腾）
+  if (hostTabId === null && !wasStalled && origId !== undefined && origId !== null && await pingTabLive(origId)) {
     hostTabId = origId;
   }
 

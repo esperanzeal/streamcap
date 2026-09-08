@@ -12,6 +12,7 @@ const $$ = s => document.querySelectorAll(s);
 })();
 
 let currentPageUrl = '';
+let currentTabId = 0; // 当前激活标签页 id（续传时指定宿主用）
 let resFilter = 'all';
 
 function resolutionGroup(res) {
@@ -125,9 +126,12 @@ function renderList(data) {
               resolution: btn.dataset.res,
               pageUrl: currentPageUrl,
               pageTitle: data.pageTitle || pageFileName(),
-              // 续传：沿用原任务 id（OPFS 分片跳过）走重试智能接管；否则 force 新建重复任务
+              // 续传：沿用原任务 id（OPFS 分片跳过）；页面嗅探续传时用户就在当前页操作
+              // → forceHostTab 直接绑当前 tab（页面必然活，无需接管链绕路）
               retryId: retryable ? resp.existingId : undefined,
               force: retryable ? undefined : true,
+              forceHostTab: retryable ? true : undefined,
+              tabId: currentTabId || undefined,
             }, r2 => {
               if (r2?.ok) {
                 btn.textContent = retryable ? '✅ 已续传' : '✅ 已加入';
@@ -154,6 +158,7 @@ function esc(s) { return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>
 // 初始化：从标签页取 URL 和标题
 chrome.tabs.query({ active: true, currentWindow: true }, tabs => {
   currentPageUrl = tabs[0]?.url || '';
+  currentTabId = tabs[0]?.id || 0;
   chrome.runtime.sendMessage({ type: 'GET_M3U8S' }, data => {
     renderList(data || { videos: [], pageUrl: '' });
   });
