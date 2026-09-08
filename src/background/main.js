@@ -466,15 +466,25 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           // 退避期间用户可能已暂停/取消/重新调度该任务：只有仍处于 retrying
           // （未被用户干预）才自动重派，避免双派发
           if (d.status !== 'retrying') return;
-          // ★ 退避期间宿主 tab 已死（页面被关）：直接 failed，不入队空转重试
-          //   （死 tab 上重试必然失败，浪费退避+派发+一个下载周期，且占调度）
-          chrome.tabs.get(d.tabId, t => {
+          // ★ 退避期间宿主 tab 已死（页面被关）：不直接 fail——自动接管：找已开启的
+          //   活同源宿主等待续传（无人值守不开新页）；找不到才 failed。
+          //   计数保留（resetCounters=false）→ 自动重试上限持续累计，有界不无限。
+          chrome.tabs.get(d.tabId, async t => {
             if (chrome.runtime.lastError || !t) {
+              const hostId = await findHostForTask(d, { origId: d.tabId, openNewTab: false });
+              if (hostId !== null) {
+                migrateTaskToTab(d, hostId, false);
+                persist();
+                broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
+                log('warn', `[重试] ${taskLabel(d.id)} 宿主页面已关闭，迁移到 tab${hostId} 等待续传（计数保留）`);
+                maybeDispatch();
+                return;
+              }
               d.status = 'failed';
-              d.error = '页面已关闭，放弃自动重试（分片保留，可手动重试自动续传）';
+              d.error = '页面已关闭且无同源可用页面，放弃自动重试（分片保留，可手动重试自动续传）';
               persist();
               broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
-              log('warn', `[重试] ${taskLabel(d.id)} 宿主页面已关闭，放弃自动重试`);
+              log('warn', `[重试] ${taskLabel(d.id)} 宿主页面已关闭且无同源页面，放弃自动重试`);
               maybeDispatch();
               return;
             }
