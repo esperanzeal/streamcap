@@ -1,7 +1,7 @@
 // host.js — 任务宿主标签页选择与迁移（手动重试 + 自动接管共用）
 import { state } from './state.js';
 
-function pingTabLive(tabId) {
+export function pingTabLive(tabId) {
   if (tabId === undefined || tabId === null) return Promise.resolve(false);
   return new Promise(resolve => {
     try {
@@ -53,7 +53,7 @@ function probeHost(tabId, url) {
 //              → 自动开同源页承接；openNewTab=false（自动路径，无人值守）→ 返回 null
 // ③ needProbe（卡过任务）→ 候选逐个真实网络探测，不过换下一个
 // ④ 无卡史 + 原 tab 活 → 原地（零打扰）；卡过的原 tab 进排除集（宁接管/开新也不回）
-async function findHostForTask(d, { origId, pageUrlHint, openNewTab = true } = {}) {
+export async function findHostForTask(d, { origId, pageUrlHint, openNewTab = true } = {}) {
   const pageHint = pageUrlHint || d.pageUrl || d.referer || '';
   const orig = origId ?? d.tabId;
   const wasStalled = (d.stallCount || 0) > 0 || /停滞|无进度|无响应/.test(d.error || '');
@@ -110,7 +110,7 @@ async function findHostForTask(d, { origId, pageUrlHint, openNewTab = true } = {
   return null;
 }
 
-function migrateTaskToTab(d, hostTabId, resetCounters = true) {
+export function migrateTaskToTab(d, hostTabId, resetCounters = true) {
   const oldQ = state.tabQueues[d.tabId];
   if (oldQ) {
     const i = oldQ.indexOf(d.id);
