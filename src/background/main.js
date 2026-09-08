@@ -328,15 +328,17 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.type === 'DELETE_DOWNLOAD') {
     const d = state.downloads[msg.downloadId];
     if (d) {
-      const wasCompleted = d.status === 'completed'; // 删除前记录（completed → 关来源标签页）
+      // 终态任务（完成/失败/取消）删除 → 顺带关来源标签页（失败页大概率已死，
+      //   留着无用；完成的留着做同源宿主池直到用户清理——Q4 统一处理）
+      const wasFinal = d.status === 'completed' || d.status === 'failed' || d.status === 'cancelled';
       if (d.status === 'downloading') cancelDownload(msg.downloadId);
       delete state.downloads[msg.downloadId];
       persist();
       // 通知该任务所在页面清理其分片（任务已删，分片视为孤儿）
       chrome.tabs.sendMessage(d.tabId, { type: 'CLEANUP_OPFS', activeDownloadIds: Object.values(state.downloads).map(x => x.id) }).catch(() => {});
       broadcast({ type: 'DOWNLOAD_REMOVED', downloadId: msg.downloadId });
-      // 删除已完成任务 → 同步关闭其来源标签页（该 tab 无其他存活任务时才关）
-      if (wasCompleted) closeTabIfIdle(d.tabId);
+      // 终态删除 → 来源 tab 无存活任务才关（closeTabIfIdle 内部有保护）
+      if (wasFinal) closeTabIfIdle(d.tabId);
     }
     sendResponse({ ok: true });
     return true;
