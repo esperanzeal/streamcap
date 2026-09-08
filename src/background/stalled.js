@@ -2,6 +2,7 @@
 import { state, persist, broadcast, taskLabel } from './state.js';
 import { maybeDispatch, requeueToFront, requeueStalled } from './scheduler.js';
 import { log } from './log.js';
+import { findHostForTask, migrateTaskToTab } from './host.js';
 
 const KEEPALIVE_ALARM = 'vgp_keepalive';
 const CLEANUP_ALARM = 'vgp_cleanup';
@@ -38,6 +39,24 @@ function failTaskQuick(d, reason) {
   persist();
   broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
   log('warn', `[停滞] ${taskLabel(d.id)} ${reason}，标为失败不再重试`);
+}
+
+// 死宿主自动接管（停滞/超时共用，自动路径）：
+// 宿主 tab 已死 → 找**已开启**的活同源宿主（openNewTab=false，无人值守不开新页）；
+// 有 → 迁移等待续传（resetCounters=false 保留停滞计数 → 反复停滞最终 failed，有界）；
+// 无 → failed 丢 fail 队列。用户拍板：有活同源 tab 就等待不直接 fail。
+async function tryAutoAdopt(d, deadReason) {
+  const hostId = await findHostForTask(d, { origId: d.tabId, openNewTab: false });
+  if (hostId !== null) {
+    migrateTaskToTab(d, hostId, false); // 保留计数：换宿主尝试有界
+    d.error = `${deadReason}，已迁移到同源标签页等待续传`;
+    persist();
+    broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
+    log('warn', `[停滞] ${taskLabel(d.id)} ${deadReason}，迁移到 tab${hostId} 等待续传（计数保留）`);
+    return true;
+  }
+  failTaskQuick(d, `${deadReason}，且无同源可用页面`);
+  return false;
 }
 
 
@@ -122,10 +141,10 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
   for (const d of stalled) {
     // tabActive 归属校验：只有当前仍由本任务占用并发槽时才释放，避免误清该 tab 其他任务的槽
     if (state.tabActive[d.tabId] !== d.id) continue;
-    // ★ 宿主 tab 已死（关闭/冻结无响应）：直接 failed 丢 fail 队列，不再走
-    //   stopping 等待/重排循环——死 tab 上重排必然再卡，纯浪费时间且占槽。
+    // ★ 宿主 tab 已死（关闭/冻结无响应）：不再直接 fail——自动接管：找已开启的活
+    //   同源宿主等待续传（无人值守不开新页）；找不到才 failed（用户拍板）
     if (await hostTabDead(d)) {
-      failTaskQuick(d, '页面已关闭或无响应，停止重试');
+      await tryAutoAdopt(d, '页面已关闭或无响应');
       continue;
     }
     // 两阶段停止：先发 CANCEL 通知 content 停止下载循环，任务进入 stopping 状态
@@ -146,9 +165,10 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
   const now2 = Date.now();
   const stuck = Object.values(state.downloads).filter(d => d.status === 'stopping' && d.stopPendingAt && now2 - d.stopPendingAt > 30000);
   for (const d of stuck) {
-    // ★ 30s 无确认 = content 没收到/没处理 CANCEL → 宿主大概率已死 → 直接 failed 不再重排空转
+    // ★ 30s 无确认 = content 没收到/没处理 CANCEL → 宿主大概率已死 → 自动接管
+    //   （活同源宿主等待续传；无才 failed，计数保留有界）
     if (await hostTabDead(d)) {
-      failTaskQuick(d, '停止确认超时（页面无响应），放弃重试');
+      await tryAutoAdopt(d, '停止确认超时（页面无响应）');
       continue;
     }
     // 释放并发槽：stopping 一直占着槽（等待确认），超时兜底转 queued 时必须释放，
