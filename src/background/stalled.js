@@ -42,10 +42,20 @@ function failTaskQuick(d, reason) {
 }
 
 // 死宿主自动接管（停滞/超时共用，自动路径）：
-// 宿主 tab 已死 → 找**已开启**的活同源宿主（openNewTab=false，无人值守不开新页）；
-// 有 → 迁移等待续传（resetCounters=false 保留停滞计数 → 反复停滞最终 failed，有界）；
-// 无 → failed 丢 fail 队列。用户拍板：有活同源 tab 就等待不直接 fail。
+// 宿主 tab 已死 → 先立即让位（释放并发槽，找宿主可能要逐个 PING/探测耗时数秒，
+// 不能让停滞任务继续占槽拖累其他任务）→ 再找**已开启**的活同源宿主
+// （openNewTab=false，无人值守不开新页）；有 → 迁移等待续传（resetCounters=false
+// 保留停滞计数 → 反复停滞最终 failed，有界）；无 → failed 丢 fail 队列。
 async function tryAutoAdopt(d, deadReason) {
+  // ① 立即让位：释放并发槽 + 中间态（不入任何队列，宿主确定后再 migrate 入队）
+  if (state.tabActive[d.tabId] === d.id) state.tabActive[d.tabId] = null;
+  d.status = 'queued';
+  d.error = `${deadReason}，正在寻找同源标签页接管...`;
+  persist();
+  broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
+  maybeDispatch(); // 空出的并发槽立刻让给其他任务
+
+  // ② 慢慢找宿主（探测不阻塞调度）
   const hostId = await findHostForTask(d, { origId: d.tabId, openNewTab: false });
   if (hostId !== null) {
     migrateTaskToTab(d, hostId, false); // 保留计数：换宿主尝试有界
@@ -53,6 +63,7 @@ async function tryAutoAdopt(d, deadReason) {
     persist();
     broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
     log('warn', `[停滞] ${taskLabel(d.id)} ${deadReason}，迁移到 tab${hostId} 等待续传（计数保留）`);
+    maybeDispatch();
     return true;
   }
   failTaskQuick(d, `${deadReason}，且无同源可用页面`);
