@@ -102,40 +102,41 @@ async function retryExisting(msg, sendResponse) {
   const isSameOrigin = t => pageOrigin && t.url && originOf(t.url) === pageOrigin;
   // 卡过的原 tab 不作为候选（原地续传=继续卡，宁开新 tab 也不回）
   const notStalledOrig = t => !wasStalled || t.id !== origId;
-  // 命中候选（needProbe 时须真实探测通过才采用）
-  const adopt = async (t) => {
-    if (!notStalledOrig(t)) return false;
-    if (!needProbe) return true;
-    return probeHost(t.id, d.url);
-  };
 
   // A) 无卡史任务：原 tab 活着 → 原地续传（零打扰默认，不探测不折腾）
   if (!wasStalled && origId !== undefined && origId !== null && await pingTabLive(origId)) {
     hostTabId = origId;
   }
-  // B) 健康宿主：同源 tab 正在下载且 60s 内有进度（网络环境被证明能跑——最高优先级）
-  //    busy 也接管：入队等它当前任务完成即用它的网络环境
+
+  // ★ 候选负载：活动任务(1) + 排队任务数。排队任务(queued)不占 tabActive，
+  //   旧逻辑只看 tabActive → 已排队的 tab 仍显示"空闲" → 多个续传任务全堆
+  //   第一个 tab（用户实测：5 个任务全绑 tab1，其余 4 个 tab 空置排队等）。
+  //   选宿主按 (负载升序 → 正在下载健康优先)，且负载 < MAX_PER_TAB 才用——
+  //   让多个续传任务自动分散到不同同源 tab，不堆叠。
+  const MAX_PER_TAB = 2; // 每 tab：1 活动 + 1 排队（用户建议上限）
+  const tabLoad = tid => (state.tabActive[tid] ? 1 : 0) + (state.tabQueues[tid] ? state.tabQueues[tid].length : 0);
+
+  // B) 负载均衡选宿主：同源候选（无同源依据时用全部候选=sniffStore 源页）逐个
+  //    PING/adopt 后按负载排序，取负载最小的活候选（负载 < MAX_PER_TAB 才定）
+  let bestRanked = null; // 负载最小活候选（含满负荷），供新 tab 失败时兜底
   if (hostTabId === null) {
-    for (const t of cands.values()) {
-      if (isSameOrigin(t) && hostIsHealthy(t.id) && await adopt(t)) { hostTabId = t.id; break; }
+    const pool = [...cands.values()].filter(t => isSameOrigin(t));
+    const ranked = [];
+    for (const t of (pool.length ? pool : [...cands.values()])) {
+      if (!notStalledOrig(t)) continue;
+      if (!(await pingTabLive(t.id))) continue;
+      if (needProbe && !(await probeHost(t.id, d.url))) continue;
+      ranked.push({ t, load: tabLoad(t.id), healthy: hostIsHealthy(t.id) });
     }
+    ranked.sort((a, b) => (a.load - b.load) || ((b.healthy ? 1 : 0) - (a.healthy ? 1 : 0)));
+    bestRanked = ranked[0] || null;
+    if (bestRanked && bestRanked.load < MAX_PER_TAB) hostTabId = bestRanked.t.id;
   }
-  // C) 同源空闲活宿主（无任务、PING 通 → 立即跑）
-  if (hostTabId === null) {
-    for (const t of cands.values()) {
-      if (isSameOrigin(t) && !state.tabActive[t.id] && await pingTabLive(t.id) && await adopt(t)) { hostTabId = t.id; break; }
-    }
-  }
-  // D) sniffStore 反查的源页（URL 精确匹配）
-  if (hostTabId === null) {
-    for (const n of cands.keys()) {
-      if (await adopt({ id: n })) { hostTabId = n; break; }
-    }
-  }
-  // E) 自动开一个同源 tab（前台避免后台节流），等 content 注入就绪
-  //    卡过的任务：新开 tab 也探测一次，失败即关掉不留废页
-  if (hostTabId === null) {
-    if (pageUrlHint) {
+
+  // C) 自动开同源 tab 分散：宿主未定，或同源候选都已满负荷（负载 ≥ MAX_PER_TAB）
+  //    → 开新 tab 承接而不是继续堆叠到已满的 tab
+  if (hostTabId === null || (bestRanked && bestRanked.load >= MAX_PER_TAB)) {
+    if (pageUrlHint && hostTabId === null) {
       let opened = null;
       try {
         opened = await chrome.tabs.create({ url: pageUrlHint, active: true });
@@ -150,6 +151,12 @@ async function retryExisting(msg, sendResponse) {
         try { await chrome.tabs.remove(opened.id); } catch {} // 未就绪/探测失败：不留废 tab
       }
     }
+  }
+
+  // D) 兜底：开新 tab 不可用（无页面地址/未就绪）→ 用负载最小的活候选
+  //    （即便已满负荷也接受——排队总比失败强）
+  if (hostTabId === null && bestRanked) {
+    hostTabId = bestRanked.t.id;
   }
 
   if (hostTabId === null) {
