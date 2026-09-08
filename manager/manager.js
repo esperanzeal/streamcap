@@ -198,11 +198,16 @@ $('#btnPauseAll').addEventListener('click', () => {
 $('#btnResumeAll').addEventListener('click', () => {
   act({ type: 'RESUME_ALL' });
 });
-// 全部重试（失败/取消任务）：走 background 统一处理，保留进度续传，仅 failed/cancelled 生效
+// 全部重试（失败/取消任务）：逐个走接管链（原 tab 失效自动找同源宿主续传，可能耗时），
+// 完成后提示成功数
 $('#btnRetryAll').addEventListener('click', () => {
   const targets = Object.values(downloads).filter(d => d.status === 'failed' || d.status === 'cancelled');
   if (targets.length === 0) { alert('没有失败/取消的任务可重试'); return; }
-  act({ type: 'RETRY_FAILED' });
+  chrome.runtime.sendMessage({ type: 'RETRY_FAILED' }, resp => {
+    if (resp && resp.total !== undefined) {
+      alert(`已尝试接管 ${resp.total} 个任务，成功续传 ${resp.count} 个${resp.count < resp.total ? '（其余需手动处理）' : ''}`);
+    }
+  });
 });
 
 $('#btnClearFail').addEventListener('click', () => {

@@ -194,6 +194,7 @@ function migrateTaskToTab(d, hostTabId) {
   d.error = null;
   d.consecutiveFails = 0; // 手动重试 = 新的尝试周期（保留 createdAt 保持 FIFO 原位置）
   d.stallCount = 0; // 停滞计数同样清零：手动重试是全新的尝试
+  d.retryCount = 0;
 }
 
 // ============ 删除已完成任务 → 关闭对应来源标签页 ============
@@ -345,24 +346,27 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   // 手动暂停（paused）的任务不在范围内——用"全部继续"恢复
   if (msg.type === 'RETRY_FAILED') {
     const targets = Object.values(state.downloads).filter(d => d.status === 'failed' || d.status === 'cancelled');
-    for (const d of targets) {
-      d.status = 'queued';
-      d.error = null;
-      // 保留 done 进度 → OPFS 断点续传生效；仅 completed 类重下才归零（见 ENQUEUE retryId 分支）
-      d.consecutiveFails = 0;
-      d.retryCount = 0;
-      d.stallCount = 0; // 手动全部重试 = 新的尝试周期
-      if (!state.tabQueues[d.tabId]) state.tabQueues[d.tabId] = [];
-      if (!state.tabQueues[d.tabId].includes(d.id)) state.tabQueues[d.tabId].push(d.id);
-    }
-    if (targets.length > 0) {
-      persist();
-      targets.forEach(d => broadcast({ type: 'DOWNLOAD_UPDATE', download: d }));
-      log('info', `[重试] 全部重试：${targets.length} 个失败/取消任务重新入队`);
-    }
-    maybeDispatch();
-    sendResponse({ ok: true, count: targets.length });
-    return true;
+    if (targets.length === 0) { sendResponse({ ok: true, count: 0 }); return true; }
+    // ★ 全部重试必须逐个走接管链：失败任务的宿主 tab 基本已死（这就是它失败的原因），
+    //   原地放回原 tab 队列必然再次失败（"页面已关闭"）。逐个复用 ENQUEUE retryId 的
+    //   完整接管逻辑：原 tab PING → 负载均衡选同源宿主（自动分散，不堆叠）→ 续传。
+    //   串行执行保证负载均衡决策准确（并行会同时看到相同负载 → 又堆叠）。
+    (async () => {
+      let okCount = 0;
+      for (const d of targets) {
+        const r = await new Promise(resolve => {
+          retryExisting(
+            { retryId: d.id, tabId: d.tabId, pageUrl: d.pageUrl, pageTitle: d.pageTitle },
+            resp => resolve(resp || {})
+          );
+        });
+        if (r && r.ok) okCount++;
+      }
+      log('info', `[重试] 全部重试：${targets.length} 个失败/取消任务，成功接管续传 ${okCount} 个`);
+      maybeDispatch();
+      sendResponse({ ok: true, count: okCount, total: targets.length });
+    })();
+    return true; // 异步响应
   }
 
   // 获取所有下载
