@@ -6,6 +6,13 @@
   "description": "解决 NDM 无法下载的鉴权 m3u8：自动携带浏览器 Referer/Origin 鉴权，支持 AES-128 解密，多线程并行分片 + 断点续传",
   "permissions": ["webRequest", "webRequestBlocking", "storage", "tabs", "scripting", "contextMenus", "downloads", "declarativeNetRequest", "alarms"],
   "host_permissions": ["<all_urls>"],
+  "declarative_net_request": {
+    "rule_resources": [{
+      "id": "cors_fix",
+      "enabled": true,
+      "path": "cors_rules.json"
+    }]
+  },
   "background": {
     "service_worker": "src/background/main.js",
     "type": "module"

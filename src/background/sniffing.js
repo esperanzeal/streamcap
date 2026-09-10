@@ -161,9 +161,18 @@ chrome.webRequest.onHeadersReceived.addListener(
   (details) => {
     // 【诊断】所有响应都打日志，确认 listener 是否被调用（MV3 blocking 是否生效）
     log('debug', `[webReq] ${details.method} ${details.url.substring(0, 60)} → ${details.statusCode} initiator=${details.initiator || '?'}`);
-    const headers = details.responseHeaders;
-    // 页面 origin（请求发起者）：credentials: include 时 ACAO 必须是具体 origin 而非 *，
-    // 且必须有 Allow-Credentials: true，否则浏览器拒绝响应。
+    const headers = details.responseHeaders || [];
+    // ★ 常规视频 URL（.m3u8/.ts/.mp4/.m4s/.mpd/.flv + media）已由 manifest 的
+    //   declarativeNetRequest 静态规则（cors_rules.json）稳定注入 ACAO:*——
+    //   不依赖 SW 存活/webRequest blocking，Chrome 引擎原生执行。
+    //   这里只兜底 DNR 覆盖不到的（无后缀 CDN）：若服务器已返回原生 ACAO（非 "null"）
+    //   则信任服务器、绝不覆盖（曾因"无条件删除原生 ACAO 再注入"在 blocking 未生效时
+    //   把原生 CORS 也删掉 → 浏览器报 No ACAO）。
+    const existingACAO = headers.find(h => h.name.toLowerCase() === 'access-control-allow-origin');
+    if (existingACAO && existingACAO.value && existingACAO.value.trim().toLowerCase() !== 'null') {
+      return;
+    }
+    // 页面 origin（请求发起者）：非通配符 ACAO 需匹配页面 origin
     let origin = '';
     try {
       if (details.initiator) origin = new URL(details.initiator).origin;
