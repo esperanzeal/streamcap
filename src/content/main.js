@@ -5,7 +5,7 @@ window.VGP = window.VGP || {};
   const { log, startDownload, getAbortController, cancelReasons, cleanupOpfs, extractVideoSources, OPFS_PREFIX } = VGP;
 
   // 文件大小探测（popup 请求）：页面上下文发请求，浏览器自动带 Referer/Cookie，
-  // 从 content-range 解析总大小（部分站点 CDN 防盗链校验 Referer，background 发会 403）
+  // 从 content-range 解析总大小（部分 CDN 防盗链校验 Referer，background 发会 403）
   async function probeSize(url) {
     try {
       const r = await fetch(url, { headers: { Range: 'bytes=0-0' } });

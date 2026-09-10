@@ -38,7 +38,7 @@ export function storeVideos(tabId, urls, pageTitle) {
 // ============ 文件大小探测（MP4 直链用 Range 请求拿 Content-Range 总大小） ============
 // 只对 mp4 直链有意义（HLS/DASH 是分片流，playlist 大小不代表视频大小）。
 // 由视频页面的 content script 发请求：页面上下文浏览器自动带 Referer + Cookie，
-// 且 部分站点等 CDN 允许同源页面 fetch（播放分片就靠它）——background 的 fetch/DNR
+// 且部分 CDN 允许同源页面 fetch（播放分片就靠它）——background 的 fetch/DNR
 // 注入 Referer 都不可靠（forbidden header / DNR 不命中 background 请求）。
 async function fetchSize(url, tabId) {
   try {

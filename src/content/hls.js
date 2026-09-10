@@ -11,7 +11,7 @@ window.VGP = window.VGP || {};
       try {
         // ★ fetch 用浏览器默认参数（v3.1.4 验证可下）：不传 referrer/credentials，
         //   请求特征与页面播放器（hls.js/video 元素）一致。曾加 referrer: unsafe-url +
-        //   credentials: include（为 部分 CDN 类 CDN），但导致 某 Cloudflare 视频站 等 Cloudflare 站
+        //   credentials: include（为兼容某类 CDN），但导致部分 Cloudflare 站
         //   拦截"带完整 Referer + 跨域 cookie"的请求（页面能播、3.1.4 能下、v4 403）。
         //   跨域 CORS 由 webRequest 注入 ACAO 解决，无需请求侧特殊参数。
         const resp = await fetch(url, {

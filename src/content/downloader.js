@@ -92,7 +92,7 @@ window.VGP = window.VGP || {};
     if (document.hidden) showHiddenBanner();
 
     // ★ 阶段3 格式分流：MP4 直链走 Range 分块下载，DASH(mpd) 走分片下载（其余 m3u8 走下方分片下载）
-    // 优先用 background 传入的 format（部分站点等 URL 无 .mp4 后缀时靠 Content-Type 识别），
+    // 优先用 background 传入的 format（URL 无 .mp4 后缀时靠 Content-Type 识别），
     // 兜底用 URL 后缀判断
     const fmt = format || detectFormat(m3u8Url);
     if (fmt === 'mp4') {

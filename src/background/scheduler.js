@@ -3,17 +3,20 @@ import { state, persist, broadcast, taskLabel } from './state.js';
 import { log } from './log.js';
 import { detectFormat } from './formats.js';
 
+/**
+ * 弱指纹：origin + pathname + resolution（忽略 query —— 签名 URL 的时效参数每次不同）。
+ * 共用同一实现：enqueue 去重（下方）＋ main.js retryExisting 的"是否允许用新 URL 刷新任务"。
+ * - 纳入分辨率：同 pathname 靠 query 区分不同视频的站点（`/play?vid=A` ↔ `?vid=B`）不应被
+ *   误判为同一视频——误报比漏报严重（"续传"会下错内容），分辨率能挡掉一部分。
+ * - 同 pathname + 同分辨率的**不同视频**仍可能同指纹 → 续传入口必须展示原任务信息、
+ *   且只对"有进度（done>0）"的失败任务提供（见 popup 侧）。
+ */
+export function urlKey(u, res) {
+  try { const x = new URL(u); return x.origin + x.pathname + '|' + (res || ''); } catch { return u + '|' + (res || ''); }
+}
+
 export function enqueue(tabId, url, referer, resolution, pageUrl, pageTitle, force = false) {
   const { downloads, tabQueues } = state;
-  // 弱指纹：origin + pathname + resolution。
-  // - 忽略 query：签名 URL 的时效参数每次不同（保留 query 会让"重新嗅探"漏检重复）。
-  // - 纳入分辨率：同 pathname 靠 query 区分不同视频的站点（`/play?vid=A` ↔ `?vid=B`）
-  //   不应被误判为同一视频——误报比漏报严重（"续传"会下错内容），分辨率能挡掉一部分。
-  // - 即便如此，同 pathname + 同分辨率的**不同视频**仍可能同指纹 → 续传入口必须
-  //   展示原任务信息、且只对"有进度（done>0）"的失败任务提供（见 popup 侧）。
-  const urlKey = (u, res) => {
-    try { const x = new URL(u); return x.origin + x.pathname + '|' + (res || ''); } catch { return u + '|' + (res || ''); }
-  };
   // 重复检测：同一视频（弱指纹相同）已有未取消任务 → 除非 force 确认，否则拒绝入队
   const existing = Object.values(downloads).find(x => urlKey(x.url, x.resolution) === urlKey(url, resolution) && x.status !== 'cancelled');
   if (existing && !force) {
@@ -36,7 +39,7 @@ export function enqueue(tabId, url, referer, resolution, pageUrl, pageTitle, for
   // 重复检测：同一视频已在任务列表中 → 新任务加序号（(2)、(3)...），提醒用户任务重复
   const dupIndex = Object.values(downloads).filter(x => urlKey(x.url, x.resolution) === urlKey(url, resolution)).length + 1;
   // 格式：优先用 sniffStore 嗅探到的（onHeadersReceived 按 Content-Type 识别过，
-  // 部分站点等无 .mp4 后缀的签名 URL 也能正确标 mp4），兜底按 URL 后缀判断
+  // 无 .mp4 后缀的签名 URL 也能正确标 mp4），兜底按 URL 后缀判断
   const sniffed = state.sniffStore[tabId]?.videos?.find(v => v.url === url);
   const taskFormat = sniffed?.format || detectFormat(url);
   downloads[id] = {
@@ -103,7 +106,7 @@ async function dispatchTab(tabId, downloadId) {
     concurrency,
     referer: d.referer || '',
     pageTitle: d.pageTitle || '',
-    format: d.format, // 入队时的格式（部分站点等 URL 无 .mp4 后缀时靠 Content-Type 识别）
+    format: d.format, // 入队时的格式（URL 无 .mp4 后缀时靠 Content-Type 识别）
   };
 
   try {

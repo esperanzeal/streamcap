@@ -2,7 +2,7 @@
 // import 各模块时副作用即生效（webRequest/alarms/downloads 监听器注册）。
 import { state, persist, broadcast, taskLabel } from './state.js';
 import { log, getLogs, clearLogs, clearAllLogs } from './log.js';
-import { enqueue, maybeDispatch, pauseAll, resumeAll, pauseDownload, cancelDownload, prioritizeDownload, requeueToFront, requeueStalled } from './scheduler.js';
+import { enqueue, urlKey, maybeDispatch, pauseAll, resumeAll, pauseDownload, cancelDownload, prioritizeDownload, requeueToFront, requeueStalled } from './scheduler.js';
 import { storeVideos, openManager, fillSizes } from './sniffing.js';
 import { handleDownloadSignal, markLoaded, pendingDownloadSignals } from './signals.js';
 import { ensureKeepaliveAlarm, pingDeadTask } from './stalled.js';
@@ -13,6 +13,23 @@ import { pingTabLive, findHostForTask, migrateTaskToTab } from './host.js';
 // 宿主选择统一在 host.js findHostForTask：
 //   无卡史 + 原 tab 活 → 原地；否则负载均衡选活同源宿主（分散、满负荷排队等待不 fail）；
 //   无活宿主 → 手动路径自动开同源页承接。forceHostTab（页面续传）= 直接绑当前活跃页。
+// 用宿主页最新嗅探到的"同一视频"URL 刷新任务签名（签名/时效参数每次不同，旧 URL 会 403）。
+// sniffStore 由 content 在页面加载/播放时重新抓取，其 query 才是当前有效的。
+// 找不到同指纹条目、或指纹不同（弱指纹含分辨率）= 保持原 URL（保守：宁可失败也不混内容）。
+function refreshUrlFromSniff(d, hostTabId) {
+  const vids = state.sniffStore[hostTabId]?.videos || [];
+  if (!vids.length) return;
+  const mine = urlKey(d.url, d.resolution);
+  // ★ 取数组里**最靠前**的同指纹条目：storeVideos 用 unshift（按完整 URL 去重），越前 = 嗅探越新，
+  //   页面上每次播放/刷新都会把新签名排到最前。
+  //   不能排除 `v.url === d.url` 的条目——若最新那条恰好就是 d.url（如 popup 续传刚刷新过），
+  //   排除它会让 find 越过最新、取到更旧的签名覆盖回来（把好签名降级成旧的 → 又 403）。
+  const hit = vids.find(v => v.url && urlKey(v.url, v.resolution || d.resolution) === mine);
+  if (!hit || hit.url === d.url) return; // 已是最新签名：无需变更
+  log('info', `[重试] ${taskLabel(d.id)} 用宿主页最新嗅探 URL 刷新签名`);
+  d.url = hit.url;
+}
+
 async function retryExisting(msg, sendResponse) {
   const d = state.downloads[msg.retryId];
   if (!d) { sendResponse({ ok: false, error: '任务不存在' }); return; }
@@ -24,6 +41,22 @@ async function retryExisting(msg, sendResponse) {
   if (d.status === 'completed') {
     // 已完成任务重试 = 重新下载：分片已清理，进度归零
     d.done = 0; d.pct = 0; d.total = 0; d.fileName = '';
+  }
+
+  // ★ 续传必须用"调用方带来的新 URL"：签名 URL 会过期，若仍用任务里的旧 d.url，就会拿
+  //   过期签名再请求一次 403 → 续传必然失败（而 popup/README 引导的正是"重新嗅探 → 续传"）。
+  //   分片按 downloadId 复用、与 URL 无关，所以换 URL 不影响断点续传。
+  //   仅当弱指纹一致（同一视频）才替换；不同视频宁可沿用旧 URL 而失败，也不下错内容。
+  if (msg.url && msg.url !== d.url) {
+    if (urlKey(msg.url, msg.resolution || d.resolution) === urlKey(d.url, d.resolution)) {
+      log('info', `[重试] ${taskLabel(d.id)} 刷新为调用方提供的新 URL（旧签名可能已过期）`);
+      d.url = msg.url;
+      if (msg.referer) d.referer = msg.referer;
+      if (msg.pageUrl) d.pageUrl = msg.pageUrl;
+      if (msg.pageTitle) d.pageTitle = msg.pageTitle;
+    } else {
+      log('warn', `[重试] ${taskLabel(d.id)} 传入 URL 与原任务不是同一视频（指纹不同），沿用原 URL`);
+    }
   }
 
   // 即时反馈：接管可能耗时（逐个 PING/探测、自动开页轮询）→ 任务卡立刻显示"接管中"，
@@ -51,6 +84,11 @@ async function retryExisting(msg, sendResponse) {
       openNewTab: true, // 手动路径：失败是少数，无宿主时自动开同源页承接
     });
   }
+
+  // 宿主已定：manager「重试」这类调用方不带新 URL（也就没有刷新签名的机会），
+  // 用宿主页最新嗅探结果里的"同一视频"URL 兜底刷新。宿主页可能是本流程刚打开的，
+  // content 加载后即重新嗅探 → sniffStore 里的签名就是当前有效的。
+  if (hostTabId !== null) refreshUrlFromSniff(d, hostTabId);
 
   if (hostTabId === null) {
     // ★ 失败原因必须落到任务卡：manager 单任务/批量重试现在立即回 pending、
