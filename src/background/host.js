@@ -76,9 +76,21 @@ export async function findHostForTask(d, { origId, pageUrlHint, openNewTab = tru
     }
   }
   const isSameOrigin = t => pageOrigin && t.url && originOf(t.url) === pageOrigin;
-  // 优先同源池；无同源依据（页面地址缺失）时退到 sniffStore 源页池
-  const pool = [...cands.values()].filter(t => isSameOrigin(t) && t.id !== orig);
-  const source = pool.length ? pool : [...cands.values()].filter(t => t.id !== orig);
+  // 候选池必须有"依据"：① 页面 URL 与任务页面同源；② sniffStore 里确实记录过该任务 URL 的 tab。
+  // ★ 禁止退化为"任意其它 tab"（曾经如此）——不同源页面照样能跑下载（分片是绝对 URL），但：
+  //   ① OPFS 分片按 origin 隔离，跨源读不到旧分片 → 续传失效、从头重下；
+  //   ② 任务来源页与宿主页不一致，定位/回原页全乱；
+  //   ③ 需要站点 Referer/Cookie 鉴权的分片会 403。
+  //   用户实测：两个不同站的任务（各自页面已关）双双挂到"为第一个任务自动打开的那个页面"，
+  //   且都能下（其实是重新下）——就是踩了这条退路。无依据时应当走下面的"开任务自己的页面"。
+  const others = [...cands.values()].filter(t => t.id !== orig);
+  const sniffHas = t => {
+    const store = state.sniffStore[t.id];
+    return !!(store && Array.isArray(store.videos) && store.videos.some(v => v.url === d.url));
+  };
+  const sameOriginPool = others.filter(isSameOrigin);
+  const urlHitPool = others.filter(t => !isSameOrigin(t) && sniffHas(t));
+  const source = sameOriginPool.length ? sameOriginPool : urlHitPool;
   const tabLoad = tid => (state.tabActive[tid] ? 1 : 0) + (state.tabQueues[tid] ? state.tabQueues[tid].length : 0);
 
   // 活候选按 (负载升序 → 健康优先) 排序；needProbe 时从负载最小开始逐个探测
