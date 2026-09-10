@@ -4,8 +4,70 @@ window.VGP = window.VGP || {};
 (function (VGP) {
   const { log, startDownload, getAbortController, cancelReasons, cleanupOpfs, extractVideoSources, OPFS_PREFIX } = VGP;
 
+  // 文件大小探测（popup 请求）：页面上下文发请求，浏览器自动带 Referer/Cookie，
+  // 从 content-range 解析总大小（部分站点 CDN 防盗链校验 Referer，background 发会 403）
+  async function probeSize(url) {
+    try {
+      const r = await fetch(url, { headers: { Range: 'bytes=0-0' } });
+      if (r.status === 206) {
+        const cr = r.headers.get('content-range');
+        const m = cr && cr.match(/\/(\d+)$/);
+        return { size: m ? parseInt(m[1]) : null };
+      }
+      if (r.status === 200) {
+        const len = r.headers.get('content-length');
+        return { size: len ? parseInt(len) : null };
+      }
+      return { size: null };
+    } catch { return { size: null }; }
+  }
+  // 迁移前健康探测（background 重试接管用）：测本页面能否正常拉取该任务的媒体。
+  // 走真实下载路径（同页面 context/cookie），Range 1KB 轻量请求，8s 超时——
+  // 比 PING 可靠：页面活着但网络卡时 fetch 会挂/超时。
+  async function probeUrl(url) {
+    try {
+      const t0 = performance.now();
+      const r = await fetch(url, {
+        headers: { Range: 'bytes=0-1023' },
+        signal: AbortSignal.timeout(8000),
+      });
+      if (!r.ok) return { ok: false, status: r.status };
+      await r.arrayBuffer(); // Range 只回 1KB，读完即释放连接
+      return { ok: true, ms: Math.round(performance.now() - t0) };
+    } catch (e) {
+      return { ok: false, error: String((e && e.name) || e) };
+    }
+  }
+  // 清理孤儿分片：删除不属于任何活跃任务的分片（扩展启动/定时清理时兜底）
+  async function cleanupOrphans(activeDownloadIds) {
+    const active = new Set(activeDownloadIds || []);
+    const root = await navigator.storage.getDirectory();
+    let removed = 0;
+    for await (const [name] of root) {
+      if (!name.startsWith(OPFS_PREFIX)) continue;
+      if (name.startsWith(OPFS_PREFIX + 'dl_')) {
+        const m = name.match(/^vgp_dl_(\d+)_/);
+        if (!m || !active.has(Number(m[1]))) {
+          try { await root.removeEntry(name); removed++; } catch {}
+        }
+      } else if (name.startsWith(OPFS_PREFIX + 'meta_')) {
+        const m = name.match(/^vgp_meta_(\d+)\.json$/);
+        if (!m || !active.has(Number(m[1]))) {
+          try { await root.removeEntry(name); removed++; } catch {}
+        }
+      }
+    }
+    // 只在实际删了东西时打日志，避免 SW 重启刷屏（每次都广播一次清理）
+    if (removed > 0) log('info', `[清理] 删除孤儿分片 ${removed} 个`);
+    return removed;
+  }
+
   // ============ 消息处理 ============
-  chrome.runtime.onMessage.addListener(async (msg, sender, sendResponse) => {
+  // ★ 监听器必须是【非 async】函数：async 返回值是 Promise，Chrome 只认严格 === true
+  //   才保持消息通道；async + await 之后的 sendResponse 永远不会送达调用方
+  //   （曾导致 FETCH_SIZE 大小探测与 PROBE_URL 健康探测全部失效）。
+  //   异步分支改为调用 async helper + 同步 return true。
+  chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     if (msg.type === 'START_DOWNLOAD') {
       startDownload(msg.downloadId, msg.m3u8Url, msg.resumeFrom || 0, msg.concurrency || 4, msg.referer || '', msg.pageTitle || '', msg.format);
       sendResponse({ ok: true });
@@ -42,69 +104,19 @@ window.VGP = window.VGP || {};
       sendResponse({ ok: true });
       return;
     }
-    // 文件大小探测（popup 请求）：页面上下文发 Range 请求，浏览器自动带 Referer/Cookie，
-    // 从 content-range 解析总大小（部分站点等 CDN 防盗链校验 Referer，background 发会 403）
+    // 文件大小探测（popup 请求）：页面上下文发请求，浏览器自动带 Referer/Cookie
     if (msg.type === 'FETCH_SIZE') {
-      try {
-        const r = await fetch(msg.url, { headers: { Range: 'bytes=0-0' } });
-        if (r.status === 206) {
-          const cr = r.headers.get('content-range');
-          const m = cr && cr.match(/\/(\d+)$/);
-          sendResponse({ size: m ? parseInt(m[1]) : null });
-        } else if (r.status === 200) {
-          const len = r.headers.get('content-length');
-          sendResponse({ size: len ? parseInt(len) : null });
-        } else {
-          sendResponse({ size: null });
-        }
-      } catch {
-        sendResponse({ size: null });
-      }
-      return true; // 异步响应
+      probeSize(msg.url).then(sendResponse);
+      return true; // 异步响应（同步 return true 才保持通道）
     }
     // 清理孤儿分片：删除不属于任何活跃任务的分片（扩展启动/定时清理时兜底）
     if (msg.type === 'CLEANUP_OPFS') {
-      const active = new Set(msg.activeDownloadIds || []);
-      const root = await navigator.storage.getDirectory();
-      let removed = 0;
-      for await (const [name] of root) {
-        if (!name.startsWith(OPFS_PREFIX)) continue;
-        if (name.startsWith(OPFS_PREFIX + 'dl_')) {
-          const m = name.match(/^vgp_dl_(\d+)_/);
-          if (!m || !active.has(Number(m[1]))) {
-            try { await root.removeEntry(name); removed++; } catch {}
-          }
-        } else if (name.startsWith(OPFS_PREFIX + 'meta_')) {
-          const m = name.match(/^vgp_meta_(\d+)\.json$/);
-          if (!m || !active.has(Number(m[1]))) {
-            try { await root.removeEntry(name); removed++; } catch {}
-          }
-        }
-      }
-      // 只在实际删了东西时打日志，避免 SW 重启刷屏（每次都广播一次清理）
-      if (removed > 0) log('info', `[清理] 删除孤儿分片 ${removed} 个`);
-      sendResponse({ ok: true, removed });
-      return;
+      cleanupOrphans(msg.activeDownloadIds).then(removed => sendResponse({ ok: true, removed }));
+      return true; // 异步响应
     }
-    // 迁移前健康探测（background 重试接管用）：测本页面能否正常拉取该任务的媒体。
-    // 走真实下载路径（同页面 context/cookie/CORS 注入），Range 1KB 轻量请求，
-    // 8s 超时——比 PING 可靠：页面活着但网络卡时 fetch 会挂/超时。
+    // 迁移前健康探测（background 重试接管用）：测本页面能否正常拉取该任务的媒体
     if (msg.type === 'PROBE_URL') {
-      try {
-        const t0 = performance.now();
-        const r = await fetch(msg.url, {
-          headers: { Range: 'bytes=0-1023' },
-          signal: AbortSignal.timeout(8000),
-        });
-        if (!r.ok) {
-          sendResponse({ ok: false, status: r.status });
-          return true;
-        }
-        await r.arrayBuffer(); // Range 只回 1KB，读完即释放连接
-        sendResponse({ ok: true, ms: Math.round(performance.now() - t0) });
-      } catch (e) {
-        sendResponse({ ok: false, error: String((e && e.name) || e) });
-      }
+      probeUrl(msg.url).then(sendResponse);
       return true; // 异步响应
     }
   });

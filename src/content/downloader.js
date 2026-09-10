@@ -137,14 +137,30 @@ window.VGP = window.VGP || {};
 
       if (parsed.segments.length === 0) throw new Error('无分片');
 
+      // fMP4（EXT-X-MAP）：init 段必须拼在所有分片之前，否则下载产物无法播放。
+      // 体积小（几十~几百 KB），下载后驻留内存，合并时 prepend；续传时重新下载。
+      // 失败按普通错误上报（可重试），不带永久失败关键词。
+      let initBytes = null;
+      if (parsed.mapUrl) {
+        const r = await fetchWithRetry(parsed.mapUrl, 3, signal, refHeaders);
+        initBytes = new Uint8Array(await r.arrayBuffer());
+        // 落盘（dl_{id}_map.bin）：手动「合并导出」只能读 OPFS，若不落盘其产物会缺 init 无法播放
+        await opfsWrite(`dl_${downloadId}_map.bin`, initBytes);
+        log('info', `[${taskLabel}] fMP4 init 段就绪 (${initBytes.byteLength}B，已落盘供合并导出)`);
+      }
+
       const { keySegments, mediaSeq } = parseKeySegments(text, textBaseUrl);
       const keyCache = new Map(); // keyUrl → cryptoKey（懒加载，支持 key rotation）
-      if (keySegments.length > 0) {
-        log('info', `[${taskLabel}] AES-128 加密（${keySegments.length} 个 key 段），预取首个密钥...`);
-        const firstKey = keySegments[0];
+      // ★ 只统计/预取真正带密钥的段：METHOD=NONE（明文）与不支持的 method 段
+      //   keyUrl 为 null，直接取 keySegments[0] 会 fetchDecryptKey(null) → 请求 /null
+      //   → HTTP 404 → 命中永久失败正则，把合法清单误判为永久失败。
+      const encryptedSegs = keySegments.filter(k => k.keyUrl);
+      if (encryptedSegs.length > 0) {
+        log('info', `[${taskLabel}] AES-128 加密（${encryptedSegs.length} 个 key 段），预取首个密钥...`);
+        const firstKey = encryptedSegs[0];
         const keyBytes = await fetchDecryptKey(firstKey.keyUrl, signal);
         keyCache.set(firstKey.keyUrl, await crypto.subtle.importKey('raw', keyBytes, { name: 'AES-CBC' }, false, ['decrypt']));
-        if (keySegments.length > 1) log('info', `[${taskLabel}] 检测到 key rotation，其余密钥按需加载`);
+        if (encryptedSegs.length > 1) log('info', `[${taskLabel}] 检测到 key rotation，其余密钥按需加载`);
         log('success', `[${taskLabel}] 密钥就绪`);
       }
 
@@ -155,8 +171,9 @@ window.VGP = window.VGP || {};
       let meta = await loadMeta(downloadId);
       if (!meta || meta.totalSegments !== total) {
         // 新建元数据（或分片结构变了，重建）
-        meta = { downloadId, totalSegments: total, completedBatches: [], batchSize: 40 };
+        meta = { downloadId, totalSegments: total, completedBatches: [], batchSize: 40, kind: 'batch' };
         await saveMeta(downloadId, meta);
+        if (VGP.refreshMergeButton) VGP.refreshMergeButton(); // meta 已落盘 → 合并导出按钮即时出现
       } else if (resumeFrom > 0) {
         // 确保 meta 反映了之前的进度。
         // ⚠️ 注意：resumeFrom 是 background 最后收到的 done（可能是批次下载中途的 mini 值），
@@ -240,7 +257,8 @@ window.VGP = window.VGP || {};
               let segData = new Uint8Array(rawBuf);
               if (keySegments.length > 0) {
                 const ks = findKeyForSegment(keySegments, segStart + idx);
-                if (ks) {
+                // ks.keyUrl 为空 = 该区段 METHOD=NONE 或不支持的加密方式 → 明文保留
+                if (ks && ks.keyUrl) {
                   let ck = keyCache.get(ks.keyUrl);
                   if (!ck) {
                     const kb = await fetchDecryptKey(ks.keyUrl, signal);
@@ -288,7 +306,8 @@ window.VGP = window.VGP || {};
             let segData = new Uint8Array(rawBuf);
             if (keySegments.length > 0) {
               const ks = findKeyForSegment(keySegments, segStart + i);
-              if (ks) {
+              // ks.keyUrl 为空 = 该区段 METHOD=NONE 或不支持的加密方式 → 明文保留
+              if (ks && ks.keyUrl) {
                 let ck = keyCache.get(ks.keyUrl);
                 if (!ck) {
                   const kb = await fetchDecryptKey(ks.keyUrl, signal);
@@ -333,11 +352,15 @@ window.VGP = window.VGP || {};
       log('info', `[${taskLabel}] 下载完成，总大小 ${(totalBytes / 1024 / 1024).toFixed(1)}MB，开始合并...`);
       reportProgress(downloadId, 98, total, total, '合并中...');
 
+      // ★ 用 OPFS 文件的 File 对象（磁盘支撑）组装 Blob，而不是把全部数据读回
+      //   ArrayBuffer——大文件时后者会把整个视频堆进 JS 堆（P0-5：80GB 级必崩）
       const allBlobs = [];
+      // fMP4：init 段（EXT-X-MAP）必须在所有分片之前，否则产物无法播放
+      if (initBytes) allBlobs.push(new Blob([initBytes]));
       for (let b = 0; b < totalBatches; b++) {
-        const buf = await opfsRead(`dl_${downloadId}_batch_${b}.blob`);
-        if (!buf) throw new Error(`批次 ${b} 缓存丢失`);
-        allBlobs.push(new Blob([buf]));
+        const f = await VGP.opfsGetFile(`dl_${downloadId}_batch_${b}.blob`);
+        if (!f) throw new Error(`批次 ${b} 缓存丢失`);
+        allBlobs.push(f);
       }
 
       const finalBlob = new Blob(allBlobs, { type: 'video/mp4' });
@@ -403,8 +426,9 @@ window.VGP = window.VGP || {};
       // 3. 断点元数据（块级续传，复用 HLS meta 结构）
       let meta = await loadMeta(downloadId);
       if (!meta || meta.totalSegments !== totalBlocks) {
-        meta = { downloadId, totalSegments: totalBlocks, completedBatches: [], batchSize: 1 };
+        meta = { downloadId, totalSegments: totalBlocks, completedBatches: [], batchSize: 1, kind: 'block' };
         await saveMeta(downloadId, meta);
+        if (VGP.refreshMergeButton) VGP.refreshMergeButton(); // meta 已落盘 → 合并导出按钮即时出现
       }
       const completed = new Set(meta.completedBatches);
       const CONCURRENCY = concurrency || 4;
@@ -452,9 +476,10 @@ window.VGP = window.VGP || {};
       reportProgress(downloadId, 98, totalBlocks, totalBlocks, '合并中...');
       const chunks = [];
       for (let b = 0; b < totalBlocks; b++) {
-        const buf = await opfsRead(`dl_${downloadId}_block_${b}.bin`);
-        if (!buf) throw new Error(`分块 ${b} 缓存丢失`);
-        chunks.push(new Blob([buf]));
+        // 磁盘支撑的 File（不读回 JS 堆）——大文件合并的内存友好路径（P0-5）
+        const f = await VGP.opfsGetFile(`dl_${downloadId}_block_${b}.bin`);
+        if (!f) throw new Error(`分块 ${b} 缓存丢失`);
+        chunks.push(f);
       }
       const finalBlob = new Blob(chunks, { type: 'video/mp4' });
       log('success', `[${taskLabel}] 合并完成: ${(finalBlob.size / 1024 / 1024).toFixed(1)}MB`);
@@ -499,9 +524,10 @@ window.VGP = window.VGP || {};
 
       // 合并 → blob → DOWNLOAD_BLOB
       reportProgress(downloadId, 98, received, 0, '合并中...');
-      const buf = await opfsRead(`dl_${downloadId}_block_0.bin`);
-      if (!buf) throw new Error('缓存丢失');
-      exportBlob(downloadId, new Blob([buf], { type: 'video/mp4' }), pageTitle, taskLabel);
+      // 用磁盘支撑的 File 组装 Blob（不读回 JS 堆）——与分块/batch/seg 路径一致
+      const streamFile = await VGP.opfsGetFile(`dl_${downloadId}_block_0.bin`);
+      if (!streamFile) throw new Error('缓存丢失');
+      exportBlob(downloadId, new Blob([streamFile], { type: 'video/mp4' }), pageTitle, taskLabel);
       removeAbortController(downloadId);
       runningDownloads.delete(downloadId);
       stopHeartbeat(downloadId);
@@ -584,8 +610,9 @@ window.VGP = window.VGP || {};
       // 5. 断点元数据 + 下载（init 段 [0] + media 段 [1..]）
       let meta = await loadMeta(downloadId);
       if (!meta || meta.totalSegments !== totalItems) {
-        meta = { downloadId, totalSegments: totalItems, completedBatches: [], batchSize: 1 };
+        meta = { downloadId, totalSegments: totalItems, completedBatches: [], batchSize: 1, kind: 'seg' };
         await saveMeta(downloadId, meta);
+        if (VGP.refreshMergeButton) VGP.refreshMergeButton(); // meta 已落盘 → 合并导出按钮即时出现
       }
       const completed = new Set(meta.completedBatches);
       const CONCURRENCY = concurrency || 4;
@@ -622,9 +649,10 @@ window.VGP = window.VGP || {};
       reportProgress(downloadId, 98, totalItems, totalItems, '合并中...');
       const parts = [];
       for (let i = 0; i < totalItems; i++) {
-        const buf = await opfsRead(`dl_${downloadId}_seg_${i}.bin`);
-        if (!buf) throw new Error(`段 ${i} 缓存丢失`);
-        parts.push(new Blob([buf]));
+        // 磁盘支撑的 File（不读回 JS 堆）——大文件合并的内存友好路径（P0-5）
+        const f = await VGP.opfsGetFile(`dl_${downloadId}_seg_${i}.bin`);
+        if (!f) throw new Error(`段 ${i} 缓存丢失`);
+        parts.push(f);
       }
       const finalBlob = new Blob(parts, { type: 'video/mp4' });
       log('success', `[${taskLabel}] 合并完成: ${(finalBlob.size / 1024 / 1024).toFixed(1)}MB`);
@@ -662,8 +690,10 @@ window.VGP = window.VGP || {};
 
   // ============ 公共 helper（四路下载路径共用，消除复制粘贴） ============
 
-  // 统一永久错误判定：404/解析失败/无分片等重试无意义 → 直接失败
-  const PERMANENT_PATTERN = /404|永久错误|无分片|无法获取文件大小|mpd 解析失败|未找到视频轨|无 Representation|无 SegmentTemplate|无法计算分片数|无 init 段 URL/;
+  // 统一永久错误判定：404/解析失败/无分片等重试无意义 → 直接失败。
+  // 注意 404 必须限定为 HTTP 状态文案：错误信息里常带分片 URL（路径可能含 "404"），
+  // 裸 /404/ 会把合法路径误判为永久失败。
+  const PERMANENT_PATTERN = /HTTP 404|404 Not Found|永久错误|无分片|无法获取文件大小|mpd 解析失败|未找到视频轨|无 Representation|无 SegmentTemplate|无法计算分片数|无 init 段 URL/;
 
   // 节流上报模板：每 15s 报一次（setInterval 每 5s 检查），getProgress 返回 { pct, done, total, speed? }
   function startThrottle(downloadId, getProgress) {
@@ -694,7 +724,14 @@ window.VGP = window.VGP || {};
           if (a.parentNode) a.parentNode.removeChild(a);
           try { URL.revokeObjectURL(blobUrl); } catch {}
           VGP.cleanupOpfs(downloadId);
-          chrome.runtime.sendMessage({ type: 'DOWNLOAD_ERROR', downloadId, error: '已通过页面 a.click() 触发下载，分片已清理', permanent: true }).catch(() => {});
+          // a.click() 回退：文件很可能已进入下载目录（浏览器下载器之外的路径扩展无法追踪）
+          // → 标为已完成并附提示，而不是 failed（旧行为让用户以为失败而重复下载）
+          chrome.runtime.sendMessage({
+            type: 'DOWNLOAD_FALLBACK_DONE',
+            downloadId,
+            fileName: filename,
+            note: '已通过页面触发下载（扩展无法追踪该路径），请检查浏览器下载目录确认文件',
+          }).catch(() => {});
         }, 60000);
       }
     });

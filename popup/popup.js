@@ -24,13 +24,14 @@ function resolutionGroup(res) {
     if (h >= 1080) return '1080p';
     if (h >= 720) return '720p';
   }
-  // 也匹配 WxH 格式
+  // 也匹配 WxH 格式：用【宽度】判定清晰度——竖屏 720x1080 应归 720p 而非 1080p
+  //（与 guessResolution "保留原始 WxH 不做 p 换算避免竖屏误导"的意图一致）
   const m2 = res.match(/(\d{3,4})x(\d{3,4})/i);
   if (m2) {
-    const h = parseInt(m2[2]);
-    if (h >= 2160) return '4K';
-    if (h >= 1080) return '1080p';
-    if (h >= 720) return '720p';
+    const w = parseInt(m2[1]);
+    if (w >= 2160) return '4K';
+    if (w >= 1080) return '1080p';
+    if (w >= 720) return '720p';
   }
   return 'other';
 }
@@ -110,14 +111,21 @@ function renderList(data) {
         if (resp?.ok) {
           btn.textContent = '✅ 已加入';
         } else if (resp?.duplicate) {
-          // 该 URL 已在任务列表：failed/paused → 提供"续传"（沿用原任务 id 断点续传，
-          // 走重试智能接管自动找宿主 tab）；其他状态 → 询问是否强制重复下载（默认拒绝）
+          // 弱指纹命中（可能误判：同 pathname 的不同视频）。展示原任务关键信息供用户判断；
+          // 续传入口只给"失败/暂停且有实际进度"的任务，其余走"重复下载？"确认
           const st = resp.existingStatus || '?';
-          const retryable = st === 'failed' || st === 'cancelled' || st === 'paused';
           const pctTxt = resp.existingPct != null ? `（已下载 ${Math.round(resp.existingPct)}%）` : '';
-          const force = confirm(retryable
-            ? `检测到同一视频的${st === 'paused' ? '已暂停' : st === 'cancelled' ? '已取消' : '失败'}任务${pctTxt}，分片已保留，可直接续传不重复下载。\n\n续传该任务？`
-            : `该视频已在下载任务列表中（状态：${st}${pctTxt}）。\n\n确定要重复下载一份吗？`);
+          const stTxt = st === 'paused' ? '已暂停' : st === 'cancelled' ? '已取消' : st === 'failed' ? '失败' : st;
+          // 原任务信息：分辨率 + URL 末段（含 query 片段）+ 创建时间——用户据此判断是否同一视频
+          let tail = String(resp.existingUrl || '(无 URL)');
+          try { const x = new URL(resp.existingUrl); tail = (x.pathname.split('/').filter(Boolean).pop() || x.pathname) + x.search.slice(0, 24); } catch { /* 保持原样 */ }
+          const when = resp.existingCreatedAt ? new Date(resp.existingCreatedAt).toLocaleString() : '?';
+          const info = `原任务：${resp.existingResolution || '?'} · ${tail}\n创建于 ${when}`;
+          const hasProgress = (resp.existingDone || 0) > 0;
+          const canResume = (st === 'failed' || st === 'paused') && hasProgress;
+          const force = confirm(canResume
+            ? `检测到可能相同的任务（${stTxt}${pctTxt}），分片已保留。\n\n${info}\n\n是同一个视频 → 确定续传（不重复下载）\n不是同一个 → 取消后可先删掉原任务再下载`
+            : `该视频已有任务在列表中（状态：${stTxt}${pctTxt}）。\n\n${info}\n\n确定要重复下载一份吗？`);
           if (force) {
             chrome.runtime.sendMessage({
               type: 'ENQUEUE',
@@ -128,16 +136,16 @@ function renderList(data) {
               pageTitle: data.pageTitle || pageFileName(),
               // 续传：沿用原任务 id（OPFS 分片跳过）；页面嗅探续传时用户就在当前页操作
               // → forceHostTab 直接绑当前 tab（页面必然活，无需接管链绕路）
-              retryId: retryable ? resp.existingId : undefined,
-              force: retryable ? undefined : true,
-              forceHostTab: retryable ? true : undefined,
+              retryId: canResume ? resp.existingId : undefined,
+              force: canResume ? undefined : true,
+              forceHostTab: canResume ? true : undefined,
               tabId: currentTabId || undefined,
             }, r2 => {
               if (r2?.ok) {
-                btn.textContent = retryable ? '✅ 已续传' : '✅ 已加入';
+                btn.textContent = canResume ? '✅ 已续传' : '✅ 已加入';
               } else {
                 // 续传也可能失败（如找不到宿主页），提示用户去下载管理点重试
-                if (retryable && r2 && r2.ok === false) alert(r2.error || '续传失败，请到下载管理点「重试」');
+                if (canResume && r2 && r2.ok === false) alert(r2.error || '续传失败，请到下载管理点「重试」');
                 btn.disabled = false;
               }
             });

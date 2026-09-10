@@ -26,6 +26,12 @@ async function retryExisting(msg, sendResponse) {
     d.done = 0; d.pct = 0; d.total = 0; d.fileName = '';
   }
 
+  // 即时反馈：接管可能耗时（逐个 PING/探测、自动开页轮询）→ 任务卡立刻显示"接管中"，
+  // 用户不会以为按钮没反应而重复点击（后续成功/失败会再 broadcast 覆盖该文案）
+  d.error = '正在寻找同源标签页接管...';
+  persist();
+  broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
+
   // 宿主查找的页面依据：msg.pageUrl（调用方实时提供，popup/页面续传=用户当前页）
   // → 任务持久化 pageUrl → referer（旧数据兜底）
   const pageUrlHint = msg.pageUrl || d.pageUrl || d.referer || '';
@@ -47,12 +53,16 @@ async function retryExisting(msg, sendResponse) {
   }
 
   if (hostTabId === null) {
-    sendResponse({
-      ok: false,
-      error: pageUrlHint
-        ? '找不到可用的同源页面（候选均无法拉取媒体），请稍后重试或在原视频网站页面重试'
-        : '任务缺少来源页面信息，请打开原视频网站页面后到下载管理点「重试」（续传可保留进度）',
-    });
+    // ★ 失败原因必须落到任务卡：manager 单任务/批量重试现在立即回 pending、
+    //   丢弃后续响应——若不写回，卡片会永久停在"正在寻找同源标签页接管..."
+    //   （语义错误 + 用户看不到真实原因，等于另一种静默失败）
+    const reason = pageUrlHint
+      ? '找不到可用的同源页面（候选均无法拉取媒体），请稍后重试或在原视频网站页面重试'
+      : '任务缺少来源页面信息，请打开原视频网站页面后到下载管理点「重试」（续传可保留进度）';
+    d.error = reason;
+    persist();
+    broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
+    sendResponse({ ok: false, error: reason });
     return;
   }
 
@@ -126,7 +136,15 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     if (msg.retryId && state.downloads[msg.retryId]) {
       // 重试：智能接管宿主 tab（原 tab 存活零打扰；失效则同源接管或自动开 tab），
       // 同 downloadId 入队 → OPFS 断点续传跳过已下载批次，进度不浪费
-      retryExisting(msg, sendResponse);
+      if (msg.forceHostTab) {
+        // 页面嗅探续传：只做一次 PING 就绑定，很快 → 保持同步返回结果（popup 需即时反馈）
+        retryExisting(msg, sendResponse);
+      } else {
+        // manager 单任务重试：可能耗时（逐个探测/自动开新页 ≤30s+）→ 立即回 pending
+        // 不让 UI 干等（也避免用户以为没反应而重复点击）；结果经任务卡状态更新呈现
+        sendResponse({ ok: true, pending: true });
+        retryExisting(msg, () => {});
+      }
       return true; // 异步响应
     } else {
       // 新下载：用当前 active tab
@@ -135,8 +153,13 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         if (!tabId) { sendResponse({ ok: false, error: '无法获取标签页' }); return; }
         const r = enqueue(tabId, msg.url, msg.referer, msg.resolution, msg.pageUrl, msg.pageTitle, msg.force === true);
         if (!r.ok && r.duplicate) {
-          // 重复 URL：返回重复状态，由发起方（popup/页面）弹确认框
-          sendResponse({ ok: false, duplicate: true, existingId: r.existingId, existingStatus: r.existingStatus, existingPct: r.existingPct, url: msg.url });
+          // 重复（弱指纹命中）：回传原任务详情，由发起方（popup/页面）弹确认框展示给用户判断
+          sendResponse({
+            ok: false, duplicate: true, url: msg.url,
+            existingId: r.existingId, existingStatus: r.existingStatus, existingPct: r.existingPct,
+            existingUrl: r.existingUrl, existingResolution: r.existingResolution,
+            existingCreatedAt: r.existingCreatedAt, existingDone: r.existingDone,
+          });
         } else {
           sendResponse({ ok: true, downloadId: r.downloadId });
         }
@@ -211,11 +234,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true;
   }
 
-  // 全部重试：仅针对失败/取消任务，原地重置状态重新入队（保留进度续传）
-  // 手动暂停（paused）的任务不在范围内——用"全部继续"恢复
+  // 全部重试：逐个走接管链（探测/开页可能耗时几十秒）→ 立即回 pending，
+  // 不让 manager 干等；每个任务的状态变化会 broadcast 更新到任务卡
   if (msg.type === 'RETRY_FAILED') {
     const targets = Object.values(state.downloads).filter(d => d.status === 'failed' || d.status === 'cancelled');
     if (targets.length === 0) { sendResponse({ ok: true, count: 0 }); return true; }
+    sendResponse({ ok: true, pending: true, total: targets.length });
     // ★ 全部重试必须逐个走接管链：失败任务的宿主 tab 基本已死（这就是它失败的原因），
     //   原地放回原 tab 队列必然再次失败（"页面已关闭"）。逐个复用 ENQUEUE retryId 的
     //   完整接管逻辑：原 tab PING → 负载均衡选同源宿主（自动分散，不堆叠）→ 续传。
@@ -233,9 +257,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       }
       log('info', `[重试] 全部重试：${targets.length} 个失败/取消任务，成功接管续传 ${okCount} 个`);
       maybeDispatch();
-      sendResponse({ ok: true, count: okCount, total: targets.length });
     })();
-    return true; // 异步响应
+    return true; // 已即时响应（pending），无需再回
   }
 
   // 获取所有下载
@@ -391,6 +414,26 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     const d = state.downloads[msg.downloadId];
     if (d) d.lastPing = Date.now();
     return;
+  }
+
+  // 页面 a.click() 回退路径完成通知：文件很可能已进下载目录（Chrome 下载器之外的
+  // 路径扩展无法追踪）→ 标为已完成并附提示，而不是 failed（旧行为误导用户重复下载）
+  if (msg.type === 'DOWNLOAD_FALLBACK_DONE') {
+    const d = state.downloads[msg.downloadId];
+    if (d) {
+      d.status = 'completed';
+      d.pct = 100;
+      d.fileName = msg.fileName || d.fileName || '';
+      d.speed = '';
+      d.error = msg.note || '已通过页面触发下载（请检查浏览器下载目录确认）';
+      state.tabActive[d.tabId] = null;
+      persist();
+      broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
+      log('warn', `[导出] ${taskLabel(d.id)} ${d.error}`);
+      maybeDispatch();
+    }
+    sendResponse({ ok: true });
+    return true;
   }
 
   if (msg.type === 'DOWNLOAD_ERROR') {

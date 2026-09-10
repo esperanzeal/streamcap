@@ -128,7 +128,8 @@ function render() {
         if (d.status === 'completed') {
           if (!confirm(`该任务已完成，重新下载将清空进度从头开始（约 ${(d.total || 0)} 个分片），确定？`)) return;
         }
-        // 带响应：原标签页已失效时后台会自动找同源页面接管或新开标签页续传；彻底失败则提示
+        // 带响应：后台可能耗时（找同源宿主/探测/开新页）→ 立即回 pending，
+        // 任务卡会显示"正在寻找同源标签页接管..."并在完成后更新；彻底失败也会体现在卡片
         chrome.runtime.sendMessage({ type: 'ENQUEUE', tabId: d.tabId, url: d.url, referer: d.referer, resolution: d.resolution, pageUrl: d.pageUrl, pageTitle: d.pageTitle, retryId: d.id }, resp => {
           if (resp && resp.ok === false) alert(resp.error || '重试失败，请稍后再试');
         });
@@ -204,7 +205,9 @@ $('#btnRetryAll').addEventListener('click', () => {
   const targets = Object.values(downloads).filter(d => d.status === 'failed' || d.status === 'cancelled');
   if (targets.length === 0) { alert('没有失败/取消的任务可重试'); return; }
   chrome.runtime.sendMessage({ type: 'RETRY_FAILED' }, resp => {
-    if (resp && resp.total !== undefined) {
+    if (resp && resp.pending) {
+      alert(`已开始逐个接管 ${resp.total} 个失败任务\n（找宿主/自动开标签页可能需要几十秒，进度见任务列表）`);
+    } else if (resp && resp.total !== undefined) {
       alert(`已尝试接管 ${resp.total} 个任务，成功续传 ${resp.count} 个${resp.count < resp.total ? '（其余需手动处理）' : ''}`);
     }
   });

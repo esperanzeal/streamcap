@@ -7,7 +7,8 @@
       "responseHeaders": [
         { "header": "Access-Control-Allow-Origin", "operation": "set", "value": "*" },
         { "header": "Access-Control-Allow-Methods", "operation": "set", "value": "GET, HEAD, OPTIONS" },
-        { "header": "Access-Control-Allow-Headers", "operation": "set", "value": "*" }
+        { "header": "Access-Control-Allow-Headers", "operation": "set", "value": "*" },
+        { "header": "Access-Control-Expose-Headers", "operation": "set", "value": "Content-Range, Content-Length, ETag, Accept-Ranges" }
       ]
     },
     "condition": { "resourceTypes": ["media"] }
@@ -20,7 +21,8 @@
       "responseHeaders": [
         { "header": "Access-Control-Allow-Origin", "operation": "set", "value": "*" },
         { "header": "Access-Control-Allow-Methods", "operation": "set", "value": "GET, HEAD, OPTIONS" },
-        { "header": "Access-Control-Allow-Headers", "operation": "set", "value": "*" }
+        { "header": "Access-Control-Allow-Headers", "operation": "set", "value": "*" },
+        { "header": "Access-Control-Expose-Headers", "operation": "set", "value": "Content-Range, Content-Length, ETag, Accept-Ranges" }
       ]
     },
     "condition": { "urlFilter": "*.m3u8", "resourceTypes": ["xmlhttprequest", "other"] }
@@ -33,7 +35,8 @@
       "responseHeaders": [
         { "header": "Access-Control-Allow-Origin", "operation": "set", "value": "*" },
         { "header": "Access-Control-Allow-Methods", "operation": "set", "value": "GET, HEAD, OPTIONS" },
-        { "header": "Access-Control-Allow-Headers", "operation": "set", "value": "*" }
+        { "header": "Access-Control-Allow-Headers", "operation": "set", "value": "*" },
+        { "header": "Access-Control-Expose-Headers", "operation": "set", "value": "Content-Range, Content-Length, ETag, Accept-Ranges" }
       ]
     },
     "condition": { "urlFilter": "*.ts", "resourceTypes": ["xmlhttprequest", "other"] }
@@ -46,7 +49,8 @@
       "responseHeaders": [
         { "header": "Access-Control-Allow-Origin", "operation": "set", "value": "*" },
         { "header": "Access-Control-Allow-Methods", "operation": "set", "value": "GET, HEAD, OPTIONS" },
-        { "header": "Access-Control-Allow-Headers", "operation": "set", "value": "*" }
+        { "header": "Access-Control-Allow-Headers", "operation": "set", "value": "*" },
+        { "header": "Access-Control-Expose-Headers", "operation": "set", "value": "Content-Range, Content-Length, ETag, Accept-Ranges" }
       ]
     },
     "condition": { "urlFilter": "*.mp4", "resourceTypes": ["xmlhttprequest", "other"] }
@@ -59,7 +63,8 @@
       "responseHeaders": [
         { "header": "Access-Control-Allow-Origin", "operation": "set", "value": "*" },
         { "header": "Access-Control-Allow-Methods", "operation": "set", "value": "GET, HEAD, OPTIONS" },
-        { "header": "Access-Control-Allow-Headers", "operation": "set", "value": "*" }
+        { "header": "Access-Control-Allow-Headers", "operation": "set", "value": "*" },
+        { "header": "Access-Control-Expose-Headers", "operation": "set", "value": "Content-Range, Content-Length, ETag, Accept-Ranges" }
       ]
     },
     "condition": { "urlFilter": "*.m4s", "resourceTypes": ["xmlhttprequest", "other"] }
@@ -72,7 +77,8 @@
       "responseHeaders": [
         { "header": "Access-Control-Allow-Origin", "operation": "set", "value": "*" },
         { "header": "Access-Control-Allow-Methods", "operation": "set", "value": "GET, HEAD, OPTIONS" },
-        { "header": "Access-Control-Allow-Headers", "operation": "set", "value": "*" }
+        { "header": "Access-Control-Allow-Headers", "operation": "set", "value": "*" },
+        { "header": "Access-Control-Expose-Headers", "operation": "set", "value": "Content-Range, Content-Length, ETag, Accept-Ranges" }
       ]
     },
     "condition": { "urlFilter": "*.mpd", "resourceTypes": ["xmlhttprequest", "other"] }
@@ -85,7 +91,8 @@
       "responseHeaders": [
         { "header": "Access-Control-Allow-Origin", "operation": "set", "value": "*" },
         { "header": "Access-Control-Allow-Methods", "operation": "set", "value": "GET, HEAD, OPTIONS" },
-        { "header": "Access-Control-Allow-Headers", "operation": "set", "value": "*" }
+        { "header": "Access-Control-Allow-Headers", "operation": "set", "value": "*" },
+        { "header": "Access-Control-Expose-Headers", "operation": "set", "value": "Content-Range, Content-Length, ETag, Accept-Ranges" }
       ]
     },
     "condition": { "urlFilter": "*.flv", "resourceTypes": ["xmlhttprequest", "other"] }

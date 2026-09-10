@@ -20,6 +20,16 @@ window.VGP = window.VGP || {};
     } catch { return null; }
   }
 
+  // 取 OPFS 文件的 File 对象（磁盘支撑，不进 JS 堆）：
+  // 大文件合并导出用它组装 Blob，避免把全部数据读回内存（P0-5）
+  async function opfsGetFile(name) {
+    try {
+      const root = await navigator.storage.getDirectory();
+      const fh = await root.getFileHandle(OPFS_PREFIX + name, { create: false });
+      return await fh.getFile();
+    } catch { return null; }
+  }
+
   async function opfsDelete(name) {
     const root = await navigator.storage.getDirectory();
     try { await root.removeEntry(OPFS_PREFIX + name); } catch {}
@@ -65,6 +75,7 @@ window.VGP = window.VGP || {};
   VGP.OPFS_PREFIX = OPFS_PREFIX;
   VGP.opfsWrite = opfsWrite;
   VGP.opfsRead = opfsRead;
+  VGP.opfsGetFile = opfsGetFile;
   VGP.opfsDelete = opfsDelete;
   VGP.opfsList = opfsList;
   VGP.saveMeta = saveMeta;

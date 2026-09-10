@@ -58,7 +58,9 @@ export async function fillSizes(store, tabId) {
     const chunk = need.slice(i, i + 3);
     await Promise.all(chunk.map(async e => {
       const size = await fetchSize(e.url, tabId);
-      e.size = size || null; // null 显示"—"（页面关闭/获取失败）
+      // 仅成功拿到数值才写入；失败保持 undefined → 下次打开 popup 会重试
+      //（原实现写 null 后固定显示 "—" 且通过 size===undefined 判断不再重试）
+      if (typeof size === 'number' && size > 0) e.size = size;
     }));
   }
 }
@@ -151,60 +153,14 @@ chrome.webRequest.onHeadersReceived.addListener(
   ['responseHeaders']
 );
 
-// ============ 视频响应注入 CORS 头 ============
-// 部分无扩展名 CDN 等无扩展名 CDN（/stream?t=）不返回 Access-Control-Allow-Origin，
-// 页面上下文 content fetch 被 CORS 拦截（Failed to fetch）。cors_rules.json 只按
-// URL 扩展名（.mp4/.ts/.m4s）注入，覆盖不到这类。这里按响应 Content-Type 兜底：
-// 任何视频流响应（video/*、mpegurl、dash+xml 或 URL 后缀是视频格式）都注入 CORS 头。
-const VIDEO_CT = ['video/', 'application/vnd.apple.mpegurl', 'application/x-mpegurl', 'audio/mpegurl', 'application/dash+xml'];
-chrome.webRequest.onHeadersReceived.addListener(
-  (details) => {
-    // 【诊断】所有响应都打日志，确认 listener 是否被调用（MV3 blocking 是否生效）
-    log('debug', `[webReq] ${details.method} ${details.url.substring(0, 60)} → ${details.statusCode} initiator=${details.initiator || '?'}`);
-    const headers = details.responseHeaders || [];
-    // ★ 常规视频 URL（.m3u8/.ts/.mp4/.m4s/.mpd/.flv + media）已由 manifest 的
-    //   declarativeNetRequest 静态规则（cors_rules.json）稳定注入 ACAO:*——
-    //   不依赖 SW 存活/webRequest blocking，Chrome 引擎原生执行。
-    //   这里只兜底 DNR 覆盖不到的（无后缀 CDN）：若服务器已返回原生 ACAO（非 "null"）
-    //   则信任服务器、绝不覆盖（曾因"无条件删除原生 ACAO 再注入"在 blocking 未生效时
-    //   把原生 CORS 也删掉 → 浏览器报 No ACAO）。
-    const existingACAO = headers.find(h => h.name.toLowerCase() === 'access-control-allow-origin');
-    if (existingACAO && existingACAO.value && existingACAO.value.trim().toLowerCase() !== 'null') {
-      return;
-    }
-    // 页面 origin（请求发起者）：非通配符 ACAO 需匹配页面 origin
-    let origin = '';
-    try {
-      if (details.initiator) origin = new URL(details.initiator).origin;
-    } catch {}
-    const allowOrigin = origin || '*';
-    const corsHeaders = [
-      { name: 'Access-Control-Allow-Origin', value: allowOrigin },
-      { name: 'Access-Control-Allow-Credentials', value: 'true' },
-    ];
-    // preflight OPTIONS：Range 头不在 CORS safelist，带 Range 的 fetch 先发 OPTIONS 预检
-    if (details.method === 'OPTIONS') {
-      // 强制覆盖：去掉服务器可能返回的 ACAO（可能无 Allow-Credentials）
-      const filtered = headers.filter(h => h.name.toLowerCase() !== 'access-control-allow-origin' && h.name.toLowerCase() !== 'access-control-allow-credentials');
-      filtered.push(...corsHeaders);
-      filtered.push({ name: 'Access-Control-Allow-Methods', value: 'GET, HEAD, OPTIONS' });
-      filtered.push({ name: 'Access-Control-Allow-Headers', value: 'Range, Referer, Content-Type' });
-      log('debug', `[CORS注入] OPTIONS ${details.url.substring(0, 60)} → ${allowOrigin}（${details.statusCode}）`);
-      return { responseHeaders: filtered };
-    }
-    // 视频响应：强制覆盖 ACAO（服务器自带的可能无 Allow-Credentials）
-    const ct = headers.find(h => h.name.toLowerCase() === 'content-type');
-    const v = (ct?.value || '').toLowerCase();
-    const isVideo = VIDEO_CT.some(p => v.includes(p)) || detectFormat(details.url) !== 'unknown';
-    if (!isVideo) return;
-    const filtered = headers.filter(h => h.name.toLowerCase() !== 'access-control-allow-origin' && h.name.toLowerCase() !== 'access-control-allow-credentials');
-    filtered.push(...corsHeaders);
-    log('debug', `[CORS注入] ${details.url.substring(0, 60)} → ${allowOrigin}（${details.statusCode}, CT=${v || '?'}）`);
-    return { responseHeaders: filtered };
-  },
-  { urls: ['<all_urls>'] },
-  ['blocking', 'responseHeaders']
-);
+// ============ 无后缀 CDN 的 CORS 兜底（已移除） ============
+// 曾用 webRequest blocking 注入兜底无扩展名 CDN（/stream?t=）的 CORS 头，但 MV3 下
+// webRequestBlocking 仅对强制安装（policy）的扩展可用——开发者模式加载时报
+// "'webRequestBlocking' requires manifest version of 2 or lower."，该 listener
+// 从未生效（且若注册抛错会中断本文件顶层，导致后面的 tabs.onRemoved/onUpdated
+// 监听器不注册 → 关页清理失效）。CORS 现改由 manifest 的 declarativeNetRequest
+// 静态规则（cors_rules.json）稳定注入，不依赖 SW/blocking。
+// 能力边界：无后缀 CDN（URL 无媒体扩展名）DNR 按 urlFilter 覆盖不到，不支持。
 
 chrome.tabs.onRemoved.addListener((tabId) => {
   delete state.sniffStore[tabId];

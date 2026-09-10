@@ -49,6 +49,7 @@ window.VGP = window.VGP || {};
     const lines = text.split('\n').map(l => l.trim());
     const segments = [], variantUrls = [];
     let isMaster = false;
+    let mapUrl = null; // fMP4：EXT-X-MAP 的 init 段（须拼在所有分片之前）
     for (let i = 0; i < lines.length; i++) {
       const line = lines[i];
       if (!line || line === '#EXTM3U') continue;
@@ -59,10 +60,16 @@ window.VGP = window.VGP || {};
           if (n && !n.startsWith('#')) { variantUrls.push(resolveUrl(n, baseUrl)); break; }
         }
       }
+      if (line.startsWith('#EXT-X-MAP')) {
+        // fMP4 init 段：URI="init.mp4"（属性顺序自由，单独提取 URI）
+        const m = line.match(/URI="([^"]+)"/);
+        if (m) mapUrl = resolveUrl(m[1], baseUrl);
+        continue;
+      }
       if (line.startsWith('#')) continue;
       segments.push(resolveUrl(line, baseUrl));
     }
-    return { segments, isMaster, variantUrls };
+    return { segments, isMaster, variantUrls, mapUrl };
   }
 
   function selectBestVariant(text) {
@@ -96,14 +103,37 @@ window.VGP = window.VGP || {};
       const line = lines[i];
 
       if (line.startsWith('#EXT-X-KEY')) {
-        const m = line.match(/METHOD=AES-128,URI="([^"]+)"(?:,IV=(0x[0-9a-fA-F]+))?/);
-        if (m) {
-          const keyUrl = resolveUrl(m[1], baseUrl);
-          const ivHex = m[2] || null;
+        // ★ 按逗号切分属性键值对解析：HLS 规范属性顺序自由
+        //   （IV 在 URI 前同样合法），不能依赖固定顺序正则匹配——否则该段密钥
+        //   丢失、分片按密文拼接 → 静默产出损坏文件且状态显示"已完成"。
+        const attrs = {};
+        const body = line.slice(line.indexOf(':') + 1);
+        for (const part of body.split(',')) {
+          const eq = part.indexOf('=');
+          if (eq < 0) continue;
+          const k = part.slice(0, eq).trim().toUpperCase();
+          let v = part.slice(eq + 1).trim();
+          if (v.startsWith('"') && v.endsWith('"')) v = v.slice(1, -1);
+          attrs[k] = v;
+        }
+        const method = (attrs.METHOD || '').toUpperCase();
+        if (method === 'AES-128' && attrs.URI) {
+          const keyUrl = resolveUrl(attrs.URI, baseUrl);
+          const ivHex = attrs.IV || null;
           if (!currentKeyInfo || currentKeyInfo.keyUrl !== keyUrl || currentKeyInfo.ivHex !== ivHex) {
             currentKeyInfo = { segStartIndex: segIndex, keyUrl, ivHex };
             keySegments.push(currentKeyInfo);
           }
+        } else if (method === 'NONE') {
+          // METHOD=NONE：后续分片为明文 → 显式清除当前密钥段
+          //   （若不处理会沿用上一个 key 去解密明文 → 产出垃圾）
+          currentKeyInfo = null;
+          keySegments.push({ segStartIndex: segIndex, keyUrl: null, ivHex: null });
+        } else {
+          // 其他 method（SAMPLE-AES 等）不支持：同样显式清除密钥，
+          //   避免用错 key 解出损坏数据（分片将按原样保留，至少不假装"已解密"）
+          currentKeyInfo = null;
+          keySegments.push({ segStartIndex: segIndex, keyUrl: null, ivHex: null });
         }
         continue;
       }

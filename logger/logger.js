@@ -24,12 +24,18 @@ function load() {
 }
 
 function render() {
-  $('count').textContent = `${curDate} · ${lines.length} 条`;
-  if (lines.length === 0) {
-    $('lines').innerHTML = '<div class="empty">📭 当天暂无日志</div>';
+  // 关键字筛选（视图级；导出仍导出当天全量）
+  const kwEl = $('filter');
+  const kw = kwEl ? (kwEl.value || '').trim() : '';
+  const shown = kw ? lines.filter(l => l.includes(kw)) : lines;
+  $('count').textContent = `${curDate} · ${shown.length}${kw ? ' / ' + lines.length : ''} 条`;
+  if (shown.length === 0) {
+    $('lines').innerHTML = kw
+      ? `<div class="empty">🔍 无匹配「${esc(kw)}」的记录</div>`
+      : '<div class="empty">📭 当天暂无日志</div>';
     return;
   }
-  $('lines').innerHTML = lines.map(l => {
+  $('lines').innerHTML = shown.map(l => {
     const m = l.match(/\[(\w+)\]/);
     const cls = m ? 'l-' + m[1].toLowerCase() : 'l-info';
     return `<span class="${cls}">${esc(l)}</span>\n`;
@@ -67,5 +73,10 @@ $('btnClearAll').addEventListener('click', () => {
     if (c) c.textContent = `${curDate} · 0 条`;
   });
 });
+
+// 关键字筛选：视图级过滤（导出仍导出当天全量）。带存在性判断——
+// 若 html/js 版本不同步（如扩展未重载）也不会让本文件后续代码中断（曾导致整页卡"加载中"）
+const filterEl = $('filter');
+if (filterEl) filterEl.addEventListener('input', render);
 
 load();

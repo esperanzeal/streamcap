@@ -21,17 +21,51 @@ window.VGP = window.VGP || {};
     }
   }
 
-  async function initMergeButton() {
-    const s = await chrome.storage.local.get('vgp_settings');
-    ensureMergeButton((s.vgp_settings || {}).mergeButton !== false);
+  // 该站 OPFS 是否存在本扩展的分片（vgp_meta_*）：没有分片时不显示按钮，
+  // 避免在所有无关网站右下角常驻悬浮按钮（骚扰 + 误点）
+  async function hasLocalShards() {
+    try {
+      const root = await navigator.storage.getDirectory();
+      for await (const [name] of root) {
+        if (name.startsWith(OPFS_PREFIX + 'meta_')) return true;
+      }
+    } catch { /* OPFS 不可用 */ }
+    return false;
   }
 
-  // 开关变化 → 已打开的页面实时显示/隐藏按钮
+  async function refreshMergeButton() {
+    const s = await chrome.storage.local.get('vgp_settings');
+    const enabled = (s.vgp_settings || {}).mergeButton !== false;
+    const show = enabled && await hasLocalShards();
+    ensureMergeButton(show);
+    // 有分片才开轮询（跟踪新增/清空），分片清空后停掉——避免定时器长期空转
+    if (show) startPolling();
+    else stopPolling();
+    return show;
+  }
+  VGP.refreshMergeButton = refreshMergeButton; // meta 落盘后由 downloader 触发即时显示
+
+  // 开关变化 → 重算显示
   chrome.storage.onChanged.addListener((changes, area) => {
-    if (area === 'local' && changes.vgp_settings && changes.vgp_settings.newValue) {
-      ensureMergeButton(changes.vgp_settings.newValue.mergeButton !== false);
-    }
+    if (area === 'local' && changes.vgp_settings) refreshMergeButton();
   });
+
+  // 条件轮询：仅在本页确有分片（= 这个站正在用本扩展下载）期间运行
+  let pollTimer = null;
+  function startPolling() {
+    if (pollTimer) return;
+    pollTimer = setInterval(() => { if (!document.hidden) refreshMergeButton(); }, 20000);
+  }
+  function stopPolling() {
+    if (!pollTimer) return;
+    clearInterval(pollTimer);
+    pollTimer = null;
+  }
+  document.addEventListener('visibilitychange', () => { if (!document.hidden && pollTimer) refreshMergeButton(); });
+
+  async function initMergeButton() {
+    await refreshMergeButton();
+  }
 
   function taskDisplayName(d) {
     try {
@@ -84,7 +118,25 @@ window.VGP = window.VGP || {};
       alert('读取分片元数据失败，分片可能已被清理。');
       return;
     }
-    const totalBatches = Math.ceil(meta.totalSegments / (meta.batchSize || 40));
+    const unitSize = meta.batchSize || 40;
+    const totalBatches = Math.ceil(meta.totalSegments / unitSize);
+    // 分片命名按格式：HLS 批 `batch_*.blob`、MP4 块 `block_*.bin`、DASH 段 `seg_*.bin`。
+    // 新 meta 带 kind 字段；旧 meta 无 kind → 探测实际存在的命名（按 unit 0 试读）。
+    const nameFor = (k, i) => OPFS_PREFIX + (k === 'batch' ? `dl_${d.id}_batch_${i}.blob`
+      : k === 'block' ? `dl_${d.id}_block_${i}.bin`
+      : `dl_${d.id}_seg_${i}.bin`);
+    let kind = meta.kind;
+    if (kind !== 'batch' && kind !== 'block' && kind !== 'seg') {
+      kind = 'batch';
+      for (const k of ['block', 'seg']) {
+        try { await root.getFileHandle(nameFor(k, 0)); kind = k; break; } catch { /* 试下一个 */ }
+      }
+    }
+
+    // fMP4 的 init 段（EXT-X-MAP）：下载时已落盘为 dl_{id}_map.bin。
+    // 手动合并必须把它拼在**所有分片之前**，否则产物无法播放（自动导出路径同样前置）。
+    let mapFile = null;
+    try { mapFile = await (await root.getFileHandle(OPFS_PREFIX + `dl_${d.id}_map.bin`)).getFile(); } catch {}
 
     let handle;
     try {
@@ -103,7 +155,7 @@ window.VGP = window.VGP || {};
       let lastErr;
       for (let attempt = 0; attempt < 3; attempt++) {
         try {
-          const f = await (await root.getFileHandle(OPFS_PREFIX + `dl_${d.id}_batch_${i}.blob`)).getFile();
+          const f = await (await root.getFileHandle(nameFor(kind, i))).getFile();
           return await f.arrayBuffer();
         } catch (e) {
           lastErr = e;
@@ -127,6 +179,7 @@ window.VGP = window.VGP || {};
       alert(`缺少 ${missing.length} 个批次（如 ${missing[0] + 1} 等）。先到下载管理对该任务点"继续/重试"补齐分片后再合并。`);
       return;
     }
+    if (mapFile) totalBytes += mapFile.size; // fMP4 init 段也计入总量（进度/校验）
 
     const writable = await handle.createWritable();
     let wrote = 0;
@@ -134,6 +187,11 @@ window.VGP = window.VGP || {};
     const t0 = Date.now();
     const fmt = b => (b / 1024 / 1024 / 1024).toFixed(1) + 'GB';
     try {
+      // fMP4：init 段必须写在所有分片之前（否则产物无法播放）
+      if (mapFile) {
+        await writable.write(await mapFile.arrayBuffer());
+        wrote += mapFile.size;
+      }
       for (let i = 0; i < totalBatches; i++) {
         currentBatch = i;
         const buf = await readBatch(i);

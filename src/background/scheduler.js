@@ -5,20 +5,36 @@ import { detectFormat } from './formats.js';
 
 export function enqueue(tabId, url, referer, resolution, pageUrl, pageTitle, force = false) {
   const { downloads, tabQueues } = state;
-  // 重复检测：同一 URL 已有未取消任务 → 除非 force 确认，否则拒绝入队
-  const existing = Object.values(downloads).find(x => x.url === url && x.status !== 'cancelled');
+  // 弱指纹：origin + pathname + resolution。
+  // - 忽略 query：签名 URL 的时效参数每次不同（保留 query 会让"重新嗅探"漏检重复）。
+  // - 纳入分辨率：同 pathname 靠 query 区分不同视频的站点（`/play?vid=A` ↔ `?vid=B`）
+  //   不应被误判为同一视频——误报比漏报严重（"续传"会下错内容），分辨率能挡掉一部分。
+  // - 即便如此，同 pathname + 同分辨率的**不同视频**仍可能同指纹 → 续传入口必须
+  //   展示原任务信息、且只对"有进度（done>0）"的失败任务提供（见 popup 侧）。
+  const urlKey = (u, res) => {
+    try { const x = new URL(u); return x.origin + x.pathname + '|' + (res || ''); } catch { return u + '|' + (res || ''); }
+  };
+  // 重复检测：同一视频（弱指纹相同）已有未取消任务 → 除非 force 确认，否则拒绝入队
+  const existing = Object.values(downloads).find(x => urlKey(x.url, x.resolution) === urlKey(url, resolution) && x.status !== 'cancelled');
   if (existing && !force) {
-    return { ok: false, duplicate: true, existingId: existing.id, existingStatus: existing.status, existingPct: existing.pct };
+    // 一并回传原任务的关键信息：弱指纹可能把"同 pathname 的不同视频"判成同一视频，
+    // 由调用方（popup）展示给用户判断，避免"续传"下错内容
+    return {
+      ok: false, duplicate: true,
+      existingId: existing.id, existingStatus: existing.status, existingPct: existing.pct,
+      existingUrl: existing.url, existingResolution: existing.resolution,
+      existingCreatedAt: existing.createdAt, existingDone: existing.done,
+    };
   }
-  // force 双保险：2s 内同 URL 只允许 force 入队一次（防双击/重发绕过 UI 禁用产生重复任务）
+  // force 双保险：2s 内同视频只允许 force 入队一次（防双击/重发绕过 UI 禁用产生重复任务）
   if (force && existing) {
     if (existing.createdAt && Date.now() - existing.createdAt < 2000) {
-      return { ok: false, error: '该 URL 刚加入过，已忽略重复请求' };
+      return { ok: false, error: '该视频刚加入过，已忽略重复请求' };
     }
   }
   const id = state.nextId++;
-  // 重复检测：同一 URL 已在任务列表中 → 新任务加序号（(2)、(3)...），提醒用户任务重复
-  const dupIndex = Object.values(downloads).filter(x => x.url === url).length + 1;
+  // 重复检测：同一视频已在任务列表中 → 新任务加序号（(2)、(3)...），提醒用户任务重复
+  const dupIndex = Object.values(downloads).filter(x => urlKey(x.url, x.resolution) === urlKey(url, resolution)).length + 1;
   // 格式：优先用 sniffStore 嗅探到的（onHeadersReceived 按 Content-Type 识别过，
   // 部分站点等无 .mp4 后缀的签名 URL 也能正确标 mp4），兜底按 URL 后缀判断
   const sniffed = state.sniffStore[tabId]?.videos?.find(v => v.url === url);
@@ -49,11 +65,16 @@ export function enqueue(tabId, url, referer, resolution, pageUrl, pageTitle, for
 async function dispatchTab(tabId, downloadId) {
   const d = state.downloads[downloadId];
   if (!d) return;
-  // ★ tab 有效性预检：页面已关闭/无效的任务直接标 failed，不尝试注入——
+  // ★ 同步占位（必须在第一个 await 之前）：maybeDispatch 的 for 循环是同步的、
+  //   且不 await dispatchTab——若 tabActive 等到 await chrome.tabs.get 之后才写，
+  //   循环第二轮仍读到空值 → 同一 tab 被连发多个任务（违反"每 tab 至多 1 任务"）。
+  state.tabActive[tabId] = downloadId;
+  // tab 有效性预检：页面已关闭/无效的任务直接标 failed，不尝试注入——
   //   否则任务停留在 queued 永不派发，手动点开始才暴露"注入失败"。
   try {
     await chrome.tabs.get(tabId);
   } catch {
+    state.tabActive[tabId] = null; // 预检失败：释放同步占位，不占并发槽
     d.status = 'failed';
     d.error = '页面已关闭，无法下载';
     persist();
@@ -68,7 +89,6 @@ async function dispatchTab(tabId, downloadId) {
   d.lastProgressAt = Date.now(); // 派发即记"最后活跃"：启动/解析阶段计入宽限期，防误判停滞
   d.lastDone = 0; // 派发清零：progress done 从 0 开始计数，防旧值干扰停滞判定
   d.lastDoneAt = Date.now(); // done 增长的初始基准：派发即记，覆盖 m3u8 获取/解析/跳过批次的启动期
-  state.tabActive[tabId] = downloadId;
   persist();
   broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
 

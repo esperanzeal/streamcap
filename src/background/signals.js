@@ -72,7 +72,7 @@ export function handleDownloadSignal(delta) {
           if (chrome.runtime.lastError || itemId2 === undefined) {
             // 重试也失败：blob 可能已失效或页面已关
             d.status = 'failed';
-            d.error = `Chrome 下载中断(${errCode})，重试失败: ${chrome.runtime.lastError?.message || '未知'}`;
+            d.error = `Chrome 下载中断(${errCode})，重试失败: ${chrome.runtime.lastError?.message || '未知'}。大文件可直接用页面右下角「🗜️ 合并导出」流式保存（分片都在，不会丢）`;
             d.speed = '';
             state.tabActive[rec.tabId] = null;
             persist();
@@ -89,7 +89,7 @@ export function handleDownloadSignal(delta) {
         return;
       }
       d.status = 'failed';
-      d.error = `Chrome 下载中断(${errCode})，可在下载管理器点重试或点重试重新合并`;
+      d.error = `Chrome 下载中断(${errCode})，可在下载管理器点「重试」重新合并导出；大文件（易 OOM）直接用页面右下角「🗜️ 合并导出」流式保存（分片都在，不会丢）`;
       d.speed = '';
       state.tabActive[rec.tabId] = null;
       persist();
