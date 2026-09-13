@@ -326,6 +326,156 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true;
   }
 
+  // 日志查询 / 清空（logger 页用）
+  if (msg.type === 'GET_LOGS') {
+    getLogs(msg.date, lines => sendResponse({ lines }));
+    return true;
+  }
+  if (msg.type === 'CLEAR_LOGS') {
+    clearLogs(msg.date, () => sendResponse({ ok: true }));
+    return true;
+  }
+  if (msg.type === 'CLEAR_ALL_LOGS') {
+    clearAllLogs(() => sendResponse({ ok: true }));
+    return true;
+  }
+
+  // content script 请求：用 chrome.downloads 触发 blob 下载
+  // 不立即标完成——等 chrome.downloads.onChanged 的 complete/interrupted 信号
+  if (msg.type === 'DOWNLOAD_BLOB') {
+    const { downloadId, blobUrl, filename } = msg;
+    const tabId = sender.tab?.id;
+    chrome.downloads.download({
+      url: blobUrl,
+      filename,
+      saveAs: false,
+      conflictAction: 'uniquify',
+    }, (itemId) => {
+      if (chrome.runtime.lastError || itemId === undefined) {
+        // 触发失败：标记失败，不进入 exporting
+        const d = state.downloads[downloadId];
+        if (d) {
+          d.status = 'failed';
+          d.error = 'Chrome 下载触发失败: ' + (chrome.runtime.lastError?.message || '未知');
+          persist();
+          broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
+        }
+        log('error', `[导出] ${taskLabel(downloadId)} chrome.downloads 触发失败: ${chrome.runtime.lastError?.message || '未知'}`);
+        sendResponse({ ok: false });
+        return;
+      }
+      // 记录映射：Chrome 下载项 id ↔ 扩展任务（存 session，SW 重启不丢）
+      chrome.storage.session.get('blob_map', s => {
+        const m = s.blob_map || {};
+        m[itemId] = { downloadId, tabId, blobUrl, filename };
+        chrome.storage.session.set({ blob_map: m });
+      });
+      // 任务进入"导出中"：等待 Chrome 下载结果信号
+      const d = state.downloads[downloadId];
+      if (d) {
+        d.status = 'exporting';
+        d.pct = 99;
+        d.error = null;
+        d.speed = ''; // 清除"合并中..."等临时文案
+        persist();
+        broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
+      }
+      log('info', `[导出] ${taskLabel(downloadId)} → Chrome 下载项 #${itemId} 开始，文件名: ${filename}`);
+      sendResponse({ ok: true });
+    });
+    return true;
+  }
+
+  // content script 报告发现的 <video> 标签 URL
+  if (msg.type === 'REPORT_VIDEO') {
+    const tabId = sender.tab?.id;
+    if (!tabId) return;
+    storeVideos(tabId, msg.urls, msg.pageTitle || '');
+    return;
+  }
+
+  // popup/右键触发强制扫描：结果写入 sniffStore（供 popup GET_M3U8S 读取）
+  if (msg.type === 'SCAN_VIDEOS') {
+    const tabId = msg.tabId ?? sender.tab?.id;
+    if (!tabId) { sendResponse({ ok: false }); return; }
+    chrome.tabs.sendMessage(tabId, { type: 'SCAN_VIDEOS' }, (resp) => {
+      if (!chrome.runtime.lastError && resp?.urls) {
+        if (!state.sniffStore[tabId]) state.sniffStore[tabId] = { videos: [], pageUrl: '', pageTitle: '' };
+        if (!state.sniffStore[tabId].pageUrl && resp.pageUrl) state.sniffStore[tabId].pageUrl = resp.pageUrl;
+        storeVideos(tabId, resp.urls, resp.pageTitle || '');
+      }
+      // 等扫描结果写入后再响应，popup 才不会读到旧数据
+      sendResponse({ ok: true });
+    });
+    return true;
+  }
+
+  // content 进度上报
+  if (msg.type === 'PROGRESS') {
+    const d = state.downloads[msg.downloadId];
+    if (d) {
+      // 状态守卫：终态任务（已完成/已取消/已失败/导出中）忽略迟到的 PROGRESS，
+      // 防止泄漏定时器或 SW 重启前 content 的残留消息覆盖终态、刷新进度条异常
+      if (d.status === 'completed' || d.status === 'failed' || d.status === 'cancelled' ||
+          d.status === 'exporting') {
+        return;
+      }
+      // ★ 轻量活动上报（content 每次分片/分块请求尝试后都会发一次）：只刷新"最近有活动"，
+      //   绝不能落到下面的 pct/done 赋值——它的 msg.done 是 undefined，会把进度写成 undefined。
+      if (msg.activity && msg.done === undefined) {
+        d.lastActivityAt = Date.now();
+        return;
+      }
+      // ★ done 单调性保护：续传/重派时 content 的 totalDone 会从 0 重新涨，跳过已落盘批次时
+      // 上报的 done 远小于 background 已记录的 done（如跳过 batch 上报 40 < 已记录 600），
+      // 若直接覆盖会把进度条拉回旧位置 → 与后续新进度交替闪烁（旧位置↔新位置来回跳）。
+      // 这里忽略 done 回退（不覆盖 d.done/d.pct），但仍刷新 lastProgressAt：
+      // content 还在主动发 PROGRESS = 循环活着，不能被停滞判定误判为卡死。
+      if (typeof msg.done === 'number' && typeof d.done === 'number' && msg.done < d.done) {
+        d.lastProgressAt = Date.now();
+        return;
+      }
+      // done 增长检测：进度真正推进才刷新 lastDoneAt（停滞判定的依据之一）。
+      // 用旧 d.done 比较（在覆盖之前），msg.done > d.done 才算增长。
+      const progressed = typeof msg.done === 'number' && msg.done > (d.done || 0);
+      d.pct = msg.pct; d.done = msg.done; d.total = msg.total;
+      d.speed = msg.speed || '';
+      d.lastProgressAt = Date.now();
+      d.lastActivityAt = Date.now(); // 带 done 的上报同样是活动证据（与 lastDoneAt 分开记，语义不同）
+      d.lastDone = msg.done;
+      if (progressed) { d.lastDoneAt = Date.now(); d.reloadCount = 0; } // 有真实进展 → 重置"刷新复活"计数
+      broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
+    }
+    return;
+  }
+
+  // content 保活心跳：下载进行中每 10s 发一次，防止 SW 空闲 30s 被 Chrome 回收
+  // 注意：心跳≠进度，只说明 content 消息循环活着；下载是否推进看 lastDoneAt
+  if (msg.type === 'HEARTBEAT') {
+    const d = state.downloads[msg.downloadId];
+    if (d) d.lastPing = Date.now();
+    return;
+  }
+
+  // 页面 a.click() 回退路径完成通知：文件很可能已进下载目录（Chrome 下载器之外的
+  // 路径扩展无法追踪）→ 标为已完成并附提示，而不是 failed（旧行为误导用户重复下载）
+  if (msg.type === 'DOWNLOAD_FALLBACK_DONE') {
+    const d = state.downloads[msg.downloadId];
+    if (d) {
+      d.status = 'completed';
+      d.pct = 100;
+      d.fileName = msg.fileName || d.fileName || '';
+      d.speed = '';
+      d.error = msg.note || '已通过页面触发下载（请检查浏览器下载目录确认）';
+      onTaskSettled(d); // v5：释放槽 + 归还承载页 + 继续调度（retrying 状态下 reap 不会替你清）
+      persist();
+      broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
+      log('warn', `[导出] ${taskLabel(d.id)} ${d.error}`);
+      maybeDispatch();
+    }
+    sendResponse({ ok: true });
+    return true;
+  }
 
   if (msg.type === 'DOWNLOAD_ERROR') {
     const d = state.downloads[msg.downloadId];
