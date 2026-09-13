@@ -289,9 +289,27 @@ async function startTaskInTab(d, tabId) {
   try {
     await chrome.tabs.sendMessage(tabId, payload);
   } catch {
-    // content script 未注入（如刚打开的页面）→ 手动注入后重发
+    // content script 未注入（如刚打开的页面）→ 手动注入后重发。
+    // ★ 第一道防线：注入前先探测 window.VGP 是否已经就绪。sendMessage 抛错不一定是
+    //   "content 不存在"，也可能只是时序/页面正在加载 —— 此时再注入一遍会得到**第二个
+    //   downloader 实例**（各自独立的 runningDownloads）→ 同一任务两个下载循环 → 两次导出
+    //   → 磁盘重复文件（真机日志：同一秒两个下载项 #653/#654）。
+    //   content 侧也有单例守卫兜底（downloader.js / main.js），这里是第一道。
+    let injected = false;
     try {
-      await chrome.scripting.executeScript({ target: { tabId }, files: CONTENT_FILES });
+      const r = await chrome.scripting.executeScript({
+        target: { tabId },
+        func: () => !!(window.VGP && window.VGP.__mainLoaded && window.VGP.__downloaderLoaded),
+      });
+      injected = !!(r && r[0] && r[0].result);
+    } catch { /* 探测失败 → 按未注入处理 */ }
+    try {
+      if (!injected) {
+        log('warn', `[调度] ${taskLabel(d.id)} content 未就绪，注入后重发 START_DOWNLOAD`);
+        await chrome.scripting.executeScript({ target: { tabId }, files: CONTENT_FILES });
+      } else {
+        log('warn', `[调度] ${taskLabel(d.id)} content 已在但首次 START 未被接受，直接重发（不重复注入）`);
+      }
       await chrome.tabs.sendMessage(tabId, payload);
     } catch (err2) {
       delete state.running[d.id];

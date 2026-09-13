@@ -2,6 +2,14 @@
 'use strict';
 window.VGP = window.VGP || {};
 (function (VGP) {
+  // ★★ 重复注入守卫：与 downloader.js 同一原因（见那里的详细说明）。这里尤其关键 ——
+  //    没有它，chrome.runtime.onMessage 会被注册**两次**，一条 START_DOWNLOAD 会被
+  //    两个实例同时处理，直接导致同一任务两个下载循环、两次导出、磁盘重复文件。
+  if (VGP.__mainLoaded) {
+    try { console.warn('[VGP] content main 被重复注入，本次实例直接退出'); } catch { /* ignore */ }
+    return;
+  }
+  VGP.__mainLoaded = true;
   const { log, startDownload, getAbortController, cancelReasons, cleanupOpfs, extractVideoSources, OPFS_PREFIX } = VGP;
 
   // 文件大小探测（popup 请求）：页面上下文发请求，浏览器自动带 Referer/Cookie，

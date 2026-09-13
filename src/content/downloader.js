@@ -2,6 +2,16 @@
 'use strict';
 window.VGP = window.VGP || {};
 (function (VGP) {
+  // ★★ 重复注入守卫（「下载文件重复落盘」的根因）：background 的 startTaskInTab 在
+  //    sendMessage 抛错时会用 scripting.executeScript 把同一批 content 文件**再注入一遍**
+  //    （页面刚 reload / 就绪竞态时很常见）。没有守卫时页面上会出现**两个 downloader 实例**：
+  //    各自的 runningDownloads 互不可见 → 同一任务两个下载循环并行 → 各自合并导出 →
+  //    Chrome 创建两个下载项。真机日志实证：同一秒 #653 / #654，磁盘出现 "xxx (1).mp4"。
+  if (VGP.__downloaderLoaded) {
+    try { console.warn('[VGP] downloader 被重复注入，本次实例直接退出'); } catch { /* ignore */ }
+    return;
+  }
+  VGP.__downloaderLoaded = true;
   const { log, fetchWithRetry, parseM3u8, selectBestVariant, resolveUrl,
     parseKeySegments, findKeyForSegment, fetchDecryptKey, decryptSegment, makeIV,
     opfsWrite, opfsRead, saveMeta, loadMeta, detectFormat } = VGP;

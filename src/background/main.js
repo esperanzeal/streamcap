@@ -361,6 +361,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       sendResponse({ ok: false, error: '该任务刚已导出过，已忽略重复请求（防重复落盘）' });
       return true;
     }
+    // ★ 竞态铁律：占位必须**同步**打上，绝不能等 chrome.downloads.download 的回调。
+    //   真机日志实证：同一任务同一秒创建了两个下载项（#653 / #654）—— 两条 DOWNLOAD_BLOB
+    //   几乎同时到达，第一条的回调还没跑完，双方都通过了上面的检查（TOCTOU）→ 各写一个文件。
+    //   （content 侧也可能存在两个实例，见 downloader.js 的重复注入守卫，所以这里必须仲裁。）
+    if (prev) { prev.exportedAt = Date.now(); persist(); }
     chrome.downloads.download({
       url: blobUrl,
       filename,
@@ -371,6 +376,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         // 触发失败：标记失败，不进入 exporting
         const d = state.downloads[downloadId];
         if (d) {
+          // ★ 回滚同步占位：这次导出没成功，必须放行后续重试（否则 10 分钟内都导不出来）
+          d.exportedAt = null;
           d.status = 'failed';
           d.error = 'Chrome 下载触发失败: ' + (chrome.runtime.lastError?.message || '未知');
           persist();
