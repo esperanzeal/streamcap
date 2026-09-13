@@ -24,11 +24,11 @@ export function persist() {
     speed: d.speed, error: d.error, createdAt: d.createdAt, tabId: d.tabId,
     fileName: d.fileName, pageTitle: d.pageTitle, dupIndex: d.dupIndex,
     pageUrl: d.pageUrl, // ★ 必须持久化：浏览器重启后重试要靠它找同源宿主/自动开原页面
-    retryCount: d.retryCount, consecutiveFails: d.consecutiveFails,
+    consecutiveFails: d.consecutiveFails,
     stallCount: d.stallCount, // 停滞计数持久化：重启后不归零，避免又从头循环
     reloadCount: d.reloadCount, // "刷新复活"次数（页面停摆时刷新页面上限）：重启不归零，避免无限刷新
     format: d.format,
-    lastProgressAt: d.lastProgressAt, lastDone: d.lastDone, lastDoneAt: d.lastDoneAt,
+    lastProgressAt: d.lastProgressAt, lastDoneAt: d.lastDoneAt,
     lastPing: d.lastPing,
   }));
   chrome.storage.local.set({ vgp_downloads: list });

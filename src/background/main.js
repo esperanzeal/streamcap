@@ -116,7 +116,7 @@ async function retryExisting(msg, sendResponse) {
 // ============ 删除已完成任务 → 关闭对应来源标签页 ============
 // 判据：tab 仍存在 + 该 tab 无存活任务。completed/failed/cancelled 不算存活
 //（failed 任务后续可走"重试智能接管"自动开/接管标签页续传，不依赖原 tab 活着）。
-// v5 状态集（stopping 已被移除：停摆改为刷新承载页，见 stalled.js reloadTaskTab）
+// v5 状态集（停摆状态已被移除：改为刷新承载页，见 stalled.js reloadTaskTab）
 const TAB_ALIVE_STATUS = new Set(['queued', 'paused', 'downloading', 'retrying', 'exporting']);
 async function closeTabIfIdle(tabId) {
   if (tabId === undefined || tabId === null) return;
@@ -442,7 +442,6 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       d.speed = msg.speed || '';
       d.lastProgressAt = Date.now();
       d.lastActivityAt = Date.now(); // 带 done 的上报同样是活动证据（与 lastDoneAt 分开记，语义不同）
-      d.lastDone = msg.done;
       if (progressed) { d.lastDoneAt = Date.now(); d.reloadCount = 0; } // 有真实进展 → 重置"刷新复活"计数
       broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
     }
@@ -489,7 +488,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       if (msg.reason === 'manual_cancel' || (msg.error || '').includes('已取消') ||
           d.status === 'paused' || d.status === 'cancelled' || d.status === 'queued' ||
           d.status === 'completed' || d.status === 'exporting' || d.status === 'failed' ||
-          // 迟到的停滞确认（reason 存在 = abort 类）：任务已离开 stopping（SW 重启重派/downloading 或手动恢复），
+          // 迟到的停滞确认（reason 存在 = abort 类）：任务已离开停摆态（SW 重启重派/downloading 或手动恢复），
           // 忽略避免白走一次 retrying 往返
           (msg.reason && d.status === 'downloading')) {
         persist();
@@ -516,7 +515,6 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       const fails = d.consecutiveFails || 0;
       if (fails < MAX_RETRY) {
         d.consecutiveFails = fails + 1;
-        d.retryCount = (d.retryCount || 0) + 1;
         d.status = 'retrying';
         d.error = `第 ${d.consecutiveFails}/${MAX_RETRY} 次重试: ${msg.error}`;
         persist();
@@ -640,13 +638,6 @@ chrome.storage.local.get('vgp_downloads', data => {
       } else if (d.status === 'downloading' || d.status === 'exporting' || d.status === 'retrying') {
         state.running[d.id] = d.tabId; // ★ 必须同步重建：slotsFree() 靠 running 计数，漏了会并发超发（原有任务 + 新派满槽）
         state.tabActive[d.tabId] = d.id;
-      } else if (d.status === 'stopping') { // 仅兼容 v4 旧数据（v5 不再产生 stopping 状态）
-        // ★ SW 重启后 content 旧循环状态不确定（CANCEL 可能已到或消息丢失），
-        //   不能继续等确认——直接转 queued 重新入队（旧版 53da483 的处理）。
-        //   若 content 还活着：runningDownloads 防重入 + done 单调性兜底，不会双循环。
-        d.status = 'queued';
-        d.error = null;
-        queueTask(d.id);
       }
     }
     persist();

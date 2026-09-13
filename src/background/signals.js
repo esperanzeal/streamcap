@@ -36,7 +36,6 @@ export function handleDownloadSignal(delta) {
       d.fileName = rec.filename;
       d.speed = '';
       d.consecutiveFails = 0;
-      d.retryCount = 0;
       onTaskSettled(d); // v5：释放槽 + 归还承载页 + 继续调度（原先只清 tabActive → 槽位假满，后续任务派发不出去）
       persist();
       broadcast({ type: 'DOWNLOAD_UPDATE', download: d });

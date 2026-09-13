@@ -223,7 +223,6 @@ async function startTaskInTab(d, tabId) {
   d.error = null;
   if (!d.done) d.pct = 0; // 续传保留已有进度
   d.lastProgressAt = Date.now();
-  d.lastDone = 0;
   d.lastDoneAt = Date.now();
   d.lastActivityAt = Date.now(); // 活动基准（分片请求尝试会刷新）
   persist();

@@ -15,13 +15,13 @@ let downloads = {};
 let filter = 'all';
 let sortMode = 'fifo'; // 队列排序偏好（v5，与 background 的 state.sortMode 同步）
 
-const ICONS = { queued: '⏳', downloading: '⬇️', retrying: '🔁', exporting: '📤', completed: '✅', failed: '❌', cancelled: '🚫', paused: '⏸️', stopping: '⏸️' };
+const ICONS = { queued: '⏳', downloading: '⬇️', retrying: '🔁', exporting: '📤', completed: '✅', failed: '❌', cancelled: '🚫', paused: '⏸️' };
 const BADGES = {
   queued: ['队列中', 'b-queued'], downloading: ['下载中', 'b-active'], retrying: ['重试中', 'b-active'],
   exporting: ['导出中', 'b-active'], completed: ['已完成', 'b-done'], failed: ['失败', 'b-fail'], cancelled: ['已取消', 'b-cxl'],
-  paused: ['已暂停', 'b-queued'], stopping: ['停止中', 'b-queued'],
+  paused: ['已暂停', 'b-queued']
 };
-const BARS = { queued: 'bar-q', downloading: 'bar-go', retrying: 'bar-go', exporting: 'bar-go', completed: 'bar-ok', failed: 'bar-err', cancelled: 'bar-cxl', paused: 'bar-q', stopping: 'bar-q' };
+const BARS = { queued: 'bar-q', downloading: 'bar-go', retrying: 'bar-go', exporting: 'bar-go', completed: 'bar-ok', failed: 'bar-err', cancelled: 'bar-cxl', paused: 'bar-q' };
 
 // ============ 操作 ============
 function act(msg) { chrome.runtime.sendMessage(msg).catch(() => {}); }
@@ -71,7 +71,7 @@ function render() {
     const icon = ICONS[d.status] || '❓';
     const [badgeText, badgeCls] = BADGES[d.status] || ['?', 'b-queued'];
     const barCls = BARS[d.status] || 'bar-q';
-    const isActive = d.status === 'downloading' || d.status === 'queued' || d.status === 'retrying' || d.status === 'stopping';
+    const isActive = d.status === 'downloading' || d.status === 'queued' || d.status === 'retrying';
     const isPaused = d.status === 'paused';
     const isDone = d.status === 'completed';
     const isExporting = d.status === 'exporting';

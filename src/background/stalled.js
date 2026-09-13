@@ -199,7 +199,7 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
     //③ 页面活着但"停摆"：PING 通、心跳新鲜，可是 done 与请求活动双陈旧（DONE_TIMEOUT 90s 无任何进展）
     //    —— 典型表现是浏览器对标签节流（实测：被节流的页面重建后恢复正常速度；
     //    重启浏览器 + 新建页后 8 并发健康跑数小时）。
-    //    旧逻辑在这里发 CANCEL 走 stopping→重排，等于把任务放回**同一个卡住的页面**反复重来；
+    //    旧逻辑在这里发 CANCEL 走 停止中态→重排，等于把任务放回**同一个卡住的页面**反复重来；
     //    改为**刷新该页面 → 等 content 重新就绪 → 重新注入任务**：
     //    OPFS 分片按 origin 存盘、不随页面销毁，刷新后按 resumeFrom 继续，进度不丢。
     await reloadTaskTab(d, '页面停摆（疑似被浏览器节流）');

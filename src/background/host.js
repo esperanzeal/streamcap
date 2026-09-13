@@ -57,7 +57,11 @@ function probeHost(tabId, url) {
 export async function findHostForTask(d, { origId, pageUrlHint, openNewTab = true } = {}) {
   const pageHint = pageUrlHint || d.pageUrl || d.referer || '';
   const orig = origId ?? d.tabId;
-  const wasStalled = (d.stallCount || 0) > 0 || /停滞|无进度|无响应/.test(d.error || '');
+  // “卡过”的判定改用 v5 真实存在的信号（stallCount 已无人自增 → 旧判据恒为 false，防呆失效）：
+  const wasStalled = (d.reloadCount || 0) > 0
+    || (d.acquireFails || 0) > 0
+    || (d.consecutiveFails || 0) > 0
+    || /停摆|停滞|无进度|无响应|无法建立承载页/.test(d.error || '');
   const needProbe = wasStalled; // 卡过的任务候选须真实探测；正常任务 trust PING
   const pageOrigin = originOf(pageHint);
 
@@ -137,8 +141,6 @@ export function migrateTaskToTab(d, hostTabId, resetCounters = true) {
   if (resetCounters) {
     // 手动重试 = 新的尝试周期（保留 createdAt 保持 FIFO 原位置）
     d.consecutiveFails = 0;
-    d.stallCount = 0;
-    d.retryCount = 0;
   }
   // resetCounters=false（自动接管）：失败计数不清零 → 停滞/失败上限持续累计，
   // 保证换承载页重试也有界，不会无限兜圈

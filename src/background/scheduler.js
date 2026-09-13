@@ -63,7 +63,7 @@ export function enqueue(tabId, url, referer, resolution, pageUrl, pageTitle, for
     format: taskFormat, // 传给 content 分流下载
     fileName: '',
     dupIndex: dupIndex > 1 ? dupIndex : undefined,
-    retryCount: 0, consecutiveFails: 0,
+    consecutiveFails: 0,
   };
   queueTask(id); // ★ v5：入全局就绪队列（顺序由 sortMode 决定，与 tab 无关）
   persist();
@@ -94,9 +94,9 @@ export async function maybeDispatch() {
 // ============ 优先下载 ============
 // 用户拍板的策略：有空槽 → 直接提到队首立即跑；满槽 → 与"运行中已下载分片最少
 // （沉没成本最低）"的任务替换。
-// 被替换任务：发 CANCEL 让 content 退出旧循环 → 释放槽 → **3s 后再回队首**
+// 被替换任务：发 CANCEL 让 content 退出旧循环 → 释放槽 → **8s 后再回队首**
 // （必须留这个间隔：content 有 runningDownloads 防重入，旧循环没退干净时新 START 会被忽略，
-//   任务会假活占槽 —— 旧版用 stopping+stopPendingAt+replacedFlag 三件套解决，v5 用延迟替代）。
+//   任务会假活占槽 —— 旧版用 停止中态+stopPendingAt+replacedFlag 三件套解决，v5 用延迟替代）。
 export async function prioritizeDownload(downloadId) {
   const d = state.downloads[downloadId];
   if (!d || d.status !== 'queued') return { ok: false, error: '任务不在队列中' };
@@ -123,8 +123,8 @@ export async function prioritizeDownload(downloadId) {
   unqueueTask(victim.id);
   chrome.tabs.sendMessage(victim.tabId, { type: 'CANCEL_DOWNLOAD', downloadId: victim.id, reason: 'manual_pause' }).catch(() => {});
   // 只释放并发槽，**暂不归还承载页**：victim 的旧 content 循环还没退（CANCEL 未确认），
-  // 立刻归还可被其他任务抢占 → 那一刻同页两个下载循环；victim 3s 后回来还会另建承载页（标签页堆叠）。
-  // → 3s 后（与回队首同一时刻）再归还。
+  // 立刻归还可被其他任务抢占 → 那一刻同页两个下载循环；victim 8s 后回来还会另建承载页（标签页堆叠）。
+  // → 8s 后（与回队首同一时刻）再归还。
   delete state.running[victim.id];
   if (state.tabActive[victim.tabId] === victim.id) state.tabActive[victim.tabId] = null;
   pump();
@@ -136,12 +136,12 @@ export async function prioritizeDownload(downloadId) {
     releaseTab(v.tabId); // 旧循环已退，归还承载页供复用
     state.readyQueue.unshift(v.id);
     pump();
-  }, 3000);
+  }, 8000); // v5：旧 content 循环可能卡在不可 abort 的 await（如大 blob 落盘），3s 不够
 
   unqueueTask(downloadId);
   state.readyQueue.unshift(downloadId);
   pump();
-  log('warn', `[优先] ${taskLabel(downloadId)} 顶替 ${taskLabel(victim.id)}（该任务进度 ${victim.done || 0} 片，3s 后回队首）`);
+  log('warn', `[优先] ${taskLabel(downloadId)} 顶替 ${taskLabel(victim.id)}（该任务进度 ${victim.done || 0} 片，8s 后回队首）`);
   return { ok: true };
 }
 
@@ -162,7 +162,6 @@ export async function resumeAll() {
     d.status = 'queued';
     d.error = null;
     d.consecutiveFails = 0;
-    d.retryCount = 0;
     d.reloadCount = 0; // 手动恢复 = 新的尝试周期
     queueTask(d.id);
   }
