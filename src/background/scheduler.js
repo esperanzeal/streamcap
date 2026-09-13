@@ -10,7 +10,7 @@
 import { state, persist, broadcast, taskLabel } from './state.js';
 import { log } from './log.js';
 import { detectFormat } from './formats.js';
-import { queueTask, unqueueTask, pump, onTaskSettled, slotsFree, releaseTab } from './pool.js';
+import { queueTask, queueTaskFront, unqueueTask, pump, onTaskSettled, slotsFree, releaseTab } from './pool.js';
 
 /**
  * 弱指纹：origin + pathname + resolution（忽略 query —— 签名 URL 的时效参数每次不同）。
@@ -97,50 +97,61 @@ export async function maybeDispatch() {
 // 被替换任务：发 CANCEL 让 content 退出旧循环 → 释放槽 → **8s 后再回队首**
 // （必须留这个间隔：content 有 runningDownloads 防重入，旧循环没退干净时新 START 会被忽略，
 //   任务会假活占槽 —— 旧版用 停止中态+stopPendingAt+replacedFlag 三件套解决，v5 用延迟替代）。
+// ★ 顺序铁律：**先插队，再 pump()**。pump 是"防重入 + 取队首"的：一旦有 pump 在跑，
+//   后面的 pump() 会被直接忽略。若先 pump 再插队，那次 pump 会立刻取走队列里原本的第一个
+//   任务、占满刚让出的槽，用户在尾部的插队 + 第二次 pump() 双双失效 ——
+//   真机现象就是「点了 ⚡ 优先，跑起来的却是别的任务，目标任务还在排队」。
 export async function prioritizeDownload(downloadId) {
   const d = state.downloads[downloadId];
-  if (!d || d.status !== 'queued') return { ok: false, error: '任务不在队列中' };
+  if (!d) return { ok: false, error: '任务不存在' };
+  if (d.status !== 'queued') return { ok: false, error: `该任务当前是「${d.status}」，只有排队中的任务才能优先` };
   log('info', `[优先] ${taskLabel(downloadId)} 收到优先下载请求`);
 
   await syncSlotCount();
+  // ① 先把它插到队首：此后任何一次 pump() 取到的第一个任务都是它
+  queueTaskFront(downloadId);
+
+  // ② 有空槽 → 立即派发
   if (slotsFree() > 0) {
-    unqueueTask(downloadId);
-    state.readyQueue.unshift(downloadId);
     pump();
+    log('info', `[优先] ${taskLabel(downloadId)} 有空闲并发槽，立即派发`);
     return { ok: true };
   }
 
-  // 满槽：挑 done 最少的运行中任务让位
+  // ③ 满槽：挑 done 最少（沉没成本最低）的运行中任务让位
   const runIds = Object.keys(state.running).map(Number).filter(id => id !== downloadId);
   const victim = runIds
     .map(id => state.downloads[id])
     .filter(Boolean)
     .sort((a, b) => (a.done || 0) - (b.done || 0))[0];
-  if (!victim) return { ok: false, error: '暂无可让位的运行中任务' };
+  if (!victim) {
+    // 极端情况：槽满但拿不出可替换的任务 → 至少保住插队位置，等自然出槽
+    pump();
+    return { ok: false, error: '当前没有可让位的下载中任务，已把它排到队列最前' };
+  }
 
   victim.status = 'queued';
   victim.error = `被优先下载替换（已下载 ${victim.done || 0} 片已保留，稍后自动续传）`;
   unqueueTask(victim.id);
   chrome.tabs.sendMessage(victim.tabId, { type: 'CANCEL_DOWNLOAD', downloadId: victim.id, reason: 'manual_pause' }).catch(() => {});
-  // 只释放并发槽，**暂不归还承载页**：victim 的旧 content 循环还没退（CANCEL 未确认），
-  // 立刻归还可被其他任务抢占 → 那一刻同页两个下载循环；victim 8s 后回来还会另建承载页（标签页堆叠）。
-  // → 8s 后（与回队首同一时刻）再归还。
+  // 只释放并发槽，**暂不归还承载页**（tabActive 也保持占位）：victim 的旧 content 循环还没退
+  //（CANCEL 未确认），此刻放开这一页会被 acquireTabFor 的"扫已打开同源页"分支分给别的任务 →
+  // 那一刻同页两个下载循环；victim 8s 后回来还会另建承载页（标签页堆叠）。
+  // → 8s 后（与回队首同一时刻）再一起放开。
   delete state.running[victim.id];
-  if (state.tabActive[victim.tabId] === victim.id) state.tabActive[victim.tabId] = null;
-  pump();
+  pump(); // 队首 = 用户点的任务 → 正好吃到刚让出的这个槽
   persist();
   broadcast({ type: 'DOWNLOAD_UPDATE', download: victim });
   setTimeout(() => {
     const v = state.downloads[victim.id];
-    if (!v || v.status !== 'queued') return; // 已被删除/被用户干预
-    releaseTab(v.tabId); // 旧循环已退，归还承载页供复用
-    state.readyQueue.unshift(v.id);
+    if (!v) return;
+    // 先归还承载页：不管 victim 之后是否继续跑，这一页都不该被它继续占着（否则页与槽双泄漏）
+    if (state.tabActive[v.tabId] === v.id) state.tabActive[v.tabId] = null;
+    releaseTab(v.tabId);
+    if (v.status !== 'queued') return; // 期间被删除/取消/手动干预
+    queueTaskFront(v.id);
     pump();
   }, 8000); // v5：旧 content 循环可能卡在不可 abort 的 await（如大 blob 落盘），3s 不够
-
-  unqueueTask(downloadId);
-  state.readyQueue.unshift(downloadId);
-  pump();
   log('warn', `[优先] ${taskLabel(downloadId)} 顶替 ${taskLabel(victim.id)}（该任务进度 ${victim.done || 0} 片，8s 后回队首）`);
   return { ok: true };
 }

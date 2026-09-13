@@ -38,15 +38,56 @@ function pingTab(tabId) {
 }
 
 // ============ 就绪队列 ============
-// 队列只存 id；排序在取用时按 state.sortMode 计算（任务量几十个，开销可忽略）
+// ★ 队列的**物理顺序就是派发顺序**：入队时按 sortMode 决定插入位置，取用时不再重排。
+//   曾经的写法是"入队 push 到队尾 + 取用时按 sortMode 整体重排"，两者冲突：
+//   重排会覆盖任何显式插队（unshift 到队首 / queueTaskFront），
+//   真机现象就是「点了 ⚡ 优先，跑起来的却是队列里原本最早的那个任务」——
+//   fifo 模式下插队 100% 失效（progress 模式也只是碰巧看着像有用）。
 export function queueTask(id) {
-  if (!state.readyQueue.includes(id)) state.readyQueue.push(id);
+  if (state.readyQueue.includes(id)) return;
+  const d = state.downloads[id];
+  const mode = state.sortMode || 'fifo';
+  if (mode === 'progress' && d) {
+    // progress：进度百分比高的排前面（先收尾，尽快减少任务总量）→ 新任务(0%)自然落在队尾
+    const r = progressRatio(d);
+    let i = 0;
+    while (i < state.readyQueue.length) {
+      const o = state.downloads[state.readyQueue[i]];
+      if (!o || progressRatio(o) < r) break;
+      i++;
+    }
+    state.readyQueue.splice(i, 0, id);
+    return;
+  }
+  // fifo：按创建时间插入 —— 新任务自然落队尾；重试/让位/暂停恢复回来的**老**任务插回它原来的
+  // 位置（否则每次重试都被新加的任务挤到队尾，"先来先跑"就失效了）。
+  // 显式插队走 queueTaskFront，不受这里影响。
+  const c = (d && d.createdAt) || Date.now();
+  let i = 0;
+  while (i < state.readyQueue.length) {
+    const o = state.downloads[state.readyQueue[i]];
+    if (!o || (o.createdAt || 0) > c) break;
+    i++;
+  }
+  state.readyQueue.splice(i, 0, id);
 }
-// 插到队首（重新注入 / 让位后的任务优先跑）
+// 插到队首（用户点「优先」/ 重新注入 / 让位后的任务优先跑）。
+// 因为取用不再重排，这里的 unshift 是**真的**生效——语义必须保持。
 export function queueTaskFront(id) {
   const i = state.readyQueue.indexOf(id);
   if (i >= 0) state.readyQueue.splice(i, 1);
   state.readyQueue.unshift(id);
+}
+// 切换排序策略时按新规则重建队列顺序（旧队列是按旧策略排的）
+export function resortQueue() {
+  const createdAt = id => (state.downloads[id] && state.downloads[id].createdAt) || 0;
+  if ((state.sortMode || 'fifo') === 'progress') {
+    state.readyQueue.sort((a, b) =>
+      progressRatio(state.downloads[b] || {}) - progressRatio(state.downloads[a] || {}) ||
+      createdAt(a) - createdAt(b));
+  } else {
+    state.readyQueue.sort((a, b) => createdAt(a) - createdAt(b));
+  }
 }
 export function unqueueTask(id) {
   const i = state.readyQueue.indexOf(id);
@@ -54,8 +95,10 @@ export function unqueueTask(id) {
 }
 export function isQueued(id) { return state.readyQueue.includes(id); }
 
-// 取下一个要跑的任务：
-//   fifo（默认）= 创建时间先来先跑；progress = 进度百分比高的优先（先收尾，尽快减少任务总量）
+// 取下一个要跑的任务：**严格按 readyQueue 的物理顺序**（队首优先），只取状态仍为 queued 的。
+// ★ 顺序策略在入队时已由 queueTask 按 sortMode 落实，这里绝不能再排序：
+//   一排序，任何插队（⚡ 优先下载 / 刷新后续传）都会被 createdAt 覆盖掉 —— 这正是
+//   "点了优先却没反应，跑起来的是原来最早那个任务"的根因。
 // 进度比率（0~1）：必须按**百分比**而不是分片数比较 —— 各任务总片数不同，
 // 直接比 done 会让「1000 片下了 500 片(50%)」排在「100 片下了 90 片(90%)」前面。
 export function progressRatio(d) {
@@ -64,17 +107,13 @@ export function progressRatio(d) {
 }
 export function pickNext(exclude) {
   const skip = exclude || null; // 本轮已尝试但拿不到承载页的任务：跳过后面的任务才有机会跑
-  const list = state.readyQueue
-    .map(id => state.downloads[id])
-.filter(d => d && d.status === 'queued' && !(skip && skip.has(d.id)));
-  if (!list.length) return null;
-  const mode = state.sortMode || 'fifo';
-  if (mode === 'progress') {
-    list.sort((a, b) => progressRatio(b) - progressRatio(a) || (a.createdAt || 0) - (b.createdAt || 0));
-  } else {
-    list.sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0));
+  for (const id of state.readyQueue) {
+    const d = state.downloads[id];
+    if (!d || d.status !== 'queued') continue;
+    if (skip && skip.has(id)) continue;
+    return id;
   }
-  return list[0].id;
+  return null;
 }
 
 // ============ 槽位 ============

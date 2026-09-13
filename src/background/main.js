@@ -8,7 +8,7 @@ import { handleDownloadSignal, markLoaded, pendingDownloadSignals } from './sign
 import { ensureKeepaliveAlarm, pingDeadTask } from './stalled.js';
 
 import { pingTabLive, findHostForTask, migrateTaskToTab } from './host.js';
-import { queueTask, onTaskSettled } from './pool.js';
+import { queueTask, onTaskSettled, resortQueue } from './pool.js';
 
 // ============ 任务重试（手动路径） ============
 // 宿主选择统一在 host.js findHostForTask：
@@ -247,11 +247,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true;
   }
 
-  // 删除
-  // 队列排序模式（manager 切换；决定 pool.pickNext 在 readyQueue 里的取用顺序）
+  // 队列排序模式（manager 切换；队列的物理顺序 = 派发顺序，见 pool.js）
   if (msg.type === 'SET_SORT_MODE') {
     state.sortMode = msg.value === 'progress' ? 'progress' : 'fifo';
-    log('info', `[排序] 队列排序切换为 ${state.sortMode === 'progress' ? '按进度（先收尾）' : '按创建时间'}`);
+    resortQueue(); // 已排好的队列按新策略重建 —— 否则旧顺序会一直沿用下去
+    log('info', `[排序] 队列排序切换为 ${state.sortMode === 'progress' ? '按进度（先收尾）' : '按创建时间'}（队列已重排）`);
     maybeDispatch();
     sendResponse({ ok: true, value: state.sortMode });
     return true;

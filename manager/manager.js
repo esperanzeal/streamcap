@@ -14,6 +14,11 @@ const $$ = s => document.querySelectorAll(s);
 let downloads = {};
 let filter = 'all';
 let sortMode = 'fifo'; // 队列排序偏好（v5，与 background 的 state.sortMode 同步）
+// 本地「刚点过 ⚡ 优先」的任务：60s 内在队列组里置顶显示并加提示。
+// 纯粹是视觉反馈（background 的 readyQueue 才是真正的插队）——
+// 没有它的话，点了优先如果一瞬间看不出变化，很容易被当成"点了没用"。
+const boosted = new Map(); // downloadId → 点击时间戳
+const BOOST_HINT_MS = 60000;
 
 const ICONS = { queued: '⏳', downloading: '⬇️', retrying: '🔁', exporting: '📤', completed: '✅', failed: '❌', cancelled: '🚫', paused: '⏸️' };
 const BADGES = {
@@ -36,9 +41,14 @@ function render() {
   const ratioOf = d => (d.total > 0 ? d.done / d.total : (d.pct || 0) / 100);
   const RUNNING = new Set(["downloading", "exporting"]);
   const rankOf = d => (RUNNING.has(d.status) ? 0 : (d.status === "queued" ? 1 : 2));
+  // 清掉过期的置顶提示
+  if (boosted.size) for (const [k, t] of boosted) if (Date.now() - t > BOOST_HINT_MS) boosted.delete(k);
   const all = Object.values(downloads).sort((a, b) => {
     const ra = rankOf(a), rb = rankOf(b);
     if (ra !== rb) return ra - rb;
+    // 刚点过 ⚡ 优先的任务置顶显示（视觉反馈；真正插队的是 background 的 readyQueue）
+    const ba = boosted.get(a.id) || 0, bb = boosted.get(b.id) || 0;
+    if (ba !== bb) return bb - ba;
     if (ra === 1 && sortMode === "progress") {
       return ratioOf(b) - ratioOf(a) || (a.createdAt || 0) - (b.createdAt || 0);
     }
@@ -108,6 +118,7 @@ function render() {
           <span>${(d.pct || 0).toFixed(1)}%</span>
         </div>
         ${d.error ? `<div class="card-err">${esc(d.error)}</div>` : ''}
+        ${(d.status === 'queued' && boosted.has(d.id)) ? '<div style="font-size:11px;color:#58a6ff;margin-top:4px;">⚡ 已置顶，正在派发…</div>' : ''}
         ${d.fileName ? `<div style="font-size:11px;color:#3fb950;margin-top:4px;">📁 ${esc(d.fileName)}</div>` : ''}
         ${exportingHint}
       </div>
@@ -127,7 +138,17 @@ function render() {
       const d = downloads[id];
       if (btn.dataset.act === 'pause') act({ type: 'PAUSE', downloadId: id });
       if (btn.dataset.act === 'delete') act({ type: 'DELETE_DOWNLOAD', downloadId: id });
-      if (btn.dataset.act === 'prioritize') act({ type: 'PRIORITIZE_DOWNLOAD', downloadId: id });
+      if (btn.dataset.act === 'prioritize') {
+        // 带响应：成功时本地置顶显示（点了必须看得见变化），失败时把原因说出来
+        //（旧实现是 act() 一发不管，后台就算返回"任务不在队列中"也完全静默 → 用户只觉得"点了没用"）
+        btn.disabled = true;
+        chrome.runtime.sendMessage({ type: 'PRIORITIZE_DOWNLOAD', downloadId: id }, resp => {
+          btn.disabled = false;
+          if (resp && resp.ok === false) { alert('优先下载失败：' + (resp.error || '未知原因')); render(); return; }
+          boosted.set(id, Date.now());
+          render();
+        });
+      }
       if (btn.dataset.act === 'resume' || btn.dataset.act === 'retry') {
         if (!d) return;
         // 已完成任务的重试 = 进度归零从头重新下载（分片已清理），需确认防误触
