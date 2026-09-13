@@ -90,31 +90,48 @@ export function releaseTab(tabId) {
 }
 
 // 取一个可承载该任务的 tab：
-//   ① 任务原 tab（重试场景：零打扰，页面就在那儿）
-//   ② 池内**同源且空闲**的 tab（复用，省一次页面加载）
+//   ① 任务自己的来源页（用户当前这个页面 / 重试场景）——不能要求它已在池里
+//   ② 其它已打开的同源空闲页（复用，省一次页面加载）
 //   ③ 新建 tab（打开任务来源页）——"并发几个槽就开几个 tab"就靠这里
 // 失败返回 null（调用方把任务放回队列，稍后再试）。
+async function getTab(tabId) {
+  try { return await chrome.tabs.get(tabId); } catch { return null; }
+}
+// 把某个已打开的 tab 登记为承载页并绑定任务
+function bindTab(tabId, task, origin) {
+  state.tabPool[tabId] = { origin: (state.tabPool[tabId] && state.tabPool[tabId].origin) || origin, taskId: task.id, lastUsedAt: Date.now() };
+  return tabId;
+}
+
 export async function acquireTabFor(task) {
   const origin = originOf(task.pageUrl || task.referer || '');
-  // ① 原 tab 仍活且空闲
+  const sameOrigin = u => !origin || originOf(u || "") === origin;
+
+  // ① 任务自己的来源页还开着且空闲 → 直接用它。
+  //    ★ 不能要求"它必须已在 tabPool 里"：用户在页面上点「加入下载」时，那个页面
+  //      从来不是扩展打开的，池里自然没有它 —— v5 首版漏了这点，于是明明人就在该页面，
+  //      却又在后台新建了一个一模一样的标签页。
   const orig = task.tabId;
-  if (orig && state.tabPool[orig] && state.tabPool[orig].taskId === null &&
-      !state.tabActive[orig] && await tabExists(orig)) {
-    state.tabPool[orig].taskId = task.id;
-    state.tabPool[orig].lastUsedAt = Date.now();
-    return orig;
+  if (orig !== undefined && orig !== null && !state.tabActive[orig]) {
+    const t = await getTab(orig);
+    if (t && sameOrigin(t.url)) {
+      log("info", `[池] 复用任务来源页 tab${orig}`);
+      return bindTab(orig, task, origin);
+    }
   }
-  // ② 池内同源空闲 tab
-  for (const [tid, e] of Object.entries(state.tabPool)) {
-    const id = Number(tid);
-    if (e.taskId !== null) continue;
-    if (e.origin !== origin) continue;
-    if (state.tabActive[id]) continue;
-    if (!(await tabExists(id))) { delete state.tabPool[id]; continue; }
-    e.taskId = task.id;
-    e.lastUsedAt = Date.now();
-    return id;
-  }
+  // ② 其它已打开的同源空闲页（用户可能开着好几个同站页面）→ 复用，省一次页面加载
+  try {
+    const tabs = await chrome.tabs.query({});
+    for (const t of tabs) {
+      if (t.id === undefined || t.id === null) continue;
+      if (t.id === orig) continue;
+      if (state.tabActive[t.id]) continue;
+      if (!sameOrigin(t.url)) continue;
+      log("info", `[池] 复用已打开的同源页 tab${t.id}`);
+      return bindTab(t.id, task, origin);
+    }
+  } catch { /* tabs.query 失败：退到新建 */ }
+
   // ③ 新建 tab 承载（后台打开：不抢焦点——8 个并发时有 7 个必然是后台，
   //    浏览器对后台标签的节流由 stalled.js 的"停摆→刷新页面"兜底）
   const pageUrl = task.pageUrl || task.referer;
