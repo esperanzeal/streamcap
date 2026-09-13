@@ -41,11 +41,6 @@ function failTaskQuick(d, reason) {
   broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
   log('warn', `[停滞] ${taskLabel(d.id)} ${reason}，标为失败不再重试`);
 }
-  state.tabActive[d.tabId] = null;
-  persist();
-  broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
-  log('warn', `[停滞] ${taskLabel(d.id)} ${reason}，标为失败不再重试`);
-}
 
 // 死宿主自动接管（停滞/超时共用，自动路径）：
 // 宿主 tab 已死 → 先立即让位（释放并发槽，找宿主可能要逐个 PING/探测耗时数秒，
