@@ -101,9 +101,16 @@ export function isQueued(id) { return state.readyQueue.includes(id); }
 //   "点了优先却没反应，跑起来的是原来最早那个任务"的根因。
 // 进度比率（0~1）：必须按**百分比**而不是分片数比较 —— 各任务总片数不同，
 // 直接比 done 会让「1000 片下了 500 片(50%)」排在「100 片下了 90 片(90%)」前面。
+// ★ 取 done/total 与 pct 两者中的**较大值**（进度 = 已达到的最高水位）：
+//   - 正常情况两者一致（1755/2251 ↔ 78%）→ 无影响；
+//   - pct 落后于分片（PROGRESS 被节流/单调保护拦下）→ 用分片值，更准；
+//   - done=0 而 pct=78（老任务被 DOWNLOAD_ERROR 把 done 打成 0 的历史脏数据，
+//     或 total 还没解析出来）→ 用 pct，不再被误当成 0% 排到队尾。
+//   只信 done/total 会在第二种/第三种情况下把有进度的任务压到队尾。
 export function progressRatio(d) {
-  if (d.total > 0) return d.done / d.total;
-  return (d.pct || 0) / 100;
+  const bySeg = d.total > 0 ? (d.done || 0) / d.total : 0;
+  const byPct = (d.pct || 0) / 100;
+  return bySeg > byPct ? bySeg : byPct;
 }
 export function pickNext(exclude) {
   const skip = exclude || null; // 本轮已尝试但拿不到承载页的任务：跳过后面的任务才有机会跑

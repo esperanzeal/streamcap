@@ -479,8 +479,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.type === 'DOWNLOAD_ERROR') {
     const d = state.downloads[msg.downloadId];
     if (d) {
-      if (msg.done !== undefined) d.done = msg.done;
-      if (msg.total !== undefined) d.total = msg.total;
+      // ★ done 单调保护（与 PROGRESS 分支同一套规则）：content 每次运行都从 totalDone=0
+      //   重新计数，若在"还没跳过任何已落盘批次"时被中止（停摆刷新重注入后立刻被 CANCEL、
+      //   让位、暂停），上报的 done 就是 0 —— 无条件写入会把已有进度打成 0/2251 分片。
+      //   真机现象：右下角 78.0% 但分片显示 0/2251，且"按进度"排序时被判成 0% 排到队尾。
+      if (typeof msg.done === 'number' && msg.done > (d.done || 0)) d.done = msg.done;
+      if (typeof msg.total === 'number' && msg.total > 0) d.total = msg.total;
 
       // 用户操作或调度器中止的任务（已取消/已暂停/已放回队列）：保留状态，不自动重试、不覆盖
       // 终态（completed/exporting/failed）也直接忽略迟到 ERROR：content 单循环只在结束时上报一次，
@@ -633,6 +637,15 @@ chrome.storage.local.get('vgp_downloads', data => {
     // ★ 重建内存队列/活跃表：SW 重启后全局 readyQueue/tabActive 已清空，
     //   若不重建，queued 任务永远不会被 maybeDispatch 派发（任务卡死等待队列）
     for (const d of list) {
+      // 一致性自愈：done 与 pct 明显矛盾（done=0 但 pct>0）是历史脏数据 —— 旧版本在
+      // DOWNLOAD_ERROR 里无条件写入了 content 的 totalDone=0，把进度打成 0/2251。
+      // 用 pct 回填 done，否则进度条会一直显示 0/2251（真机反馈）。
+      // 只修排队中的任务（downloading/exporting 由 content 实时上报覆盖，pct=99 的导出态也已排除）。
+      // 真正续传靠 OPFS 里的 meta.completedBatches，与 done 无关，回填不影响下载行为。
+      if (d.status === 'queued' && !(d.done > 0) && (d.pct > 0) && (d.total > 0)) {
+        d.done = Math.round(d.pct / 100 * d.total);
+        log('info', `[恢复] ${taskLabel(d.id)} 进度自愈：分片数回填为 ${d.done}/${d.total}（按 ${d.pct}% 推算）`);
+      }
       if (d.status === 'queued') {
         queueTask(d.id);
       } else if (d.status === 'downloading' || d.status === 'exporting' || d.status === 'retrying') {

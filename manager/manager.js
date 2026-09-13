@@ -37,8 +37,9 @@ function render() {
   //   · 队列中按 sortMode 排（fifo=创建时间先来先跑 / progress=进度百分比高的优先，先收尾）；
   //   · 其余（暂停/失败/取消/完成）按创建时间。
   //   不再依赖已废弃的 priority —— v5 由全局队列（pool.pickNext）决定实际派发顺序。
-  // 进度比率：与 background 的 pool.progressRatio 保持一致（按百分比，不按分片数）
-  const ratioOf = d => (d.total > 0 ? d.done / d.total : (d.pct || 0) / 100);
+  // 进度比率：与 background 的 pool.progressRatio 保持一致（按百分比而非分片数比较；
+  // 取 done/total 与 pct 的较大值 —— 否则 done 被历史脏数据打成 0 的任务会被排到 0% 档）
+  const ratioOf = d => Math.max(d.total > 0 ? (d.done || 0) / d.total : 0, (d.pct || 0) / 100);
   const RUNNING = new Set(["downloading", "exporting"]);
   const rankOf = d => (RUNNING.has(d.status) ? 0 : (d.status === "queued" ? 1 : 2));
   // 清掉过期的置顶提示
