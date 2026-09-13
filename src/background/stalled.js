@@ -220,6 +220,13 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
   // 任务永远踢不出去。lastDoneAt 只在 done 真正增长时刷新（见 main.js PROGRESS 处理）。
   const stalled = Object.values(state.downloads).filter(d => {
     if (d.status !== 'downloading') return false;
+    // ★★ 分片已全部下载完（done 达到 total）→ 剩下的只是**合并/导出**，本来就不会再有分片增长。
+    //   这类任务绝对不能按"停摆"处理：刷新页面会把正在进行的合并打断，页面重载后任务又被
+    //   重新派发（分片还在，因为 FINALIZE_DOWNLOAD 没执行），于是**再合并、再导出一次** ——
+    //   而 Chrome 的 conflictAction:'uniquify' 遇到同名不覆盖、另存为 "xxx (1).mp4"，
+    //   真机表现就是「E:\Downloads 大量文件重复落盘」。合并阶段由 content 的
+    //   reportActivity 保活（见 downloader.js），不再需要这里的超时兜底。
+    if (d.total > 0 && (d.done || 0) >= d.total) return false;
     // 判定依据 = 最近一次**真实活动**：done 增长（lastDoneAt）或任意分片/分块请求尝试
     // （lastActivityAt，由 content 的 reportActivity 在每次网络尝试时刷新）。
     // 真卡死（fetch 挂起、无任何回调）→ 两者都不动 → 90s 后被抓；

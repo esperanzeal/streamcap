@@ -481,10 +481,15 @@ window.VGP = window.VGP || {};
       clearInterval(throttleTimer);
 
       // 5. 合并 → blob → DOWNLOAD_BLOB
+      //    合并要逐块读 OPFS 组装 File 列表（大文件可达数分钟），期间**没有任何网络请求**，
+      //    后台的停滞判定只看 done/请求活动 → 会以为任务卡死。这里每读若干块补一次 activity
+      //    心跳，让 background 知道"还在合并"，绝不因合并慢而刷新页面（刷新会打断合并，
+      //    页面重载后任务又被重派 → 重新下载 + 二次导出 → 磁盘出现 "xxx (1).mp4" 重复文件）。
       log('info', `[${taskLabel}] 分块全部完成，开始合并...`);
       reportProgress(downloadId, 98, totalBlocks, totalBlocks, '合并中...');
       const chunks = [];
       for (let b = 0; b < totalBlocks; b++) {
+        if (b % 8 === 0) reportActivity(downloadId); // 合并心跳：只表示"还活着"，不涉及进度
         // 磁盘支撑的 File（不读回 JS 堆）——大文件合并的内存友好路径（P0-5）
         const f = await VGP.opfsGetFile(`dl_${downloadId}_block_${b}.bin`);
         if (!f) throw new Error(`分块 ${b} 缓存丢失`);
@@ -533,6 +538,7 @@ window.VGP = window.VGP || {};
 
       // 合并 → blob → DOWNLOAD_BLOB
       reportProgress(downloadId, 98, received, 0, '合并中...');
+      reportActivity(downloadId); // 合并心跳（流式路径：这一份是唯一一份数据，别被判停摆打断）
       // 用磁盘支撑的 File 组装 Blob（不读回 JS 堆）——与分块/batch/seg 路径一致
       const streamFile = await VGP.opfsGetFile(`dl_${downloadId}_block_0.bin`);
       if (!streamFile) throw new Error('缓存丢失');
@@ -658,6 +664,7 @@ window.VGP = window.VGP || {};
       reportProgress(downloadId, 98, totalItems, totalItems, '合并中...');
       const parts = [];
       for (let i = 0; i < totalItems; i++) {
+        if (i % 8 === 0) reportActivity(downloadId); // 合并心跳：分片已下完，这里只剩磁盘读取，别被判停摆打断
         // 磁盘支撑的 File（不读回 JS 堆）——大文件合并的内存友好路径（P0-5）
         const f = await VGP.opfsGetFile(`dl_${downloadId}_seg_${i}.bin`);
         if (!f) throw new Error(`段 ${i} 缓存丢失`);

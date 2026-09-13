@@ -30,6 +30,7 @@ export function persist() {
     lastProgressAt: d.lastProgressAt, lastDoneAt: d.lastDoneAt,
     lastActivityAt: d.lastActivityAt, // 最近一次"网络尝试"：SW 重启后停滞判定要靠它区分"真卡死/被节流拖着"
     lastRetryAt: d.lastRetryAt,       // 进入 retrying 的时刻：alarm 用它判断退避定时器是否已丢
+    exportedAt: d.exportedAt,         // ★ 最近一次触发导出的时刻：SW 重启后仍要能拦住重复导出（防重复落盘）
     lastPing: d.lastPing,
   }));
   chrome.storage.local.set({ vgp_downloads: list });

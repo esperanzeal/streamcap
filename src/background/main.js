@@ -118,6 +118,10 @@ async function retryExisting(msg, sendResponse) {
 //（failed 任务后续可走"重试智能接管"自动开/接管标签页续传，不依赖原 tab 活着）。
 // v5 状态集（停摆状态已被移除：改为刷新承载页，见 stalled.js reloadTaskTab）
 const TAB_ALIVE_STATUS = new Set(['queued', 'paused', 'downloading', 'retrying', 'exporting']);
+// ★ 重复导出去重窗口（防 E:\Downloads 重复落盘）：同一任务在此窗口内的第二次 DOWNLOAD_BLOB
+//   一律拒绝。窗口取 10 分钟 —— 足以覆盖"承载页刷新→任务重派→重新下载→重新合并"的往返，
+//   又不会挡住用户几小时后主动重试导出（那种情况状态早已是 failed，不会命中本判据）。
+const EXPORT_DEDUP_MS = 10 * 60 * 1000;
 async function closeTabIfIdle(tabId) {
   if (tabId === undefined || tabId === null) return;
   try {
@@ -345,6 +349,18 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.type === 'DOWNLOAD_BLOB') {
     const { downloadId, blobUrl, filename } = msg;
     const tabId = sender.tab?.id;
+    // ★★ 幂等保护（真机反馈：E:\Downloads 大量文件重复落盘）：
+    //   同一个任务只允许导出一次。重复的 DOWNLOAD_BLOB（承载页被刷新后重跑一轮、
+    //   跨页双跑、SW 消息重放）会让 Chrome 再写一个文件 —— conflictAction:'uniquify'
+    //   遇到同名不覆盖、而是另存为 "xxx (1).mp4"，所以用户看到的是同名文件成对出现。
+    const prev = state.downloads[downloadId];
+    if (prev && prev.exportedAt && Date.now() - prev.exportedAt < EXPORT_DEDUP_MS) {
+      log('warn', `[导出] ${taskLabel(downloadId)} ${Math.round((Date.now() - prev.exportedAt) / 1000)}s 前已导出过 → 忽略重复的 DOWNLOAD_BLOB（防重复落盘）`);
+      // 让 content 释放这份多余的 blob 并清掉分片（它已经没用了）
+      chrome.tabs.sendMessage(tabId, { type: 'FINALIZE_DOWNLOAD', downloadId, blobUrl }).catch(() => {});
+      sendResponse({ ok: false, error: '该任务刚已导出过，已忽略重复请求（防重复落盘）' });
+      return true;
+    }
     chrome.downloads.download({
       url: blobUrl,
       filename,
@@ -373,6 +389,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       // 任务进入"导出中"：等待 Chrome 下载结果信号
       const d = state.downloads[downloadId];
       if (d) {
+        d.exportedAt = Date.now(); // ★ 记下导出时刻：EXPORT_DEDUP_MS 窗口内再来的 DOWNLOAD_BLOB 一律拒绝
         d.status = 'exporting';
         d.pct = 99;
         d.error = null;
