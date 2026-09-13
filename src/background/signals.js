@@ -16,12 +16,6 @@ export let loaded = false;
 export function markLoaded() { loaded = true; }
 export const pendingDownloadSignals = [];
 
-// 失败置顶：把来源 tab 移到所在窗口标签栏最前（不激活），几十个标签页里一眼可定位
-function pinFailedTab(tabId) {
-  if (!tabId) return;
-  chrome.tabs.move(tabId, { index: 0 }).catch(() => {});
-}
-
 export function handleDownloadSignal(delta) {
   chrome.storage.session.get('blob_map', s => {
     const m = s.blob_map || {};
@@ -79,7 +73,6 @@ export function handleDownloadSignal(delta) {
             persist();
             broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
             log('error', `[下载器] ${taskLabel(rec.downloadId)} 导出重试失败: ${chrome.runtime.lastError?.message || '未知'}`);
-            pinFailedTab(rec.tabId); // 失败置顶：来源标签页移到最前，方便定位重试
             maybeDispatch();
           } else {
             m[itemId2] = rec;
@@ -96,7 +89,6 @@ export function handleDownloadSignal(delta) {
       persist();
       broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
       log('warn', `[下载器] Chrome 下载项 #${delta.id} 中断(${errCode}) → ${taskLabel(rec.downloadId)} 标为失败（blob 保留可重试）`);
-      pinFailedTab(rec.tabId); // 失败置顶：来源标签页移到最前，方便定位重试
       maybeDispatch();
     } else {
       log('debug', `[下载器] Chrome 下载项 #${delta.id} 状态变化: ${delta.state.current}（未处理）`);
