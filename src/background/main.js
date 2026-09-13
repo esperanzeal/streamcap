@@ -656,6 +656,7 @@ chrome.storage.local.get('vgp_downloads', data => {
       if (d.status === 'queued') {
         queueTask(d.id);
       } else if (d.status === 'downloading' || d.status === 'exporting' || d.status === 'retrying') {
+        state.running[d.id] = d.tabId; // ★ 必须同步重建：slotsFree() 靠 running 计数，漏了会并发超发（原有任务 + 新派满槽）
         state.tabActive[d.tabId] = d.id;
       } else if (d.status === 'stopping') { // 仅兼容 v4 旧数据（v5 不再产生 stopping 状态）
         // ★ SW 重启后 content 旧循环状态不确定（CANCEL 可能已到或消息丢失），

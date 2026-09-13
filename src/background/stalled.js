@@ -1,7 +1,7 @@
 // stalled.js — StreamCap 保活 alarm + 停滞判定/心跳探测/页面停摆刷新复活
 import { state, persist, broadcast, taskLabel } from './state.js';
 import { maybeDispatch } from './scheduler.js';
-import { queueTaskFront } from './pool.js';
+import { queueTaskFront, onTaskSettled } from './pool.js';
 import { log } from './log.js';
 import { findHostForTask, migrateTaskToTab } from './host.js';
 
@@ -36,6 +36,11 @@ async function hostTabDead(d) {
 function failTaskQuick(d, reason) {
   d.status = 'failed';
   d.error = `${reason}（分片保留，可手动重试自动续传）`;
+  onTaskSettled(d); // v5：统一收尾（释放槽 + 归还承载页 + 继续调度），与其它结束路径一致
+  persist();
+  broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
+  log('warn', `[停滞] ${taskLabel(d.id)} ${reason}，标为失败不再重试`);
+}
   state.tabActive[d.tabId] = null;
   persist();
   broadcast({ type: 'DOWNLOAD_UPDATE', download: d });

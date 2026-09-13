@@ -62,10 +62,11 @@ export function progressRatio(d) {
   if (d.total > 0) return d.done / d.total;
   return (d.pct || 0) / 100;
 }
-export function pickNext() {
+export function pickNext(exclude) {
+  const skip = exclude || null; // 本轮已尝试但拿不到承载页的任务：跳过后面的任务才有机会跑
   const list = state.readyQueue
     .map(id => state.downloads[id])
-    .filter(d => d && d.status === 'queued');
+.filter(d => d && d.status === 'queued' && !(skip && skip.has(d.id)));
   if (!list.length) return null;
   const mode = state.sortMode || 'fifo';
   if (mode === 'progress') {
@@ -196,6 +197,9 @@ async function startTaskInTab(d, tabId) {
   state.tabActive[tabId] = d.id;   // 同步占位（第一个 await 之前）
   d.tabId = tabId;                 // 任务记住自己的承载页（结束时才能释放/复用）
   state.running[d.id] = tabId;
+  // ★ 状态必须在这里（第一个 await 之前）就切到 downloading：pump 下一轮开头的 reap()
+  //   会把"状态不是下载中却占着槽"的任务当成泄漏清掉，若等到 load 完再切就会被误清。
+  d.status = "downloading";
   if (!state.tabPool[tabId]) state.tabPool[tabId] = { origin: '', taskId: d.id, lastUsedAt: Date.now() };
   state.tabPool[tabId].taskId = d.id;
   state.tabPool[tabId].lastUsedAt = Date.now();
@@ -214,6 +218,7 @@ async function startTaskInTab(d, tabId) {
     return;
   }
 
+  d.acquireFails = 0; // 成功建立承载页 → 清零失败计数
   d.status = 'downloading';
   d.error = null;
   if (!d.done) d.pct = 0; // 续传保留已有进度
@@ -289,18 +294,32 @@ export function pump() {
   reap(); // 先自愈：清掉"已结束却还占着槽"的任务，否则槽位假满
   pumping = true;
   (async () => {
+      const skipped = new Set(); // 本轮拿不到承载页的任务（防死循环 / 不阻塞队列）
     try {
       while (slotsFree() > 0) {
-        const id = pickNext();
+        const id = pickNext(skipped);
         if (id === null) break;
         const d = state.downloads[id];
         if (!d || d.status !== 'queued') { unqueueTask(id); continue; }
         unqueueTask(id); // 先出队，避免同一任务被重复派发
         const tabId = await acquireTabFor(d);
         if (tabId === null) {
-          queueTask(id); // 拿不到承载页：放回队列等下一轮（不改状态，避免震荡）
-          log('warn', `[调度] ${taskLabel(id)} 暂无可用承载页，保持排队`);
-          break;
+          // 拿不到承载页（来源页打不开 / 加载超时）→ 放回队列。**不能 break**：
+          // pickNext 每次都会先选中队首，队首一直失败就会把后面所有任务饿死。
+          // 记失败次数，超限标失败（有界），否则本轮先跳过它。
+          d.acquireFails = (d.acquireFails || 0) + 1;
+          if (d.acquireFails >= 3) {
+            d.status = "failed";
+            d.error = "来源页无法打开（连续 3 次无法建立承载页），请确认该视频站可访问后重试";
+            persist();
+            broadcast({ type: "DOWNLOAD_UPDATE", download: d });
+            log("warn", `[调度] ${taskLabel(id)} 连续 ${d.acquireFails} 次无法建立承载页，标为失败`);
+            continue;
+          }
+          skipped.add(id);
+          queueTask(id);
+          log("warn", `[调度] ${taskLabel(id)} 暂无可用承载页（第 ${d.acquireFails} 次），本轮先跳过`);
+          continue;
         }
         // ★ await 期间任务可能已被暂停/取消（"全部暂停"就是这种情况）→ 归还承载页，不派发
         if (d.status !== "queued") {

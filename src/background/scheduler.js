@@ -10,7 +10,7 @@
 import { state, persist, broadcast, taskLabel } from './state.js';
 import { log } from './log.js';
 import { detectFormat } from './formats.js';
-import { queueTask, unqueueTask, pump, onTaskSettled, slotsFree } from './pool.js';
+import { queueTask, unqueueTask, pump, onTaskSettled, slotsFree, releaseTab } from './pool.js';
 
 /**
  * 弱指纹：origin + pathname + resolution（忽略 query —— 签名 URL 的时效参数每次不同）。
@@ -122,12 +122,18 @@ export async function prioritizeDownload(downloadId) {
   victim.error = `被优先下载替换（已下载 ${victim.done || 0} 片已保留，稍后自动续传）`;
   unqueueTask(victim.id);
   chrome.tabs.sendMessage(victim.tabId, { type: 'CANCEL_DOWNLOAD', downloadId: victim.id, reason: 'manual_pause' }).catch(() => {});
-  onTaskSettled(victim); // 释放槽 + 归还 tab + 触发下一轮调度
+  // 只释放并发槽，**暂不归还承载页**：victim 的旧 content 循环还没退（CANCEL 未确认），
+  // 立刻归还可被其他任务抢占 → 那一刻同页两个下载循环；victim 3s 后回来还会另建承载页（标签页堆叠）。
+  // → 3s 后（与回队首同一时刻）再归还。
+  delete state.running[victim.id];
+  if (state.tabActive[victim.tabId] === victim.id) state.tabActive[victim.tabId] = null;
+  pump();
   persist();
   broadcast({ type: 'DOWNLOAD_UPDATE', download: victim });
   setTimeout(() => {
     const v = state.downloads[victim.id];
     if (!v || v.status !== 'queued') return; // 已被删除/被用户干预
+    releaseTab(v.tabId); // 旧循环已退，归还承载页供复用
     state.readyQueue.unshift(v.id);
     pump();
   }, 3000);
