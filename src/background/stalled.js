@@ -5,6 +5,7 @@ import { queueTaskFront, onTaskSettled } from './pool.js';
 import { log } from './log.js';
 import { findHostForTask, migrateTaskToTab } from './host.js';
 
+const HOST_GRACE_MS = 90000; // 宿主/content 心跳宽限（原为 60s/120s 两套，已统一）
 const KEEPALIVE_ALARM = 'vgp_keepalive';
 const CLEANUP_ALARM = 'vgp_cleanup';
 
@@ -19,7 +20,7 @@ function pingContent(tabId) {
   });
 }
 // 判定宿主 tab 是否真死：tab 已关闭（tabs.get 失败）或 content 无响应
-//（PING 2s 不通，且最近 60s 无心跳——心跳 10s 一次，60s 无 = content 消息循环已停）。
+//（PING 2s 不通，且最近 HOST_GRACE_MS(90s) 无心跳——心跳 10s 一次，90s 无 = content 消息循环已停）。
 // PING 不通但心跳新鲜：可能只是后台节流消息延迟，保守不算死（交给心跳路径处理）。
 async function hostTabDead(d) {
   if (!d.tabId) return true;
@@ -30,7 +31,7 @@ async function hostTabDead(d) {
   if (tab.discarded) return true;
   const alive = await pingContent(d.tabId);
   if (alive) return false;
-  return !(d.lastPing && Date.now() - d.lastPing < 60000);
+  return !(d.lastPing && Date.now() - d.lastPing < HOST_GRACE_MS);
 }
 // 快速失败：直接 failed 丢 fail 队列并释放并发槽（分片保留，手动重试走接管续传）
 function failTaskQuick(d, reason) {
@@ -161,15 +162,6 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
     broadcast({ type: "DOWNLOAD_UPDATE", download: d });
   }
 
-  // 心跳兜底：SW 刚被唤醒时，检查 downloading 任务是否还活着。
-  // 若 content 已死（页面被冻结/关闭），标为可续传暂停并让出并发槽。
-  const pingers = Object.values(state.downloads)
-    .filter(d => d.status === 'downloading')
-    .map(d => pingDeadTask(d, '页面无响应（后台冻结/关闭），可点继续续传'));
-  Promise.allSettled(pingers).then(() => {
-    maybeDispatch(); // 队列里若有 queued 任务，趁机派发
-  });
-
   // 无进度超时判定：下载中任务若已下载分片数长时间无增长，说明下载循环卡死
   // （fetch 挂起/页面冻结后消息循环还活着但下载不推进）。把任务标为可续传暂停、
   // 释放并发槽、记录 stalledAt 排到队尾——恢复调度后它排最后执行，不反复占槽。
@@ -213,6 +205,18 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
     await reloadTaskTab(d, '页面停摆（疑似被浏览器节流）');
   }
   if (stalled.length > 0) maybeDispatch();
+
+  // 心跳兜底：SW 刚被唤醒时，检查 downloading 任务是否还活着。
+  // ★ 放在无进度停摆判定**之后**：pingDeadTask 会先把无响应任务标 paused 并清 tabActive，
+  //   若先跑心跳，停摆检测会在 `if (state.tabActive[d.tabId] !== d.id) continue;` 处跳过，
+  //   把本可"刷新复活"的任务提前吞掉（v5 防呆修复）。
+  // 若 content 已死（页面被冻结/关闭），标为可续传暂停并让出并发槽。
+  const pingers = Object.values(state.downloads)
+    .filter(d => d.status === 'downloading')
+    .map(d => pingDeadTask(d, '页面无响应（后台冻结/关闭），可点继续续传'));
+  Promise.allSettled(pingers).then(() => {
+    maybeDispatch(); // 队列里若有 queued 任务，趁机派发
+  });
 });
 
 // 心跳探测：downloading 任务若 content script 已死（页面导航/刷新/冻结后无感知），
@@ -229,8 +233,8 @@ export function pingDeadTask(d, pauseReason) {
   return withTimeout(chrome.tabs.sendMessage(d.tabId, { type: 'PING' }), 2000)
     .catch(() => {
       const cur = state.downloads[d.id];
-      // 最近 120s 内收到过 content 心跳 → content 还活着，只是 PING 消息延迟/后台节流，不误伤
-      if (cur && cur.lastPing && Date.now() - cur.lastPing < 120000) return;
+      // 最近 HOST_GRACE_MS(90s) 内收到过 content 心跳 → content 还活着，只是 PING 消息延迟/后台节流，不误伤
+      if (cur && cur.lastPing && Date.now() - cur.lastPing < HOST_GRACE_MS) return;
       if (cur && cur.status === 'downloading' && state.tabActive[cur.tabId] === cur.id) {
         cur.status = 'paused';
         cur.error = pauseReason;
