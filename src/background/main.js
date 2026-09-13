@@ -2,12 +2,13 @@
 // import 各模块时副作用即生效（webRequest/alarms/downloads 监听器注册）。
 import { state, persist, broadcast, taskLabel } from './state.js';
 import { log, getLogs, clearLogs, clearAllLogs } from './log.js';
-import { enqueue, urlKey, maybeDispatch, pauseAll, resumeAll, pauseDownload, cancelDownload, prioritizeDownload, requeueToFront, requeueStalled } from './scheduler.js';
+import { enqueue, urlKey, maybeDispatch, pauseAll, resumeAll, pauseDownload, cancelDownload, prioritizeDownload } from './scheduler.js';
 import { storeVideos, openManager, fillSizes } from './sniffing.js';
 import { handleDownloadSignal, markLoaded, pendingDownloadSignals } from './signals.js';
 import { ensureKeepaliveAlarm, pingDeadTask } from './stalled.js';
 
 import { pingTabLive, findHostForTask, migrateTaskToTab } from './host.js';
+import { queueTask, onTaskSettled } from './pool.js';
 
 // ============ 任务重试（手动路径） ============
 // 宿主选择统一在 host.js findHostForTask：
@@ -34,8 +35,8 @@ async function retryExisting(msg, sendResponse) {
   const d = state.downloads[msg.retryId];
   if (!d) { sendResponse({ ok: false, error: '任务不存在' }); return; }
   // 状态守卫：正在下载/重试/导出/停止确认中的任务不接受重试请求（防双击/断线重发把 downloading 打回 queued）
-  if (d.status === 'downloading' || d.status === 'retrying' || d.status === 'exporting' || d.status === 'stopping') {
-    sendResponse({ ok: false, error: `任务正在${d.status === 'exporting' ? '导出' : d.status === 'stopping' ? '停止确认' : '下载'}，无需重试` });
+  if (d.status === 'downloading' || d.status === 'retrying' || d.status === 'exporting') {
+    sendResponse({ ok: false, error: `任务正在${d.status === 'exporting' ? '导出' : '下载'}，无需重试` });
     return;
   }
   if (d.status === 'completed') {
@@ -115,16 +116,16 @@ async function retryExisting(msg, sendResponse) {
 // ============ 删除已完成任务 → 关闭对应来源标签页 ============
 // 判据：tab 仍存在 + 该 tab 无存活任务。completed/failed/cancelled 不算存活
 //（failed 任务后续可走"重试智能接管"自动开/接管标签页续传，不依赖原 tab 活着）。
-const TAB_ALIVE_STATUS = new Set(['queued', 'paused', 'downloading', 'retrying', 'exporting', 'stopping']);
+// v5 状态集（stopping 已被移除：停摆改为刷新承载页，见 stalled.js reloadTaskTab）
+const TAB_ALIVE_STATUS = new Set(['queued', 'paused', 'downloading', 'retrying', 'exporting']);
 async function closeTabIfIdle(tabId) {
   if (tabId === undefined || tabId === null) return;
   try {
     await chrome.tabs.get(tabId); // tab 已不存在会 throw → 跳过
-    const q = state.tabQueues[tabId] || [];
-    const hasAlive = q.some(id => {
-      const dl = state.downloads[id];
-      return dl && TAB_ALIVE_STATUS.has(dl.status);
-    });
+    // v5：队列不再按 tab 分组 → 直接看有没有任务的承载页仍是这个 tab
+    const hasAlive = Object.values(state.downloads).some(
+      dl => dl.tabId === tabId && TAB_ALIVE_STATUS.has(dl.status)
+    );
     if (hasAlive) return; // 该 tab 还有存活任务（其他排队/下载/暂停任务靠它的 content 执行），不能关
     if (state.tabActive[tabId]) return; // 双保险：调度槽仍被占用
     await chrome.tabs.remove(tabId);
@@ -247,6 +248,19 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
 
   // 删除
+  // 队列排序模式（manager 切换；决定 pool.pickNext 在 readyQueue 里的取用顺序）
+  if (msg.type === 'SET_SORT_MODE') {
+    state.sortMode = msg.value === 'progress' ? 'progress' : 'fifo';
+    log('info', `[排序] 队列排序切换为 ${state.sortMode === 'progress' ? '按进度（先收尾）' : '按创建时间'}`);
+    maybeDispatch();
+    sendResponse({ ok: true, value: state.sortMode });
+    return true;
+  }
+  if (msg.type === 'GET_SORT_MODE') {
+    sendResponse({ value: state.sortMode || 'fifo' });
+    return true;
+  }
+
   if (msg.type === 'DELETE_DOWNLOAD') {
     const d = state.downloads[msg.downloadId];
     if (d) {
@@ -424,6 +438,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           d.status === 'exporting') {
         return;
       }
+      // ★ 轻量活动上报（content 每次分片/分块请求尝试后都会发一次）：只刷新"最近有活动"，
+      //   绝不能落到下面的 pct/done 赋值——它的 msg.done 是 undefined，会把进度写成 undefined。
+      if (msg.activity && msg.done === undefined) {
+        d.lastActivityAt = Date.now();
+        return;
+      }
       // ★ done 单调性保护：续传/重派时 content 的 totalDone 会从 0 重新涨，跳过已落盘批次时
       // 上报的 done 远小于 background 已记录的 done（如跳过 batch 上报 40 < 已记录 600），
       // 若直接覆盖会把进度条拉回旧位置 → 与后续新进度交替闪烁（旧位置↔新位置来回跳）。
@@ -433,14 +453,15 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         d.lastProgressAt = Date.now();
         return;
       }
-      // done 增长检测：进度真正推进才刷新 lastDoneAt（停滞判定的唯一依据）。
+      // done 增长检测：进度真正推进才刷新 lastDoneAt（停滞判定的依据之一）。
       // 用旧 d.done 比较（在覆盖之前），msg.done > d.done 才算增长。
       const progressed = typeof msg.done === 'number' && msg.done > (d.done || 0);
       d.pct = msg.pct; d.done = msg.done; d.total = msg.total;
       d.speed = msg.speed || '';
       d.lastProgressAt = Date.now();
+      d.lastActivityAt = Date.now(); // 带 done 的上报同样是活动证据（与 lastDoneAt 分开记，语义不同）
       d.lastDone = msg.done;
-      if (progressed) d.lastDoneAt = Date.now();
+      if (progressed) { d.lastDoneAt = Date.now(); d.reloadCount = 0; } // 有真实进展 → 重置"刷新复活"计数
       broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
     }
     return;
@@ -464,7 +485,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       d.fileName = msg.fileName || d.fileName || '';
       d.speed = '';
       d.error = msg.note || '已通过页面触发下载（请检查浏览器下载目录确认）';
-      state.tabActive[d.tabId] = null;
+      onTaskSettled(d); // v5：释放槽 + 归还承载页 + 继续调度（retrying 状态下 reap 不会替你清）
       persist();
       broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
       log('warn', `[导出] ${taskLabel(d.id)} ${d.error}`);
@@ -483,25 +504,6 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       // 用户操作或调度器中止的任务（已取消/已暂停/已放回队列）：保留状态，不自动重试、不覆盖
       // 终态（completed/exporting/failed）也直接忽略迟到 ERROR：content 单循环只在结束时上报一次，
       // 但用户双击重试等操作可能造成 background 状态与 content 循环不同步，防止终态被回退重下
-      // ★ stopping 确认：停滞判定发 CANCEL 后 content 旧循环退出的确认信号。
-      //   此时才把任务转 queued 重新入队（重派只在旧循环确认退出后发生，杜绝竞态），
-      //   并在此处累计 consecutiveFails（≤3 次自动重派，超过标 failed 放弃）。
-      //   接受"已暂停"和"已取消"两种文案：content 侧 cancelReasons 若因异常丢失会报"已取消"，
-      //   但 stopping 状态必然是调度器触发（用户手动取消时 status 已是 cancelled，不会是 stopping），
-      //   所以两种文案都应走重排确认，否则任务卡在 stopping 占槽。
-      //   reason 结构化枚举（review P0-1）：stopping 确认只认 reason（abort 类），文案兜底兼容旧消息
-      if (d.status === 'stopping' && (msg.reason || (msg.error || '').includes('已暂停') || (msg.error || '').includes('已取消'))) {
-        // ★ 被优先下载替换的任务：确认旧循环退出后回队首（不计连续失败）
-        if (d.replacedFlag) {
-          delete d.replacedFlag;
-          requeueToFront(d);
-          log('info', `[优先] ${taskLabel(d.id)} 停止确认，回队列等待续传（priority=${d.priority}）`);
-          return;
-        }
-        // 停滞重排（≤3 次重排队尾，超过标 failed）——统一走 requeueStalled
-        requeueStalled(d, false);
-        return;
-      }
       if (msg.reason === 'manual_cancel' || (msg.error || '').includes('已取消') ||
           d.status === 'paused' || d.status === 'cancelled' || d.status === 'queued' ||
           d.status === 'completed' || d.status === 'exporting' || d.status === 'failed' ||
@@ -518,7 +520,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         d.status = 'failed';
         d.error = msg.error;
         d.consecutiveFails = (d.consecutiveFails || 0) + 1;
-        state.tabActive[d.tabId] = null;
+        onTaskSettled(d); // v5：释放槽 + 归还承载页 + 继续调度（retrying 状态下 reap 不会替你清）
         persist();
         broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
         log('warn', `[重试] ${taskLabel(d.id)} 永久错误，直接失败: ${msg.error}`);
@@ -538,7 +540,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         persist();
         broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
         // ★ 让出并发槽：退避期间其他任务可插队，避免失败任务占坑
-        state.tabActive[d.tabId] = null;
+        onTaskSettled(d); // v5：释放槽 + 归还承载页 + 继续调度（retrying 状态下 reap 不会替你清）
         maybeDispatch();
         const delay = d.consecutiveFails * 3000; // 3s / 6s / 9s 退避
         log('info', `[重试] ${taskLabel(d.id)} 失败，${delay}ms 后重新排队（${d.consecutiveFails}/${MAX_RETRY}）`);
@@ -574,15 +576,14 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             persist();
             broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
             // 放回原 tab 队列（保留 createdAt → FIFO 原位置），由 maybeDispatch 统一调度
-            if (!state.tabQueues[d.tabId]) state.tabQueues[d.tabId] = [];
-            if (!state.tabQueues[d.tabId].includes(d.id)) state.tabQueues[d.tabId].push(d.id);
+            queueTask(d.id);
             maybeDispatch();
           });
         }, delay);
       } else {
         d.status = 'failed';
         d.error = msg.error;
-        state.tabActive[d.tabId] = null;
+        onTaskSettled(d); // v5：释放槽 + 归还承载页 + 继续调度（retrying 状态下 reap 不会替你清）
         persist();
         broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
         log('warn', `[重试] ${taskLabel(d.id)} 连续失败 ${fails + 1} 次，转入失败队列`);
@@ -621,14 +622,6 @@ chrome.storage.local.get('vgp_downloads', data => {
   if (list.length > 0) {
     state.nextId = Math.max(...list.map(d => d.id), Date.now()) + 1;
   }
-  // 旧版本任务没有 priority 字段：按 createdAt 排序补序号（FIFO），并恢复 prioritySeq
-  const needsPrio = list.filter(d => d.priority === undefined || d.priority === null);
-  if (needsPrio.length > 0) {
-    const sorted = [...list].sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0));
-    sorted.forEach((d, i) => { if (d.priority === undefined || d.priority === null) d.priority = i + 1; });
-  }
-  state.prioritySeq = Math.max(0, ...list.map(d => d.priority ?? 0));
-  state.priorityFloor = Math.min(0, ...list.map(d => d.priority ?? 0)); // 负向计数器延续（点过优先的任务）
 
   // 区分"浏览器重启"和"SW 空闲重启"：
   // MV3 service worker 空闲约 30s 会被 Chrome 终止、有事件再唤醒（SW 重启很频繁），
@@ -657,23 +650,20 @@ chrome.storage.local.get('vgp_downloads', data => {
       }
     }
 
-    // ★ 重建内存队列/活跃表：SW 重启后全局 tabQueues/tabActive 已清空，
+    // ★ 重建内存队列/活跃表：SW 重启后全局 readyQueue/tabActive 已清空，
     //   若不重建，queued 任务永远不会被 maybeDispatch 派发（任务卡死等待队列）
     for (const d of list) {
       if (d.status === 'queued') {
-        if (!state.tabQueues[d.tabId]) state.tabQueues[d.tabId] = [];
-        if (!state.tabQueues[d.tabId].includes(d.id)) state.tabQueues[d.tabId].push(d.id);
+        queueTask(d.id);
       } else if (d.status === 'downloading' || d.status === 'exporting' || d.status === 'retrying') {
         state.tabActive[d.tabId] = d.id;
-      } else if (d.status === 'stopping') {
+      } else if (d.status === 'stopping') { // 仅兼容 v4 旧数据（v5 不再产生 stopping 状态）
         // ★ SW 重启后 content 旧循环状态不确定（CANCEL 可能已到或消息丢失），
         //   不能继续等确认——直接转 queued 重新入队（旧版 53da483 的处理）。
         //   若 content 还活着：runningDownloads 防重入 + done 单调性兜底，不会双循环。
         d.status = 'queued';
         d.error = null;
-        d.stopPendingAt = null; // 清除：否则派发后超时判定可能误触发
-        if (!state.tabQueues[d.tabId]) state.tabQueues[d.tabId] = [];
-        if (!state.tabQueues[d.tabId].includes(d.id)) state.tabQueues[d.tabId].push(d.id);
+        queueTask(d.id);
       }
     }
     persist();

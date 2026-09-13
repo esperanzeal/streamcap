@@ -3,9 +3,13 @@
 window.VGP = window.VGP || {};
 (function (VGP) {
   // 重试 fetch（含 20s 超时，防 TCP 挂起卡死批次）
-  async function fetchWithRetry(url, retries = 3, signal = null, extraHeaders = {}) {
+  async function fetchWithRetry(url, retries = 3, signal = null, extraHeaders = {}, onAttempt = null) {
     for (let attempt = 1; attempt <= retries; attempt++) {
       if (signal?.aborted) throw new DOMException('已取消', 'AbortError');
+      // ★ 每次真实网络尝试（成功/失败/超时都算）先通知调用方：慢下载、坏分片重试期间
+      //   "done 长时间不涨"但有活动信号，background 据此区分"在动"与"真卡死"
+      //   （见 stalled.js 停滞判定：取 max(lastDoneAt, lastActivityAt)）
+      if (onAttempt) { try { onAttempt(attempt); } catch { /* 回调异常不影响下载 */ } }
       const timeoutSignal = AbortSignal.timeout(20000); // 20s 无响应 → 超时按失败重试
       const sig = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
       try {

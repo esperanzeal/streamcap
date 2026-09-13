@@ -1,5 +1,6 @@
 // host.js — 任务宿主标签页选择与迁移（手动重试 + 自动接管共用）
 import { state } from './state.js';
+import { queueTask } from './pool.js';
 
 export function pingTabLive(tabId) {
   if (tabId === undefined || tabId === null) return Promise.resolve(false);
@@ -91,7 +92,7 @@ export async function findHostForTask(d, { origId, pageUrlHint, openNewTab = tru
   const sameOriginPool = others.filter(isSameOrigin);
   const urlHitPool = others.filter(t => !isSameOrigin(t) && sniffHas(t));
   const source = sameOriginPool.length ? sameOriginPool : urlHitPool;
-  const tabLoad = tid => (state.tabActive[tid] ? 1 : 0) + (state.tabQueues[tid] ? state.tabQueues[tid].length : 0);
+  const tabLoad = tid => (state.tabActive[tid] ? 1 : 0); // v5：队列不绑 tab，负载 = 该 tab 是否在跑
 
   // 活候选按 (负载升序 → 健康优先) 排序；needProbe 时从负载最小开始逐个探测
   const alive = [];
@@ -123,16 +124,15 @@ export async function findHostForTask(d, { origId, pageUrlHint, openNewTab = tru
 }
 
 export function migrateTaskToTab(d, hostTabId, resetCounters = true) {
-  const oldQ = state.tabQueues[d.tabId];
-  if (oldQ) {
-    const i = oldQ.indexOf(d.id);
-    if (i >= 0) oldQ.splice(i, 1);
-  }
+  // v5：任务只在全局 readyQueue 里排队；tab 只是承载页，迁移 = 换承载页 + 释放原来的
   if (state.tabActive[d.tabId] === d.id) state.tabActive[d.tabId] = null;
+  if (state.tabPool[d.tabId]) state.tabPool[d.tabId].taskId = null;
   d.tabId = hostTabId;
-  if (!state.tabQueues[hostTabId]) state.tabQueues[hostTabId] = [];
-  if (!state.tabQueues[hostTabId].includes(d.id)) state.tabQueues[hostTabId].push(d.id);
-  d.status = 'queued';
+  let origin = "";
+  try { origin = new URL(d.pageUrl || d.referer || "").origin; } catch { /* 无来源页 */ }
+  state.tabPool[hostTabId] = { origin, taskId: d.id, lastUsedAt: Date.now() };
+  queueTask(d.id);
+  d.status = "queued";
   d.error = null;
   if (resetCounters) {
     // 手动重试 = 新的尝试周期（保留 createdAt 保持 FIFO 原位置）
@@ -141,5 +141,5 @@ export function migrateTaskToTab(d, hostTabId, resetCounters = true) {
     d.retryCount = 0;
   }
   // resetCounters=false（自动接管）：失败计数不清零 → 停滞/失败上限持续累计，
-  // 保证"换宿主重试"也有界，不会无限兜圈
+  // 保证换承载页重试也有界，不会无限兜圈
 }

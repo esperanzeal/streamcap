@@ -7,6 +7,7 @@
 // 因此：未加载完成时先把信号缓存起来，加载完成后重放（见 main.js 恢复逻辑）。
 import { state, persist, broadcast, taskLabel } from './state.js';
 import { maybeDispatch } from './scheduler.js';
+import { onTaskSettled } from './pool.js';
 import { log } from './log.js';
 
 export let loaded = false;
@@ -42,7 +43,7 @@ export function handleDownloadSignal(delta) {
       d.speed = '';
       d.consecutiveFails = 0;
       d.retryCount = 0;
-      state.tabActive[rec.tabId] = null;
+      onTaskSettled(d); // v5：释放槽 + 归还承载页 + 继续调度（原先只清 tabActive → 槽位假满，后续任务派发不出去）
       persist();
       broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
       log('info', `[下载器] Chrome 下载项 #${delta.id} 完成 → ${taskLabel(rec.downloadId)} 标为已完成`);
@@ -74,7 +75,7 @@ export function handleDownloadSignal(delta) {
             d.status = 'failed';
             d.error = `Chrome 下载中断(${errCode})，重试失败: ${chrome.runtime.lastError?.message || '未知'}。大文件可直接用页面右下角「🗜️ 合并导出」流式保存（分片都在，不会丢）`;
             d.speed = '';
-            state.tabActive[rec.tabId] = null;
+      onTaskSettled(d); // v5：释放槽 + 归还承载页 + 继续调度（原先只清 tabActive → 槽位假满，后续任务派发不出去）
             persist();
             broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
             log('error', `[下载器] ${taskLabel(rec.downloadId)} 导出重试失败: ${chrome.runtime.lastError?.message || '未知'}`);
@@ -91,7 +92,7 @@ export function handleDownloadSignal(delta) {
       d.status = 'failed';
       d.error = `Chrome 下载中断(${errCode})，可在下载管理器点「重试」重新合并导出；大文件（易 OOM）直接用页面右下角「🗜️ 合并导出」流式保存（分片都在，不会丢）`;
       d.speed = '';
-      state.tabActive[rec.tabId] = null;
+      onTaskSettled(d); // v5：释放槽 + 归还承载页 + 继续调度（原先只清 tabActive → 槽位假满，后续任务派发不出去）
       persist();
       broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
       log('warn', `[下载器] Chrome 下载项 #${delta.id} 中断(${errCode}) → ${taskLabel(rec.downloadId)} 标为失败（blob 保留可重试）`);

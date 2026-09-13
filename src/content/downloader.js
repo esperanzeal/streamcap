@@ -27,6 +27,13 @@ window.VGP = window.VGP || {};
     chrome.runtime.sendMessage({ type: 'PROGRESS', downloadId, pct, done, total, speed }).catch(() => {});
   }
 
+  // 轻量"活动"上报：分片/分块请求尝试过（成功、失败、超时都算）就发一次，让 background
+  // 区分"在慢慢重试/慢下载"与"真卡死"——停滞判定只看 done 增长时，坏分片重试 115s 会被
+  // 误判为卡死（CANCEL 打断重试 → 重排 → 再判 → failed）。只带 activity、不带 done：不碰进度字段。
+  function reportActivity(downloadId) {
+    chrome.runtime.sendMessage({ type: 'PROGRESS', downloadId, activity: 1 }).catch(() => {});
+  }
+
   // ============ SW 保活心跳 ============
   // MV3：SW 空闲约 30s 被 Chrome 回收。下载跑在 content，回收不影响下载，
   // 但 SW 内存态（tabActive/tabQueues）会丢、队列没人调度。下载期间每 10s 发
@@ -119,7 +126,7 @@ window.VGP = window.VGP || {};
       const refHeaders = {};
 
       // 1. 获取 m3u8 文本
-      let resp = await fetchWithRetry(m3u8Url, 3, signal, refHeaders);
+      let resp = await fetchWithRetry(m3u8Url, 3, signal, refHeaders, () => reportActivity(downloadId));
       let text = await resp.text();
       log('info', `[${taskLabel}] m3u8 获取成功 (${text.length}B)`);
 
@@ -130,7 +137,7 @@ window.VGP = window.VGP || {};
         const best = selectBestVariant(text);
         textBaseUrl = best ? resolveUrl(best, m3u8Url) : parsed.variantUrls[parsed.variantUrls.length - 1];
         log('info', `[${taskLabel}] 选择子清单: ${textBaseUrl.substring(0, 60)}...`);
-        resp = await fetchWithRetry(textBaseUrl, 3, signal, refHeaders);
+        resp = await fetchWithRetry(textBaseUrl, 3, signal, refHeaders, () => reportActivity(downloadId));
         text = await resp.text();
         parsed = parseM3u8(text, textBaseUrl);
       }
@@ -142,7 +149,7 @@ window.VGP = window.VGP || {};
       // 失败按普通错误上报（可重试），不带永久失败关键词。
       let initBytes = null;
       if (parsed.mapUrl) {
-        const r = await fetchWithRetry(parsed.mapUrl, 3, signal, refHeaders);
+        const r = await fetchWithRetry(parsed.mapUrl, 3, signal, refHeaders, () => reportActivity(downloadId));
         initBytes = new Uint8Array(await r.arrayBuffer());
         // 落盘（dl_{id}_map.bin）：手动「合并导出」只能读 OPFS，若不落盘其产物会缺 init 无法播放
         await opfsWrite(`dl_${downloadId}_map.bin`, initBytes);
@@ -210,7 +217,7 @@ window.VGP = window.VGP || {};
       // 让 background 能区分"下载在推进只是慢"与"真卡死"（done 增长仍由批次循环上报）。
       const throttleTimer = startThrottle(downloadId, () => {
         const elapsed = (performance.now() - downloadStartTime) / 1000;
-        return { pct: Math.round(totalDone / total * 100), done: totalDone, total, speed: elapsed > 1 ? formatSpeed(networkBytes / elapsed) : '' };
+        return { pct: Math.round(totalDone / total * 100), done: totalDone, total, speed: liveSpeed(downloadId) };
       });
       for (let batchIdx = 0; batchIdx < totalBatches; batchIdx++) {
         if (completed.has(batchIdx)) {
@@ -251,9 +258,10 @@ window.VGP = window.VGP || {};
           const results = await Promise.allSettled(mini.map(async (url, bi) => {
             const idx = i + bi;
             try {
-              const r = await fetchWithRetry(url, 3, signal, refHeaders);
+              const r = await fetchWithRetry(url, 3, signal, refHeaders, () => reportActivity(downloadId));
               const rawBuf = await r.arrayBuffer();
               networkBytes += rawBuf.byteLength;
+              trackBytes(downloadId, networkBytes); // 实时速度采样
               let segData = new Uint8Array(rawBuf);
               if (keySegments.length > 0) {
                 const ks = findKeyForSegment(keySegments, segStart + idx);
@@ -283,7 +291,7 @@ window.VGP = window.VGP || {};
           }));
           totalDone = segStart + batchDone;
           const elapsed = (performance.now() - downloadStartTime) / 1000;
-          const speed = elapsed > 1 ? formatSpeed(networkBytes / elapsed) : '';
+          const speed = liveSpeed(downloadId); // 实时速度
           const pct = Math.round((totalDone / total) * 100);
           reportProgress(downloadId, pct, totalDone, total, speed);
         }
@@ -297,9 +305,10 @@ window.VGP = window.VGP || {};
           const segNum = segStart + i + 1;
           try {
             log('info', `[${taskLabel}] 重试分片 ${segNum}`);
-            const r = await fetchWithRetry(batchUrls[i], 5, signal, refHeaders);
+            const r = await fetchWithRetry(batchUrls[i], 5, signal, refHeaders, () => reportActivity(downloadId));
             const rawBuf = await r.arrayBuffer();
             networkBytes += rawBuf.byteLength;
+            trackBytes(downloadId, networkBytes); // 实时速度采样
             // 重试成功后：该分片计入成功进度（并行阶段失败时没计，这里补上）
             totalDone++;
             reportProgress(downloadId, Math.round(totalDone / total * 100), totalDone, total, '');
@@ -453,7 +462,7 @@ window.VGP = window.VGP || {};
         const end = Math.min(start + BLOCK_SIZE, size) - 1;
         let data;
         try {
-          const r = await fetchWithRetry(url, 3, signal, { Range: `bytes=${start}-${end}` });
+          const r = await fetchWithRetry(url, 3, signal, { Range: `bytes=${start}-${end}` }, () => reportActivity(downloadId));
           data = new Uint8Array(await r.arrayBuffer());
         } catch (err) {
           if (err.name === 'AbortError') throw err;
@@ -557,7 +566,7 @@ window.VGP = window.VGP || {};
     let throttleTimer = null;
     try {
       // 1. 获取 mpd
-      const resp = await fetchWithRetry(mpdUrl, 3, signal, {});
+      const resp = await fetchWithRetry(mpdUrl, 3, signal, {}, () => reportActivity(downloadId));
       const xml = await resp.text();
       const doc = new DOMParser().parseFromString(xml, 'application/xml');
       if (doc.querySelector('parsererror')) throw new Error('mpd 解析失败');
@@ -627,7 +636,7 @@ window.VGP = window.VGP || {};
         }
         let data;
         try {
-          const r = await fetchWithRetry(urls[i], 3, signal, {});
+          const r = await fetchWithRetry(urls[i], 3, signal, {}, () => reportActivity(downloadId));
           data = new Uint8Array(await r.arrayBuffer());
         } catch (err) {
           if (err.name === 'AbortError') throw err;
@@ -669,6 +678,44 @@ window.VGP = window.VGP || {};
     }
   }
 
+  // ============ 实时速度（滑动窗口） ============
+  // 只统计"最近 4 秒"的字节增量，而不是"从任务开始到现在的平均速度"——
+  // 平均值会被历史拉平：任务单独吃满带宽时仍显示旧的慢速值（真机实测：8 并发时 2.5MB/s，
+  // 只剩它一个吃满 14MB/s 仍显示 2.5），任务卡死后也不下降（僵在几十 KB）。
+  const speedTrack = new Map(); // downloadId → { samples: [{ t, bytes }], text }
+  const SPEED_WINDOW_MS = 4000; // 4s 窗口 = "当前速度"，太长会把之前的慢速段一起平均进来
+
+  // 每下完一个分片/分块调用：记录 (时间, 累计字节) 快照
+  function trackBytes(downloadId, totalBytes) {
+    let s = speedTrack.get(downloadId);
+    if (!s) { s = { samples: [], text: "", lastAt: 0 }; speedTrack.set(downloadId, s); }
+    const now = performance.now();
+    s.samples.push({ t: now, bytes: totalBytes });
+    while (s.samples.length > 1 && now - s.samples[0].t > SPEED_WINDOW_MS) s.samples.shift();
+  }
+
+  // 当前实时速度：窗口内最老/最新两点求差。样本间隔太近（<0.5s）时沿用上次值，避免数字抖动。
+  // 若窗口里已不足 2 个样本（长时间没有新分片完成）→ 返回空，UI 不再显示陈旧速度。
+  function liveSpeed(downloadId) {
+    const s = speedTrack.get(downloadId);
+    if (!s || s.samples.length < 2) { if (s) s.text = ""; return ""; }
+    const now = performance.now();
+    // 只保留窗口内的样本；样本不足 2 个（长时间没有新分片 = 实际停摆）→ 清空速度，UI 不再显示陈旧值
+    while (s.samples.length > 1 && now - s.samples[0].t > SPEED_WINDOW_MS) s.samples.shift();
+    if (s.samples.length < 2) { s.text = ""; return ""; }
+    // 距上次算过不到 1s → 沿用上次值，避免界面数字抖动
+    if (s.lastAt && now - s.lastAt < 1000) return s.text;
+    const a = s.samples[0], b = s.samples[s.samples.length - 1];
+    const dt = (b.t - a.t) / 1000;
+    if (dt < 0.4) return s.text;
+    s.lastAt = now;
+    s.text = formatSpeed((b.bytes - a.bytes) / dt);
+    return s.text;
+  }
+
+  // 任务结束时清掉采样（避免 Map 长期占用）
+  function clearSpeed(downloadId) { speedTrack.delete(downloadId); }
+
   function formatSpeed(bytesPerSec) {
     if (bytesPerSec < 0) return '';
     if (bytesPerSec > 1024 * 1024) return (bytesPerSec / 1024 / 1024).toFixed(1) + ' MB/s';
@@ -700,11 +747,11 @@ window.VGP = window.VGP || {};
     let last = 0;
     return setInterval(() => {
       const now = Date.now();
-      if (now - last < 15000) return;
+      if (now - last < 3000) return; // v5：实时速度 → 3s 上报一次（原 15s 太滞后）
       last = now;
       const p = getProgress(now);
       reportProgress(downloadId, p.pct, p.done, p.total, p.speed || '');
-    }, 5000);
+    }, 1000);
   }
 
   // 合并导出：blob → DOWNLOAD_BLOB → 失败回退 a.click() → 60s 后清理

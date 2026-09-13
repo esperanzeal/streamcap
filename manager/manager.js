@@ -13,6 +13,7 @@ const $$ = s => document.querySelectorAll(s);
 
 let downloads = {};
 let filter = 'all';
+let sortMode = 'fifo'; // 队列排序偏好（v5，与 background 的 state.sortMode 同步）
 
 const ICONS = { queued: '⏳', downloading: '⬇️', retrying: '🔁', exporting: '📤', completed: '✅', failed: '❌', cancelled: '🚫', paused: '⏸️', stopping: '⏸️' };
 const BADGES = {
@@ -26,13 +27,22 @@ const BARS = { queued: 'bar-q', downloading: 'bar-go', retrying: 'bar-go', expor
 function act(msg) { chrome.runtime.sendMessage(msg).catch(() => {}); }
 
 function render() {
-  // 排序：状态分组（进行中/下载中置顶），组内按 priority 序号小到大
-  // （priority 变化会触发 DOWNLOAD_UPDATE → render，自动重排）
-  const statusRank = { downloading: 0, retrying: 0, exporting: 0, stopping: 0, queued: 1, paused: 1, completed: 2, failed: 2, cancelled: 2 };
+  // 排序（v5）：
+  //   · 运行中（下载/导出）固定置顶，出一个进一个、位置不因重排而跳动；
+  //   · 队列中按 sortMode 排（fifo=创建时间先来先跑 / progress=进度百分比高的优先，先收尾）；
+  //   · 其余（暂停/失败/取消/完成）按创建时间。
+  //   不再依赖已废弃的 priority —— v5 由全局队列（pool.pickNext）决定实际派发顺序。
+  // 进度比率：与 background 的 pool.progressRatio 保持一致（按百分比，不按分片数）
+  const ratioOf = d => (d.total > 0 ? d.done / d.total : (d.pct || 0) / 100);
+  const RUNNING = new Set(["downloading", "exporting"]);
+  const rankOf = d => (RUNNING.has(d.status) ? 0 : (d.status === "queued" ? 1 : 2));
   const all = Object.values(downloads).sort((a, b) => {
-    const ra = statusRank[a.status] ?? 3, rb = statusRank[b.status] ?? 3;
+    const ra = rankOf(a), rb = rankOf(b);
     if (ra !== rb) return ra - rb;
-    return (a.priority ?? Number.MAX_SAFE_INTEGER) - (b.priority ?? Number.MAX_SAFE_INTEGER);
+    if (ra === 1 && sortMode === "progress") {
+      return ratioOf(b) - ratioOf(a) || (a.createdAt || 0) - (b.createdAt || 0);
+    }
+    return (a.createdAt || 0) - (b.createdAt || 0);
   });
   const cnt = {};
   all.forEach(d => { cnt[d.status] = (cnt[d.status] || 0) + 1; });
@@ -72,7 +82,9 @@ function render() {
     const barW = d.pct || 0;
     const doneText = d.total ? `${d.done}/${d.total}` : '—';
     // 速度/临时文案只在下载中、重试中显示（已完成/失败等不显示，避免残留"合并中"等）
-    const speedText = (d.status === 'downloading' || d.status === 'retrying') ? (d.speed || '') : '';
+    // 速度新鲜度：20s 没有进度上报（卡死/被节流）→ 不显示旧速度（原先会僵在几十 KB 不动）
+    const speedFresh = d.lastProgressAt && Date.now() - d.lastProgressAt < 20000;
+    const speedText = ((d.status === 'downloading' || d.status === 'retrying') && speedFresh) ? (d.speed || '') : '';
     // 导出中提示：与"下载中"视觉区分，提醒别关页面
     const exportingHint = isExporting
       ? '<div style="font-size:11px;color:#d29922;margin-top:4px;">📤 文件保存中，请勿关闭此页面</div>'
@@ -137,6 +149,24 @@ function render() {
     });
   });
 }
+
+// ============ 队列排序切换（v5） ============
+// 写回 background 的 state.sortMode（决定 pool.pickNext 的实际派发顺序），并本地重排列表
+const sortSel = $('#sortMode');
+if (sortSel) {
+  sortSel.addEventListener('change', () => {
+    sortMode = sortSel.value;
+    act({ type: 'SET_SORT_MODE', value: sortMode });
+    render();
+  });
+}
+chrome.runtime.sendMessage({ type: 'GET_SORT_MODE' }, resp => {
+  if (resp && resp.value) {
+    sortMode = resp.value;
+    if (sortSel) sortSel.value = sortMode;
+    render();
+  }
+});
 
 // ============ 过滤标签 ============
 $$('.tab-btn').forEach(b => {

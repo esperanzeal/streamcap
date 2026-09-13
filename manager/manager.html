@@ -105,6 +105,11 @@
       <option value="1">1</option><option value="2">2</option><option value="4" selected>4</option>
       <option value="8">8</option><option value="16">16</option><option value="0">无限</option>
     </select>
+    <label style="color:#8b949e;font-size:12px;margin-left:8px;">队列排序:</label>
+    <select id="sortMode" style="background:#21262d;color:#c9d1d9;border:1px solid #30363d;border-radius:6px;padding:4px 8px;font-size:12px;">
+      <option value="fifo" selected>按创建时间</option>
+      <option value="progress">按进度（先收尾）</option>
+    </select>
     <span class="spacer"></span>
     <span id="stats" class="stats"></span>
     <label style="color:#8b949e;font-size:12px;margin-right:4px;" title="在视频网站页面右下角显示/隐藏「合并导出」按钮">

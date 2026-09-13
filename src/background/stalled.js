@@ -1,6 +1,7 @@
-// stalled.js — StreamCap 保活 alarm + 停滞判定/心跳探测/stopping 兜底
+// stalled.js — StreamCap 保活 alarm + 停滞判定/心跳探测/页面停摆刷新复活
 import { state, persist, broadcast, taskLabel } from './state.js';
-import { maybeDispatch, requeueToFront, requeueStalled } from './scheduler.js';
+import { maybeDispatch } from './scheduler.js';
+import { queueTaskFront } from './pool.js';
 import { log } from './log.js';
 import { findHostForTask, migrateTaskToTab } from './host.js';
 
@@ -70,6 +71,53 @@ async function tryAutoAdopt(d, deadReason) {
   return false;
 }
 
+// 页面停摆/被回收 → 刷新该 tab 并重新注入任务（用户拍板：降速异常就刷新重新加载）。
+// 为什么刷新有效：OPFS 分片按 origin 存盘、不随页面销毁 → 刷新后按 resumeFrom 继续续传；
+// 而浏览器对标签的节流（后台降级 / Memory Saver 丢弃）会随页面重建解除
+// （真机实测：被节流的任务重建页面后恢复正常速度，重启后 8 并发可健康跑数小时）。
+// 与"死宿主"的区别：这里页面还活着（PING 通、心跳新鲜），只是没在跑。
+// 有界：同一任务最多刷新 MAX_RELOAD 次；有真实进展时 main.js 会把 reloadCount 清零。
+const MAX_RELOAD = 3;
+async function reloadTaskTab(d, reason) {
+  if (d.status === 'exporting') return; // 导出中的 blob 随页面销毁会丢 → 绝不刷新
+  const tabId = d.tabId;
+  const n = (d.reloadCount || 0) + 1;
+  if (n > MAX_RELOAD) {
+    failTaskQuick(d, `${reason}，已刷新页面 ${MAX_RELOAD} 次仍无进展`);
+    return;
+  }
+  d.reloadCount = n;
+  // 让位：刷新期间不占并发槽（页面随即被销毁，content 循环自然消失）
+  if (state.tabActive[tabId] === d.id) state.tabActive[tabId] = null;
+  d.status = 'queued'; // 回队列；done/pct 保留 → 续传（不是从头下）
+  d.error = `${reason}，正在刷新页面重新续传（${n}/${MAX_RELOAD}）`;
+  persist();
+  broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
+  maybeDispatch(); // 空出的并发槽先让给其他任务
+  log('warn', `[节流] ${taskLabel(d.id)} ${reason} → 刷新 tab${tabId} 重新续传（${n}/${MAX_RELOAD}）`);
+  try {
+    await chrome.tabs.reload(tabId);
+  } catch {
+    failTaskQuick(d, `${reason}，且页面已关闭无法刷新`);
+    return;
+  }
+  // 等 content 重新注入（≤20s，与 findHostForTask 打开新页后的就绪轮询同规格）
+  let ready = false;
+  for (let i = 0; i < 40; i++) {
+    await new Promise(r => setTimeout(r, 500));
+    if (await pingContent(tabId)) { ready = true; break; }
+  }
+  if (!ready) {
+    failTaskQuick(d, `${reason}，刷新后页面仍无响应`);
+    return;
+  }
+  // 页面 URL 未变（同源）→ 放回该 tab 队首优先续传。
+  // 签名过期不在这里处理：页面刷新后 content 会重新嗅探写入 sniffStore，
+  // 下载流程也会重新拉取清单 → 新签名自然生效。
+  queueTaskFront(d.id);
+  maybeDispatch();
+}
+
 
 export function ensureKeepaliveAlarm() {
   chrome.alarms.get(KEEPALIVE_ALARM, a => {
@@ -100,30 +148,17 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
   }
 
   if (alarm.name !== KEEPALIVE_ALARM) return;
-  // ★ 定期清理：queued 任务所在 tab 已失效（页面被关闭/无效）→ 标 failed，
-  //   否则任务停留在 queued 永不派发（maybeDispatch 只在并发有空槽时才轮到它，
-  //   且 dispatchTab 预检只在派发时触发；这里兜底每分钟清理一次）。
-  const queuedTasks = Object.values(state.downloads).filter(d => d.status === 'queued');
-  if (queuedTasks.length > 0) {
-    Promise.all(queuedTasks.map(d => chrome.tabs.get(d.tabId).then(() => null, () => d.id)))
-      .then(invalidIds => {
-        const bad = invalidIds.filter(Boolean);
-        if (bad.length) {
-          for (const id of bad) {
-            const d = state.downloads[id];
-            if (d && d.status === 'queued') {
-              d.status = 'failed';
-              d.error = '页面已关闭，无法下载';
-              const q = state.tabQueues[d.tabId];
-              if (q) { const i = q.indexOf(id); if (i >= 0) q.splice(i, 1); }
-              persist();
-              broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
-            }
-          }
-          log('warn', `[清理] ${bad.length} 个排队任务所在页面已关闭，标为失败`);
-          maybeDispatch();
-        }
-      });
+  // v5：queued 任务不再绑定某个 tab（tab 只是承载页）→ 承载页关闭不必标失败，
+  //   调度器下一轮 pump 会给它复用/新建承载页。只有任务连来源页都没有、
+  //   根本无法建立承载页时，才算真的无法继续（提示用户去原视频页重新嗅探）。
+  const orphans = Object.values(state.downloads).filter(d =>
+    d.status === "queued" && !d.pageUrl && !d.referer
+  );
+  for (const d of orphans) {
+    d.status = "failed";
+    d.error = "缺少来源页面信息，无法建立承载页（请在原视频页重新嗅探后重试）";
+    persist();
+    broadcast({ type: "DOWNLOAD_UPDATE", download: d });
   }
 
   // 心跳兜底：SW 刚被唤醒时，检查 downloading 任务是否还活着。
@@ -142,60 +177,42 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
   // 是独立定时器，循环卡死时照样在发，导致 lastProgressAt/lastPing 永远新鲜，
   // 任务永远踢不出去。lastDoneAt 只在 done 真正增长时刷新（见 main.js PROGRESS 处理）。
   const now = Date.now();
-  const DONE_TIMEOUT = 90000; // 90s 无进度增长（done 不变）→ 判停滞踢出
+  const DONE_TIMEOUT = 90000; // 90s 既无进度增长、也无任何请求活动 → 判停滞踢出
   const stalled = Object.values(state.downloads).filter(d => {
     if (d.status !== 'downloading') return false;
-    // 真卡死（fetch 挂起/循环死）时 done 永远不涨；慢下载/重试阶段 done 会涨（慢但涨）。
-    const doneStalled = now - (d.lastDoneAt || d.createdAt || 0) > DONE_TIMEOUT;
-    return doneStalled;
+    // 判定依据 = 最近一次**真实活动**：done 增长（lastDoneAt）或任意分片/分块请求尝试
+    // （lastActivityAt，由 content 的 reportActivity 在每次网络尝试时刷新）。
+    // 真卡死（fetch 挂起、无任何回调）→ 两者都不动 → 仍会在 90s 后被抓；
+    // 慢下载 / 坏分片重试中（每 ≤20s 一次尝试）→ 有活动 → 不再被误判为卡死。
+    // ★ 仍不能用 lastProgressAt：15s 节流上报是 setInterval，循环卡死时照样在发。
+    const lastAlive = Math.max(d.lastDoneAt || 0, d.lastActivityAt || 0, d.createdAt || 0);
+    return now - lastAlive > DONE_TIMEOUT;
   });
   for (const d of stalled) {
     // tabActive 归属校验：只有当前仍由本任务占用并发槽时才释放，避免误清该 tab 其他任务的槽
     if (state.tabActive[d.tabId] !== d.id) continue;
-    // ★ 宿主 tab 已死（关闭/冻结无响应）：不再直接 fail——自动接管：找已开启的活
-    //   同源宿主等待续传（无人值守不开新页）；找不到才 failed（用户拍板）
+    // ① 页面被 Memory Saver 丢弃（tab 还在、页面已被卸载）→ 刷新即可复活（OPFS 分片不丢）
+    let tabInfo = null;
+    try { tabInfo = await chrome.tabs.get(d.tabId); } catch { tabInfo = null; }
+    if (tabInfo && tabInfo.discarded) {
+      await reloadTaskTab(d, '页面已被浏览器回收');
+      continue;
+    }
+    // ② 页面真死（tab 已关闭 / PING 不通且心跳也停）→ 自动接管：找已开启的活同源宿主
+    //    等待续传（无人值守不开新页）；找不到才 failed（用户拍板）
     if (await hostTabDead(d)) {
       await tryAutoAdopt(d, '页面已关闭或无响应');
       continue;
     }
-    // 两阶段停止：先发 CANCEL 通知 content 停止下载循环，任务进入 stopping 状态
-    // （占槽但不算 downloading、不参与重派），等 content 上报 DOWNLOAD_ERROR 确认
-    // 旧循环已退出后，才转 queued 重新入队由调度器重派。避免"不等确认就重派"
-    // 导致：新 START 撞上旧循环被忽略 / 迟到 DOWNLOAD_ERROR 双计数 / 状态抖动。
-    d.status = 'stopping';
-    d.error = '无进度，等待停止确认后自动重排';
-    d.stopPendingAt = Date.now(); // 超时兜底：content 无响应时强制转 queued
-    // 通知 content 停止下载循环（防卡死循环继续空转/继续占资源）
-    chrome.tabs.sendMessage(d.tabId, { type: 'CANCEL_DOWNLOAD', downloadId: d.id, reason: 'stalled' }).catch(() => {});
-    persist();
-    broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
-    log('warn', `[停滞] ${taskLabel(d.id)} 无进度超过 ${DONE_TIMEOUT / 1000}s，已发送停止信号，等待确认后自动重排`);
+    //③ 页面活着但"停摆"：PING 通、心跳新鲜，可是 done 与请求活动双陈旧（DONE_TIMEOUT 90s 无任何进展）
+    //    —— 典型表现是浏览器对标签节流（实测：被节流的页面重建后恢复正常速度；
+    //    重启浏览器 + 新建页后 8 并发健康跑数小时）。
+    //    旧逻辑在这里发 CANCEL 走 stopping→重排，等于把任务放回**同一个卡住的页面**反复重来；
+    //    改为**刷新该页面 → 等 content 重新就绪 → 重新注入任务**：
+    //    OPFS 分片按 origin 存盘、不随页面销毁，刷新后按 resumeFrom 继续，进度不丢。
+    await reloadTaskTab(d, '页面停摆（疑似被浏览器节流）');
   }
-  // stopping 超时兜底：content 已死（页面关闭/冻结无响应）→ 收不到 DOWNLOAD_ERROR 确认，
-  // 30s 后强制处理（此时旧循环必然已随页面销毁，无竞态）。
-  const now2 = Date.now();
-  const stuck = Object.values(state.downloads).filter(d => d.status === 'stopping' && d.stopPendingAt && now2 - d.stopPendingAt > 30000);
-  for (const d of stuck) {
-    // ★ 30s 无确认 = content 没收到/没处理 CANCEL → 宿主大概率已死 → 自动接管
-    //   （活同源宿主等待续传；无才 failed，计数保留有界）
-    if (await hostTabDead(d)) {
-      await tryAutoAdopt(d, '停止确认超时（页面无响应）');
-      continue;
-    }
-    // 释放并发槽：stopping 一直占着槽（等待确认），超时兜底转 queued 时必须释放，
-    // 否则 maybeDispatch 因 tabActive[tabId] 非空永久跳过该 tab，任务卡死永不重派
-    state.tabActive[d.tabId] = null;
-    // ★ 被优先下载替换的任务：超时兜底同样回队列（不计连续失败），priority 保持原值
-    if (d.replacedFlag) {
-      delete d.replacedFlag;
-      requeueToFront(d);
-      log('warn', `[优先] ${taskLabel(d.id)} 停止确认超时（content 无响应），回队列（priority=${d.priority}）`);
-      continue;
-    }
-    // 与确认路径一致：超时兜底也累计停滞次数（仅 1 次自动重排，超过标 failed 放弃）——统一 requeueStalled
-    requeueStalled(d, true);
-  }
-  if (stalled.length > 0 || stuck.length > 0) maybeDispatch();
+  if (stalled.length > 0) maybeDispatch();
 });
 
 // 心跳探测：downloading 任务若 content script 已死（页面导航/刷新/冻结后无感知），

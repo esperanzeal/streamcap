@@ -1,0 +1,291 @@
+// pool.js — v5 调度核心：全局就绪队列 + 并发槽位 + tab 池
+//
+// 为什么要重构（旧结构的病根）：
+//   旧结构 state.tabQueues 是 **tabId → [任务id]**，"任务排在哪个 tab 上"决定它何时能跑。
+//   一旦某 tab 被占用，挂在该 tab 下的所有任务全部冻结——即使全局并发槽空着也调度不到，
+//   这就是"某任务长期占 tab，后续任务永远等不到"的根因；而"点重试失败把任务全堆到一个 tab"
+//   也是它（findHostForTask 优先复用同一个同源页）。
+//
+// v5 结构：
+//   ① 任务只排在一个**全局就绪队列** state.readyQueue 里，位置由排序策略决定，与 tab 无关；
+//   ② 每个 tab 同一时刻只跑一个任务（沿用 state.tabActive 的语义 → 50 处引用无需改动）；
+//   ③ 槽位 = 用户设置的并发数（state.slotCount，0 = 无限）；运行中任务数满槽就不再派发；
+//      任务结束 → 释放槽 → 立刻取下一个（"出一个进一个"，运行中位置固定不重排）；
+//   ④ **tab 池**：按需创建、同源复用、空闲超时回收。并发 8 就用 8 个 tab 并行，
+//      而不是把几十个任务塞进同一个 tab 排队。
+import { state, persist, broadcast, taskLabel } from './state.js';
+import { log } from './log.js';
+
+const TAB_IDLE_KEEP_MS = 5 * 60 * 1000; // 空闲 tab 保留 5 分钟，之后回收（防标签页堆积）
+const CONTENT_FILES = [
+  'src/content/log.js', 'src/content/opfs.js', 'src/content/formats.js',
+  'src/content/hls.js', 'src/content/downloader.js', 'src/content/merge.js',
+  'src/content/sniffer.js', 'src/content/main.js',
+];
+
+function originOf(u) { try { return new URL(u).origin; } catch { return ''; } }
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+async function tabExists(tabId) {
+  try { await chrome.tabs.get(tabId); return true; } catch { return false; }
+}
+function pingTab(tabId) {
+  return new Promise(resolve => {
+    try {
+      chrome.tabs.sendMessage(tabId, { type: 'PING' }, r => resolve(!chrome.runtime.lastError && r && r.ok === true));
+    } catch { resolve(false); }
+  });
+}
+
+// ============ 就绪队列 ============
+// 队列只存 id；排序在取用时按 state.sortMode 计算（任务量几十个，开销可忽略）
+export function queueTask(id) {
+  if (!state.readyQueue.includes(id)) state.readyQueue.push(id);
+}
+// 插到队首（重新注入 / 让位后的任务优先跑）
+export function queueTaskFront(id) {
+  const i = state.readyQueue.indexOf(id);
+  if (i >= 0) state.readyQueue.splice(i, 1);
+  state.readyQueue.unshift(id);
+}
+export function unqueueTask(id) {
+  const i = state.readyQueue.indexOf(id);
+  if (i >= 0) state.readyQueue.splice(i, 1);
+}
+export function isQueued(id) { return state.readyQueue.includes(id); }
+
+// 取下一个要跑的任务：
+//   fifo（默认）= 创建时间先来先跑；progress = 进度百分比高的优先（先收尾，尽快减少任务总量）
+// 进度比率（0~1）：必须按**百分比**而不是分片数比较 —— 各任务总片数不同，
+// 直接比 done 会让「1000 片下了 500 片(50%)」排在「100 片下了 90 片(90%)」前面。
+export function progressRatio(d) {
+  if (d.total > 0) return d.done / d.total;
+  return (d.pct || 0) / 100;
+}
+export function pickNext() {
+  const list = state.readyQueue
+    .map(id => state.downloads[id])
+    .filter(d => d && d.status === 'queued');
+  if (!list.length) return null;
+  const mode = state.sortMode || 'fifo';
+  if (mode === 'progress') {
+    list.sort((a, b) => progressRatio(b) - progressRatio(a) || (a.createdAt || 0) - (b.createdAt || 0));
+  } else {
+    list.sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0));
+  }
+  return list[0].id;
+}
+
+// ============ 槽位 ============
+export function runningCount() { return Object.keys(state.running).length; }
+export function slotMax() { return state.slotCount === 0 ? Infinity : (state.slotCount || 4); }
+export function slotsFree() { return slotMax() - runningCount(); }
+
+// ============ tab 池 ============
+export function poolEntry(tabId) { return state.tabPool[tabId] || null; }
+
+export function releaseTab(tabId) {
+  const e = state.tabPool[tabId];
+  if (e) { e.taskId = null; e.lastUsedAt = Date.now(); }
+}
+
+// 取一个可承载该任务的 tab：
+//   ① 任务原 tab（重试场景：零打扰，页面就在那儿）
+//   ② 池内**同源且空闲**的 tab（复用，省一次页面加载）
+//   ③ 新建 tab（打开任务来源页）——"并发几个槽就开几个 tab"就靠这里
+// 失败返回 null（调用方把任务放回队列，稍后再试）。
+export async function acquireTabFor(task) {
+  const origin = originOf(task.pageUrl || task.referer || '');
+  // ① 原 tab 仍活且空闲
+  const orig = task.tabId;
+  if (orig && state.tabPool[orig] && state.tabPool[orig].taskId === null &&
+      !state.tabActive[orig] && await tabExists(orig)) {
+    state.tabPool[orig].taskId = task.id;
+    state.tabPool[orig].lastUsedAt = Date.now();
+    return orig;
+  }
+  // ② 池内同源空闲 tab
+  for (const [tid, e] of Object.entries(state.tabPool)) {
+    const id = Number(tid);
+    if (e.taskId !== null) continue;
+    if (e.origin !== origin) continue;
+    if (state.tabActive[id]) continue;
+    if (!(await tabExists(id))) { delete state.tabPool[id]; continue; }
+    e.taskId = task.id;
+    e.lastUsedAt = Date.now();
+    return id;
+  }
+  // ③ 新建 tab 承载（后台打开：不抢焦点——8 个并发时有 7 个必然是后台，
+  //    浏览器对后台标签的节流由 stalled.js 的"停摆→刷新页面"兜底）
+  const pageUrl = task.pageUrl || task.referer;
+  if (!pageUrl) return null;
+  let opened = null;
+  try {
+    opened = await chrome.tabs.create({ url: pageUrl, active: false });
+    let ready = false;
+    for (let i = 0; i < 40; i++) { // ≤20s：等页面加载 + content script 注入
+      await sleep(500);
+      if (await pingTab(opened.id)) { ready = true; break; }
+    }
+    if (!ready) { await chrome.tabs.remove(opened.id); return null; }
+  } catch {
+    if (opened) { try { await chrome.tabs.remove(opened.id); } catch { /* ignore */ } }
+    return null;
+  }
+  state.tabPool[opened.id] = { origin: originOf(pageUrl), taskId: task.id, lastUsedAt: Date.now() };
+  log('info', `[池] 新建承载页 tab${opened.id}（${origin}）`);
+  return opened.id;
+}
+
+// 空闲回收：关掉"超过保留时长且无任务"的 tab（由 alarm 定期调用）
+export async function sweepIdleTabs() {
+  const now = Date.now();
+  for (const [tid, e] of Object.entries(state.tabPool)) {
+    const id = Number(tid);
+    if (e.taskId !== null) continue;
+    if (state.tabActive[id]) continue;
+    if (now - (e.lastUsedAt || 0) < TAB_IDLE_KEEP_MS) continue;
+    try { await chrome.tabs.remove(id); } catch { /* 已关闭 */ }
+    delete state.tabPool[id];
+    log('info', `[池] 回收空闲承载页 tab${id}（空闲超过 ${TAB_IDLE_KEEP_MS / 60000} 分钟）`);
+  }
+}
+
+// ============ 派发 ============
+// 把任务注入到指定 tab：占槽 + 状态切换 + 注入（失败则标失败并释放）
+// 从旧 scheduler.dispatchTab 移植：预检同步占位、content 未注入时 executeScript 兜底。
+async function startTaskInTab(d, tabId) {
+  // ★ 状态守卫：pump 在 await acquireTabFor 期间（建承载页最长等 20s），用户可能已经暂停/取消/删除
+  //   了这个任务。不检查的话下面会把已暂停的任务强行改回 downloading 并启动下载 ——
+  //   真机现象就是"全部暂停"后总有一个任务继续跑，必须手动再点一次。
+  if (!state.downloads[d.id] || d.status !== "queued") {
+    if (tabId !== null && tabId !== undefined) {
+      delete state.running[d.id];
+      if (state.tabActive[tabId] === d.id) state.tabActive[tabId] = null;
+      releaseTab(tabId);
+    }
+    return;
+  }
+  state.tabActive[tabId] = d.id;   // 同步占位（第一个 await 之前）
+  d.tabId = tabId;                 // 任务记住自己的承载页（结束时才能释放/复用）
+  state.running[d.id] = tabId;
+  if (!state.tabPool[tabId]) state.tabPool[tabId] = { origin: '', taskId: d.id, lastUsedAt: Date.now() };
+  state.tabPool[tabId].taskId = d.id;
+  state.tabPool[tabId].lastUsedAt = Date.now();
+
+  try {
+    await chrome.tabs.get(tabId);
+  } catch {
+    delete state.running[d.id];
+    state.tabActive[tabId] = null;
+    releaseTab(tabId);
+    d.status = 'failed';
+    d.error = '页面已关闭，无法下载';
+    persist();
+    broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
+    log('warn', `[调度] ${taskLabel(d.id)} 所在页面已关闭，标为失败`);
+    return;
+  }
+
+  d.status = 'downloading';
+  d.error = null;
+  if (!d.done) d.pct = 0; // 续传保留已有进度
+  d.lastProgressAt = Date.now();
+  d.lastDone = 0;
+  d.lastDoneAt = Date.now();
+  d.lastActivityAt = Date.now(); // 活动基准（分片请求尝试会刷新）
+  persist();
+  broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
+
+  const settings = await chrome.storage.local.get('vgp_settings');
+  const concurrency = (settings.vgp_settings && settings.vgp_settings.concurrency) || 4;
+  const payload = {
+    type: 'START_DOWNLOAD',
+    downloadId: d.id,
+    m3u8Url: d.url,
+    resumeFrom: d.done || 0,
+    concurrency,
+    referer: d.referer || '',
+    pageTitle: d.pageTitle || '',
+    format: d.format,
+  };
+  try {
+    await chrome.tabs.sendMessage(tabId, payload);
+  } catch {
+    // content script 未注入（如刚打开的页面）→ 手动注入后重发
+    try {
+      await chrome.scripting.executeScript({ target: { tabId }, files: CONTENT_FILES });
+      await chrome.tabs.sendMessage(tabId, payload);
+    } catch (err2) {
+      delete state.running[d.id];
+      state.tabActive[tabId] = null;
+      releaseTab(tabId);
+      d.status = 'failed';
+      d.error = '注入失败: ' + err2.message;
+      persist();
+      broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
+    }
+  }
+}
+
+// 任务结束（完成/失败/取消/暂停）统一收尾：释放槽 + 归还 tab + 继续调度
+export function onTaskSettled(d) {
+  if (!d) return;
+  delete state.running[d.id];
+  if (state.tabActive[d.tabId] === d.id) state.tabActive[d.tabId] = null;
+  releaseTab(d.tabId);
+  pump();
+}
+
+// ============ 调度主循环 ============
+// 与旧的 maybeDispatch 等价（保留旧名做别名，47 处调用点零改动），但语义简化为：
+// "有空槽 + 有就绪任务 → 依次派发"，不再依赖"某个 tab 是否空闲"。
+// 自愈：清理"已经不在运行、但槽位表里还占着"的任务（完成/失败/取消/暂停/回队列）。
+// 必须有它兜底：任何一条结束路径漏调 onTaskSettled，槽位就会假满 → 后续任务永远派发不出去
+//（真机实测过：8 个任务全部跑完后整个队列卡死，就是这个原因）。
+// 注意 exporting 仍算"活着"：导出期间必须继续占着承载页，否则新任务会被派到正在导出的页面上。
+function reap() {
+  for (const [idStr, tabId] of Object.entries(state.running)) {
+    const id = Number(idStr);
+    const d = state.downloads[id];
+    const alive = d && (d.status === "downloading" || d.status === "retrying" || d.status === "exporting");
+    if (alive) continue;
+    delete state.running[id];
+    if (state.tabActive[tabId] === id) state.tabActive[tabId] = null;
+    releaseTab(Number(tabId));
+  }
+}
+
+let pumping = false;
+export function pump() {
+  if (pumping) return; // 防重入（替代旧的 promise 链串行化）
+  reap(); // 先自愈：清掉"已结束却还占着槽"的任务，否则槽位假满
+  pumping = true;
+  (async () => {
+    try {
+      while (slotsFree() > 0) {
+        const id = pickNext();
+        if (id === null) break;
+        const d = state.downloads[id];
+        if (!d || d.status !== 'queued') { unqueueTask(id); continue; }
+        unqueueTask(id); // 先出队，避免同一任务被重复派发
+        const tabId = await acquireTabFor(d);
+        if (tabId === null) {
+          queueTask(id); // 拿不到承载页：放回队列等下一轮（不改状态，避免震荡）
+          log('warn', `[调度] ${taskLabel(id)} 暂无可用承载页，保持排队`);
+          break;
+        }
+        // ★ await 期间任务可能已被暂停/取消（"全部暂停"就是这种情况）→ 归还承载页，不派发
+        if (d.status !== "queued") {
+          delete state.running[d.id];
+          if (state.tabActive[tabId] === d.id) state.tabActive[tabId] = null;
+          releaseTab(tabId);
+          continue;
+        }
+        startTaskInTab(d, tabId);
+      }
+    } finally {
+      pumping = false;
+    }
+  })();
+}

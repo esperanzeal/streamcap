@@ -171,23 +171,10 @@ chrome.tabs.onRemoved.addListener((tabId) => {
     persist(); // 立即落盘：否则 SW 空闲重启后恢复逻辑会把它当 downloading 重建，假活占槽
     broadcast({ type: 'DOWNLOAD_UPDATE', download: state.downloads[active] });
   }
-  // ★ 该 tab 队列里所有 queued 任务也标 failed（页面已关闭无法下载）：
-  //   否则 delete tabQueues 后任务还停留在 queued 状态，成为"不在任何队列的孤儿"，
-  //   并发槽空着也永远不会被 maybeDispatch 派发（用户手动点开始才暴露"注入失败"）。
-  const q = state.tabQueues[tabId];
-  if (q) {
-    for (const did of q) {
-      const d = state.downloads[did];
-      if (d && d.status === 'queued') {
-        d.status = 'failed';
-        d.error = '页面已关闭';
-        persist();
-        broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
-      }
-    }
-  }
+  // v5：queued 任务不再绑定某个 tab（tab 只是承载页）→ tab 关闭不需要把它们标失败，
+  //     调度器下一轮 pump 会给它们复用/新建承载页。
   delete state.tabActive[tabId];
-  delete state.tabQueues[tabId];
+  delete state.tabPool[tabId];
   maybeDispatch();
 });
 
