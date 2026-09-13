@@ -358,7 +358,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       log('warn', `[导出] ${taskLabel(downloadId)} ${Math.round((Date.now() - prev.exportedAt) / 1000)}s 前已导出过 → 忽略重复的 DOWNLOAD_BLOB（防重复落盘）`);
       // 让 content 释放这份多余的 blob 并清掉分片（它已经没用了）
       chrome.tabs.sendMessage(tabId, { type: 'FINALIZE_DOWNLOAD', downloadId, blobUrl }).catch(() => {});
-      sendResponse({ ok: false, error: '该任务刚已导出过，已忽略重复请求（防重复落盘）' });
+      // ★ 必须回 ok:true + duplicate 标记，**不能回 ok:false**：
+      //   content 侧 exportBlob 的判定是 `if (!resp || !resp.ok) → 回退 a.click()`，
+      //   回 ok:false 会让第二个实例改用 a.click() 再落一份文件 —— 那等于把这个防重复
+      //   修复反过来变成"再多落一份"。content 看到 duplicate 就只释放 blob、不做任何回退。
+      sendResponse({ ok: true, duplicate: true, note: '该任务刚已导出过，已忽略本次重复导出（防重复落盘）' });
       return true;
     }
     // ★ 竞态铁律：占位必须**同步**打上，绝不能等 chrome.downloads.download 的回调。

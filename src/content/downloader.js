@@ -776,6 +776,13 @@ window.VGP = window.VGP || {};
     const blobUrl = URL.createObjectURL(finalBlob);
     const filename = guessName(pageTitle || document.title);
     chrome.runtime.sendMessage({ type: 'DOWNLOAD_BLOB', downloadId, blobUrl, filename }, (resp) => {
+      // ★ 后台判定为重复导出（另一个 content 实例已经在导出了）→ **绝不能回退 a.click()**：
+      //   那会真的再写一个文件，把"防重复落盘"反过来变成"再多落一份"。本实例只释放 blob。
+      if (resp && resp.duplicate) {
+        log('warn', `[${taskLabel}] 后台已判定为重复导出（另有实例在导出），本实例放弃并释放 blob`);
+        try { URL.revokeObjectURL(blobUrl); } catch {}
+        return;
+      }
       if (chrome.runtime.lastError || !resp || !resp.ok) {
         log('warn', `[${taskLabel}] chrome.downloads 触发失败，回退 a.click()`);
         const a = document.createElement('a');

@@ -265,6 +265,9 @@ async function startTaskInTab(d, tabId) {
   }
 
   d.acquireFails = 0; // 成功建立承载页 → 清零失败计数
+  // ★ 新一轮下载开始 → 清除上一轮的导出占位。否则「重新下载」一个 10 分钟内完成过的任务时，
+  //   新一轮的导出会被幂等窗口拒绝 → 文件永远存不下来（这是加幂等保护时引入的连带风险）。
+  d.exportedAt = null;
   d.status = 'downloading';
   d.error = null;
   if (!d.done) d.pct = 0; // 续传保留已有进度

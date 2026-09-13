@@ -8,6 +8,7 @@ import { findHostForTask, migrateTaskToTab } from './host.js';
 const HOST_GRACE_MS = 90000; // 宿主/content 心跳宽限（原为 60s/120s 两套，已统一）
 const DONE_TIMEOUT = 90000;    // 90s 内既无分片增长、也无任何请求活动 → 判停摆
 const DONE_STALL_MS = 240000;  // 4 分钟只有请求活动、分片数一片不涨 → 同样判停摆（疑似被节流）
+const MERGE_STALL_MS = 600000; // 10 分钟：分片已下完（正在合并/导出）时的停摆宽限 —— 超时仍会动手，避免合并真卡死无人管
 const RETRY_STUCK_MS = 60000;  // retrying 持续超过 60s（最大退避只有 9s）→ 退避定时器已丢
 const KEEPALIVE_ALARM = 'vgp_keepalive';
 const CLEANUP_ALARM = 'vgp_cleanup';
@@ -226,7 +227,13 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
     //   而 Chrome 的 conflictAction:'uniquify' 遇到同名不覆盖、另存为 "xxx (1).mp4"，
     //   真机表现就是「E:\Downloads 大量文件重复落盘」。合并阶段由 content 的
     //   reportActivity 保活（见 downloader.js），不再需要这里的超时兜底。
-    if (d.total > 0 && (d.done || 0) >= d.total) return false;
+    if (d.total > 0 && (d.done || 0) >= d.total) {
+      // ★ 分片已下完 = 只剩合并/导出，本来就不会再有分片增长，不能按 90s/4 分钟判停摆。
+      //   但**不能无条件跳过**：合并真卡死（OPFS 读取挂起、连 activity 心跳都停）时必须有人
+      //   管它，否则任务会永远卡在 downloading。所以给一个明显更长的宽限，超时仍按停摆处理。
+      const lastMergeAlive = Math.max(d.lastDoneAt || 0, d.lastActivityAt || 0, d.createdAt || 0);
+      return now - lastMergeAlive > MERGE_STALL_MS;
+    }
     // 判定依据 = 最近一次**真实活动**：done 增长（lastDoneAt）或任意分片/分块请求尝试
     // （lastActivityAt，由 content 的 reportActivity 在每次网络尝试时刷新）。
     // 真卡死（fetch 挂起、无任何回调）→ 两者都不动 → 90s 后被抓；

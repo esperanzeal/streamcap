@@ -2,6 +2,14 @@
 'use strict';
 window.VGP = window.VGP || {};
 (function (VGP) {
+  // ★ 重复注入守卫：与 downloader.js 同一原因（见那里的详细说明）。没有它，
+  //    chrome.storage.onChanged 会被注册两次，切换设置时按钮刷新两次（无功能危害，
+  //    但会掩盖"content 被重复注入"这一事实 —— 那是重复落盘的根因）。
+  if (VGP.__mergeLoaded) {
+    try { console.warn('[VGP] merge 被重复注入，本次实例直接退出'); } catch { /* ignore */ }
+    return;
+  }
+  VGP.__mergeLoaded = true;
   const { log, OPFS_PREFIX } = VGP;
 
   // 点击后 showSaveFilePicker 选保存位置，流式逐批写盘：不占内存、不经过 Chrome 下载器。
