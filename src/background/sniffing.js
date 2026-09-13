@@ -1,6 +1,7 @@
 // sniffing.js — StreamCap 嗅探（webRequest + video 扫描兜底 + tab 事件 + 右键菜单）
 import { state, persist, broadcast, taskLabel } from './state.js';
 import { maybeDispatch } from './scheduler.js';
+import { queueTask } from './pool.js';
 import { log } from './log.js';
 import { detectFormat } from './formats.js';
 
@@ -182,10 +183,38 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 // （onRemoved 只在关闭时触发，刷新/跳转不触发）。这里把进行中任务标为可续传暂停，
 // 释放 tabActive，让调度器能派发其他任务；用户点"继续"即可续传。
 chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
+  // ★ 页面加载完成：若该页承载的任务在导航期间被打断（导出中 → blob 已失效），现在重做。
+  //   必须等 complete —— loading 阶段派发会因为 content 未就绪而失败。
+  if (changeInfo.status === 'complete') {
+    const pend = Object.values(state.downloads).find(x => x.tabId === tabId && x.restartOnNav);
+    if (pend) {
+      delete pend.restartOnNav;
+      pend.status = 'queued';
+      pend.error = '页面刷新/跳转打断了导出，正在重新合并导出（分片已保留）';
+      queueTask(pend.id);
+      persist();
+      broadcast({ type: 'DOWNLOAD_UPDATE', download: pend });
+      log('warn', `[页面导航] 页面已就绪 → 重新驱动 ${taskLabel(pend.id)} 重新合并导出`);
+      maybeDispatch();
+    }
+    return;
+  }
   if (changeInfo.status !== 'loading') return;
   const active = state.tabActive[tabId];
   if (!active || !state.downloads[active]) return;
   const d = state.downloads[active];
+  // ★ 导出中（exporting）：页面导航/刷新会让 blob 失效 → Chrome 下载项 NETWORK_FAILED，
+  //   文件不会落盘（真机日志：两个任务"合并完成"却没落盘就是这个）。旧逻辑只处理
+  //   downloading/retrying，**漏了 exporting** → 任务一直保持 exporting 直到下载项失败。
+  //   这里打标记，等页面加载完（上面 complete 分支）再重新驱动。
+  if (d.status === 'exporting') {
+    d.restartOnNav = true;
+    state.tabActive[tabId] = null;
+    persist();
+    broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
+    log('warn', `[页面导航] ${taskLabel(active)} 导出期间页面被刷新/跳转（blob 将失效）→ 待页面就绪后重新合并导出`);
+    return;
+  }
   if (d.status === 'downloading' || d.status === 'retrying') {
     d.status = 'paused';
     d.error = '页面刷新/跳转，可点继续续传';
