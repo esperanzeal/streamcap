@@ -212,6 +212,7 @@ async function startTaskInTab(d, tabId) {
     releaseTab(tabId);
     d.status = 'failed';
     d.error = '页面已关闭，无法下载';
+    pinTaskTab(tabId); // 失败：来源页置顶
     persist();
     broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
     log('warn', `[调度] ${taskLabel(d.id)} 所在页面已关闭，标为失败`);
@@ -254,6 +255,7 @@ async function startTaskInTab(d, tabId) {
       releaseTab(tabId);
       d.status = 'failed';
       d.error = '注入失败: ' + err2.message;
+      pinTaskTab(tabId); // 失败：来源页置顶
       persist();
       broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
     }
@@ -261,11 +263,18 @@ async function startTaskInTab(d, tabId) {
 }
 
 // 任务结束（完成/失败/取消/暂停）统一收尾：释放槽 + 归还 tab + 继续调度
+// 失败任务的来源标签页置顶：几十个标签页里一眼找到失败的（v4 的行为，v5 统一到收尾路径）
+export function pinTaskTab(tabId) {
+  if (tabId === undefined || tabId === null) return;
+  try { chrome.tabs.move(tabId, { index: 0 }).catch(() => {}); } catch { /* 忽略（tab 已关等） */ }
+}
+
 export function onTaskSettled(d) {
   if (!d) return;
   delete state.running[d.id];
   if (state.tabActive[d.tabId] === d.id) state.tabActive[d.tabId] = null;
   releaseTab(d.tabId);
+  if (d.status === "failed") pinTaskTab(d.tabId); // 失败 → 来源页置顶（所有失败路径统一在这里生效）
   pump();
 }
 
