@@ -394,7 +394,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       // 记录映射：Chrome 下载项 id ↔ 扩展任务（存 session，SW 重启不丢）
       chrome.storage.session.get('blob_map', s => {
         const m = s.blob_map || {};
-        m[itemId] = { downloadId, tabId, blobUrl, filename };
+        // ★ expectedSize：content 报上来的 blob 字节数。Chrome 下载完成时用它校验**实际
+        //   落盘字节数**（见 signals.js）—— 这是唯一能发现"文件被截断/只写了一半"的兜底。
+        m[itemId] = { downloadId, tabId, blobUrl, filename, expectedSize: msg.size || 0 };
         chrome.storage.session.set({ blob_map: m });
       });
       // 任务进入"导出中"：等待 Chrome 下载结果信号

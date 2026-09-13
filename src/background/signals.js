@@ -35,18 +35,57 @@ export function handleDownloadSignal(delta) {
       }
       delete m[delta.id];
       chrome.storage.session.set({ blob_map: m });
-      d.status = 'completed';
-      d.pct = 100;
-      d.fileName = rec.filename;
-      d.speed = '';
-      d.consecutiveFails = 0;
-      onTaskSettled(d); // v5：释放槽 + 归还承载页 + 继续调度（原先只清 tabActive → 槽位假满，后续任务派发不出去）
-      persist();
-      broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
-      log('info', `[下载器] Chrome 下载项 #${delta.id} 完成 → ${taskLabel(rec.downloadId)} 标为已完成`);
-      // 通知 content：revoke blob + 清理分片（标签页不自动关——删除已完成任务时才关，见 main.js DELETE_DOWNLOAD）
-      chrome.tabs.sendMessage(rec.tabId, { type: 'FINALIZE_DOWNLOAD', downloadId: rec.downloadId, blobUrl: rec.blobUrl }).catch(() => {});
-      maybeDispatch();
+      // ★★ 完整性校验（真机反馈后新增）：Chrome 说"完成"不等于"文件完整"。
+      //    真机上确实出现过"任务显示成功、文件却只有一半"的情况（同一个视频 884MB vs 1450MB）。
+      //    这里把 Chrome 实际落盘的字节数与 content 上报的 blob.size 比对，不一致就**标失败**，
+      //    绝不当成完成。（老任务没有 expectedSize、或 API 查不到时按原逻辑放过，不误伤。）
+      const finishComplete = () => {
+        d.status = 'completed';
+        d.pct = 100;
+        d.fileName = rec.filename;
+        d.speed = '';
+        d.consecutiveFails = 0;
+        onTaskSettled(d); // v5：释放槽 + 归还承载页 + 继续调度（原先只清 tabActive → 槽位假满，后续任务派发不出去）
+        persist();
+        broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
+        log('info', `[下载器] Chrome 下载项 #${delta.id} 完成 → ${taskLabel(rec.downloadId)} 标为已完成（完整性校验通过）`);
+        // 通知 content：revoke blob + 清理分片（标签页不自动关——删除已完成任务时才关，见 main.js DELETE_DOWNLOAD）
+        chrome.tabs.sendMessage(rec.tabId, { type: 'FINALIZE_DOWNLOAD', downloadId: rec.downloadId, blobUrl: rec.blobUrl }).catch(() => {});
+        maybeDispatch();
+      };
+      const expectedSize = rec.expectedSize || 0;
+      if (expectedSize > 0) {
+        const verify = () => {
+          try {
+            chrome.downloads.search({ id: delta.id }, (items) => {
+              const it = items && items[0];
+              const actual = it ? (it.fileSize || it.bytesReceived || 0) : 0;
+              if (actual > 0 && actual !== expectedSize) {
+                const pctLost = Math.round((1 - actual / expectedSize) * 100);
+                d.status = 'failed';
+                d.error = `文件不完整：预期 ${expectedSize} 字节，实际落盘 ${actual} 字节（少 ${pctLost}%）。分片已保留，可点重试重新合并导出`;
+                d.speed = '';
+                d.consecutiveFails = (d.consecutiveFails || 0) + 1;
+                onTaskSettled(d);
+                persist();
+                broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
+                log('warn', `[下载器] ${taskLabel(rec.downloadId)} 完整性校验失败：落盘 ${actual} / 预期 ${expectedSize} 字节（少 ${pctLost}%）→ 标为失败，不当作完成`);
+                maybeDispatch();
+                return;
+              }
+              finishComplete();
+            });
+            return;
+          } catch {
+            // 校验本身失败（downloads API 不可用等）→ 按原逻辑完成，
+            // 绝不能因为"校验故障"把任务卡在 exporting
+            finishComplete();
+          }
+        };
+        verify();
+        return;
+      }
+      finishComplete();
     } else if (delta.state.current === 'interrupted') {
       if (!d) {
         delete m[delta.id];

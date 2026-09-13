@@ -373,6 +373,16 @@ window.VGP = window.VGP || {};
 
       // ★ 用 OPFS 文件的 File 对象（磁盘支撑）组装 Blob，而不是把全部数据读回
       //   ArrayBuffer——大文件时后者会把整个视频堆进 JS 堆（P0-5：80GB 级必崩）
+      // ★ 完整性校验（合并前，真机反馈后新增）：所有批次必须都在 completed 集合里。
+      //   只检查"OPFS 文件是否存在"是不够的 —— 缺批次但 OPFS 里留有上一轮的旧文件时，
+      //   合并会把**旧的/不完整的数据**当成这一批静默拼进去，产出"看起来正常、内容却不对"
+      //   的文件。宁可失败报错，也不产半成品。
+      const missingBatches = [];
+      for (let b = 0; b < totalBatches; b++) if (!completed.has(b)) missingBatches.push(b + 1);
+      if (missingBatches.length) {
+        throw new Error(`完整性校验失败：${missingBatches.length}/${totalBatches} 个批次未成功下载（第 ${missingBatches.slice(0, 8).join(',')}${missingBatches.length > 8 ? '…' : ''} 个）`);
+      }
+
       const allBlobs = [];
       // fMP4：init 段（EXT-X-MAP）必须在所有分片之前，否则产物无法播放
       if (initBytes) allBlobs.push(new Blob([initBytes]));
@@ -497,6 +507,12 @@ window.VGP = window.VGP || {};
       //    页面重载后任务又被重派 → 重新下载 + 二次导出 → 磁盘出现 "xxx (1).mp4" 重复文件）。
       log('info', `[${taskLabel}] 分块全部完成，开始合并...`);
       reportProgress(downloadId, 98, totalBlocks, totalBlocks, '合并中...');
+      // ★ 完整性校验（合并前）：所有分块必须都在 completed 里 —— 详见 batch 路径的同款说明
+      const missingBlocks = [];
+      for (let b = 0; b < totalBlocks; b++) if (!completed.has(b)) missingBlocks.push(b + 1);
+      if (missingBlocks.length) {
+        throw new Error(`完整性校验失败：${missingBlocks.length}/${totalBlocks} 个分块未成功下载（第 ${missingBlocks.slice(0, 8).join(',')}${missingBlocks.length > 8 ? '…' : ''} 个）`);
+      }
       const chunks = [];
       for (let b = 0; b < totalBlocks; b++) {
         if (b % 8 === 0) reportActivity(downloadId); // 合并心跳：只表示"还活着"，不涉及进度
@@ -528,6 +544,10 @@ window.VGP = window.VGP || {};
     try {
       const resp = await fetch(url, { signal });
       if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      // ★ 完整性校验的依据：能拿到 content-length 就一定校验；拿不到就必须明确记录
+      //   "无法校验" —— 否则服务器中途断流会被 reader.read() 当成正常结束，静默产出
+      //   一个内容不全的文件（真机反馈的半成品来源之一）。
+      const declaredLen = parseInt(resp.headers.get('content-length') || '0', 10) || 0;
       const root = await navigator.storage.getDirectory();
       const fh = await root.getFileHandle(VGP.OPFS_PREFIX + `dl_${downloadId}_block_0.bin`, { create: true });
       const w = await fh.createWritable();
@@ -544,6 +564,12 @@ window.VGP = window.VGP || {};
         }
       }
       await w.close();
+      if (declaredLen > 0 && received !== declaredLen) {
+        throw new Error(`完整性校验失败：服务器声明 ${declaredLen} 字节，实际收到 ${received} 字节（差 ${declaredLen - received}）`);
+      }
+      if (declaredLen === 0) {
+        log('warn', `[${taskLabel}] 服务器未提供 content-length，无法校验完整性（文件可能被截断，建议播放确认）`);
+      }
       log('success', `[${taskLabel}] 流式下载完成: ${(received / 1024 / 1024).toFixed(1)}MB`);
 
       // 合并 → blob → DOWNLOAD_BLOB
@@ -672,6 +698,13 @@ window.VGP = window.VGP || {};
       // 6. 拼接合并（init + media 段顺序）→ blob → DOWNLOAD_BLOB
       log('info', `[${taskLabel}] 全部分片完成，开始合并...`);
       reportProgress(downloadId, 98, totalItems, totalItems, '合并中...');
+      // ★ 完整性校验（合并前）：所有分段必须都在 completed 里 —— 详见 batch 路径的同款说明
+      //   （只查 OPFS 文件存在性会把上一轮的残留当成这一批静默拼进去）
+      const missingSegs = [];
+      for (let i = 0; i < totalItems; i++) if (!completed.has(i)) missingSegs.push(i + 1);
+      if (missingSegs.length) {
+        throw new Error(`完整性校验失败：${missingSegs.length}/${totalItems} 个分段未成功下载（第 ${missingSegs.slice(0, 8).join(',')}${missingSegs.length > 8 ? '…' : ''} 个）`);
+      }
       const parts = [];
       for (let i = 0; i < totalItems; i++) {
         if (i % 8 === 0) reportActivity(downloadId); // 合并心跳：分片已下完，这里只剩磁盘读取，别被判停摆打断
@@ -775,7 +808,9 @@ window.VGP = window.VGP || {};
   function exportBlob(downloadId, finalBlob, pageTitle, taskLabel) {
     const blobUrl = URL.createObjectURL(finalBlob);
     const filename = guessName(pageTitle || document.title);
-    chrome.runtime.sendMessage({ type: 'DOWNLOAD_BLOB', downloadId, blobUrl, filename }, (resp) => {
+    // ★ 把 blob 的字节数一并上报：后台在 Chrome 下载完成时用它校验**实际落盘字节数**，
+    //   不一致就标失败（而不是默默显示成功）—— 这是唯一能抓住"视频中途被截断"的兜底。
+    chrome.runtime.sendMessage({ type: 'DOWNLOAD_BLOB', downloadId, blobUrl, filename, size: finalBlob.size }, (resp) => {
       // ★ 后台判定为重复导出（另一个 content 实例已经在导出了）→ **绝不能回退 a.click()**：
       //   那会真的再写一个文件，把"防重复落盘"反过来变成"再多落一份"。本实例只释放 blob。
       if (resp && resp.duplicate) {
