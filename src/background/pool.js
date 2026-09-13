@@ -119,7 +119,17 @@ export async function acquireTabFor(task) {
       return bindTab(orig, task, origin);
     }
   }
-  // ② 其它已打开的同源空闲页（用户可能开着好几个同站页面）→ 复用，省一次页面加载
+  // ②a 池内登记过的同源空闲页（origin 记录最准，且不依赖 tabs.query）
+  for (const [tid, e] of Object.entries(state.tabPool)) {
+    const id = Number(tid);
+    if (e.taskId !== null) continue;
+    if (state.tabActive[id]) continue;
+    if (e.origin && origin && e.origin !== origin) continue;
+    if (!(await tabExists(id))) { delete state.tabPool[id]; continue; }
+    log("info", `[池] 复用池内同源页 tab${id}`);
+    return bindTab(id, task, origin);
+  }
+  // ②b 其它已打开的同源空闲页（用户自己开的同站页面）
   try {
     const tabs = await chrome.tabs.query({});
     for (const t of tabs) {
