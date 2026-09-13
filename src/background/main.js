@@ -521,6 +521,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         d.consecutiveFails = fails + 1;
         d.status = 'retrying';
         d.error = `第 ${d.consecutiveFails}/${MAX_RETRY} 次重试: ${msg.error}`;
+        d.lastRetryAt = Date.now(); // ★ 记下进入重试态的时刻：退避 setTimeout 若随 SW 回收丢失，
+                                    //   alarm 里的兜底判据靠它把任务捞回队列（否则永久停在"重试中"）
         persist();
         broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
         // ★ 让出并发槽：退避期间其他任务可插队，避免失败任务占坑

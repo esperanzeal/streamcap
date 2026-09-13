@@ -1,11 +1,14 @@
 // stalled.js — StreamCap 保活 alarm + 停滞判定/心跳探测/页面停摆刷新复活
 import { state, persist, broadcast, taskLabel } from './state.js';
 import { maybeDispatch } from './scheduler.js';
-import { queueTaskFront, onTaskSettled } from './pool.js';
+import { queueTask, queueTaskFront, onTaskSettled, isQueued } from './pool.js';
 import { log } from './log.js';
 import { findHostForTask, migrateTaskToTab } from './host.js';
 
 const HOST_GRACE_MS = 90000; // 宿主/content 心跳宽限（原为 60s/120s 两套，已统一）
+const DONE_TIMEOUT = 90000;    // 90s 内既无分片增长、也无任何请求活动 → 判停摆
+const DONE_STALL_MS = 240000;  // 4 分钟只有请求活动、分片数一片不涨 → 同样判停摆（疑似被节流）
+const RETRY_STUCK_MS = 60000;  // retrying 持续超过 60s（最大退避只有 9s）→ 退避定时器已丢
 const KEEPALIVE_ALARM = 'vgp_keepalive';
 const CLEANUP_ALARM = 'vgp_cleanup';
 
@@ -57,8 +60,19 @@ async function tryAutoAdopt(d, deadReason) {
   broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
   maybeDispatch(); // 空出的并发槽立刻让给其他任务
 
-  // ② 慢慢找宿主（探测不阻塞调度）
-  const hostId = await findHostForTask(d, { origId: d.tabId, openNewTab: false });
+  // ② 慢慢找宿主（探测不阻塞调度）。★ 整段兜底：内部 await 抛错（tab 恰在此刻关闭、
+  //   探测异常）会把任务永久丢在"状态 queued 却不在 readyQueue"的中间态 ——
+  //   既不占槽也不会被停滞判定看到（那里只看 downloading），真机表现就是完全静默地卡住。
+  //   出错时放回队列，下一轮 alarm 会重新尝试，而不是把它留成幽灵任务。
+  let hostId = null;
+  try {
+    hostId = await findHostForTask(d, { origId: d.tabId, openNewTab: false });
+  } catch (e) {
+    log('warn', `[停滞] ${taskLabel(d.id)} 寻找接管页面时出错：${e && e.message} → 放回队列稍后重试`);
+    queueTask(d.id);
+    maybeDispatch();
+    return false;
+  }
   if (hostId !== null) {
     migrateTaskToTab(d, hostId, false); // 保留计数：换宿主尝试有界
     d.error = `${deadReason}，已迁移到同源标签页等待续传`;
@@ -96,17 +110,22 @@ async function reloadTaskTab(d, reason) {
   broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
   maybeDispatch(); // 空出的并发槽先让给其他任务
   log('warn', `[节流] ${taskLabel(d.id)} ${reason} → 刷新 tab${tabId} 重新续传（${n}/${MAX_RELOAD}）`);
+  let ready = false;
   try {
     await chrome.tabs.reload(tabId);
-  } catch {
-    failTaskQuick(d, `${reason}，且页面已关闭无法刷新`);
+    // 等 content 重新注入（≤20s，与 findHostForTask 打开新页后的就绪轮询同规格）
+    for (let i = 0; i < 40; i++) {
+      await new Promise(r => setTimeout(r, 500));
+      if (await pingContent(tabId)) { ready = true; break; }
+    }
+  } catch (e) {
+    // ★ 兜底：刷新/轮询期间抛错（tab 恰在此刻被关闭、SW 时间片被打断）不能让任务停在中间态
+    //   ——状态 queued 却不在队列 = 不占槽、不调度、无日志（真机反馈的"完全没反应"）。
+    //   放回队列，下一轮 alarm 会重新尝试。
+    log('warn', `[节流] ${taskLabel(d.id)} 刷新页面出错：${e && e.message} → 放回队列稍后重试`);
+    queueTask(d.id);
+    maybeDispatch();
     return;
-  }
-  // 等 content 重新注入（≤20s，与 findHostForTask 打开新页后的就绪轮询同规格）
-  let ready = false;
-  for (let i = 0; i < 40; i++) {
-    await new Promise(r => setTimeout(r, 500));
-    if (await pingContent(tabId)) { ready = true; break; }
   }
   if (!ready) {
     failTaskQuick(d, `${reason}，刷新后页面仍无响应`);
@@ -162,27 +181,72 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
     broadcast({ type: "DOWNLOAD_UPDATE", download: d });
   }
 
+  const now = Date.now();
+
+  // ============ 自愈：把卡在"没人管"状态的任务放回队列 ============
+  // ★ 为什么必须有这一段（真机反馈"任务没进度、没有调度、日志也没记录"）：
+  //   MV3 的 setTimeout 不可靠 —— 退避重派（main.js）与让位后回队首（scheduler.js）都靠它，
+  //   SW 被回收时定时器随之丢失，任务就永远停在中间态：状态看着还是"排队中/重试中"，
+  //   却不在 readyQueue → 既不会被派发，也不会被下面的停滞判定看到（那里只看 downloading）
+  //   → 完全静默。用每分钟一次的 alarm 兜底，比另开一个 alarm 更省事也更可靠。
+  // 幽灵 queued：状态是排队中却不在队列。（正在派发的有 running、主动让位等旧循环退出的
+  //   有 tabActive，都会被后两个条件排除，不会误放回来。）
+  const ghosts = Object.values(state.downloads).filter(d =>
+    d.status === 'queued' && !isQueued(d.id) && !state.running[d.id] && !state.tabActive[d.tabId]
+  );
+  for (const d of ghosts) {
+    queueTask(d.id);
+    log('warn', `[调度] ${taskLabel(d.id)} 状态为排队中却不在队列（定时器丢失？）→ 放回队列重派`);
+  }
+  // 卡死的 retrying：最大退避只有 9s，超过 RETRY_STUCK_MS 还是 retrying 必然是定时器丢了
+  const stuckRetry = Object.values(state.downloads).filter(d =>
+    d.status === 'retrying' && !state.running[d.id] &&
+    now - (d.lastRetryAt || d.lastProgressAt || d.createdAt || 0) > RETRY_STUCK_MS
+  );
+  for (const d of stuckRetry) {
+    d.status = 'queued';
+    d.error = null;
+    queueTask(d.id);
+    persist();
+    broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
+    log('warn', `[调度] ${taskLabel(d.id)} 停在重试态超过 ${RETRY_STUCK_MS / 1000}s（退避定时器丢失）→ 放回队列`);
+  }
+  if (ghosts.length || stuckRetry.length) maybeDispatch();
+
   // 无进度超时判定：下载中任务若已下载分片数长时间无增长，说明下载循环卡死
-  // （fetch 挂起/页面冻结后消息循环还活着但下载不推进）。把任务标为可续传暂停、
-  // 释放并发槽、记录 stalledAt 排到队尾——恢复调度后它排最后执行，不反复占槽。
+  // （fetch 挂起/页面冻结后消息循环还活着但下载不推进）。
   // 判定依据是 done（已下载分片数）增长，而非收到消息：content 的节流上报/心跳
   // 是独立定时器，循环卡死时照样在发，导致 lastProgressAt/lastPing 永远新鲜，
   // 任务永远踢不出去。lastDoneAt 只在 done 真正增长时刷新（见 main.js PROGRESS 处理）。
-  const now = Date.now();
-  const DONE_TIMEOUT = 90000; // 90s 既无进度增长、也无任何请求活动 → 判停滞踢出
   const stalled = Object.values(state.downloads).filter(d => {
     if (d.status !== 'downloading') return false;
     // 判定依据 = 最近一次**真实活动**：done 增长（lastDoneAt）或任意分片/分块请求尝试
     // （lastActivityAt，由 content 的 reportActivity 在每次网络尝试时刷新）。
-    // 真卡死（fetch 挂起、无任何回调）→ 两者都不动 → 仍会在 90s 后被抓；
-    // 慢下载 / 坏分片重试中（每 ≤20s 一次尝试）→ 有活动 → 不再被误判为卡死。
-    // ★ 仍不能用 lastProgressAt：15s 节流上报是 setInterval，循环卡死时照样在发。
+    // 真卡死（fetch 挂起、无任何回调）→ 两者都不动 → 90s 后被抓；
+    // 慢下载 / 坏分片重试中（每 ≤20s 一次尝试）→ 有活动 → 不被误判为卡死。
+    // ★ 仍不能用 lastProgressAt：节流上报是 setInterval，循环卡死时照样在发。
     const lastAlive = Math.max(d.lastDoneAt || 0, d.lastActivityAt || 0, d.createdAt || 0);
-    return now - lastAlive > DONE_TIMEOUT;
+    if (now - lastAlive > DONE_TIMEOUT) return true;
+    // ★ 零进展判据（补"有活动"这个口子）：页面被浏览器节流时，分片请求会**持续尝试**、
+    //   每次都刷新 lastActivityAt，但全部超时失败 → done 一片都不涨。只看"有没有活动"
+    //   就永远抓不到它 —— 这正是"任务没进度、检测却不触发、日志也没记录"的形态。
+    //   4 分钟一片没涨（正常慢速下载 4 分钟至少也要完成几片）→ 同样按停摆处理。
+    const lastProgress = Math.max(d.lastDoneAt || 0, d.createdAt || 0);
+    return now - lastProgress > DONE_STALL_MS;
   });
   for (const d of stalled) {
-    // tabActive 归属校验：只有当前仍由本任务占用并发槽时才释放，避免误清该 tab 其他任务的槽
-    if (state.tabActive[d.tabId] !== d.id) continue;
+    // tabActive 归属校验：只有当前仍由本任务占用并发槽时才动它，避免误清该 tab 其他任务的槽。
+    // ★ 但必须留日志：以前这里静默 continue，一旦归属对不上（SW 重启后的残留记录等），
+    //   任务既不会被救、也查不到任何线索。
+    if (state.tabActive[d.tabId] !== d.id) {
+      log('warn', `[停滞] ${taskLabel(d.id)} 疑似停摆，但并发槽归属不是它（tab${d.tabId}）→ 本轮跳过`);
+      continue;
+    }
+    // 停摆原因分开记：排查时能一眼区分"彻底没动静"与"被节流拖着空转"
+    const idle = now - Math.max(d.lastDoneAt || 0, d.lastActivityAt || 0, d.createdAt || 0) > DONE_TIMEOUT;
+    const stallReason = idle
+      ? `页面停摆（${DONE_TIMEOUT / 1000}s 内无任何请求活动）`
+      : `页面停摆（${Math.round(DONE_STALL_MS / 60000)} 分钟无分片进展，疑似被浏览器节流）`;
     // ① 页面被 Memory Saver 丢弃（tab 还在、页面已被卸载）→ 刷新即可复活（OPFS 分片不丢）
     let tabInfo = null;
     try { tabInfo = await chrome.tabs.get(d.tabId); } catch { tabInfo = null; }
@@ -196,13 +260,12 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
       await tryAutoAdopt(d, '页面已关闭或无响应');
       continue;
     }
-    //③ 页面活着但"停摆"：PING 通、心跳新鲜，可是 done 与请求活动双陈旧（DONE_TIMEOUT 90s 无任何进展）
-    //    —— 典型表现是浏览器对标签节流（实测：被节流的页面重建后恢复正常速度；
-    //    重启浏览器 + 新建页后 8 并发健康跑数小时）。
+    //③ 页面活着但"停摆"：PING 通、心跳新鲜，可是分片长时间不涨。
     //    旧逻辑在这里发 CANCEL 走 停止中态→重排，等于把任务放回**同一个卡住的页面**反复重来；
     //    改为**刷新该页面 → 等 content 重新就绪 → 重新注入任务**：
     //    OPFS 分片按 origin 存盘、不随页面销毁，刷新后按 resumeFrom 继续，进度不丢。
-    await reloadTaskTab(d, '页面停摆（疑似被浏览器节流）');
+    //    （实测：被节流的页面重建后恢复正常速度；重启浏览器 + 新建页后 8 并发健康跑数小时。）
+    await reloadTaskTab(d, stallReason);
   }
   if (stalled.length > 0) maybeDispatch();
 

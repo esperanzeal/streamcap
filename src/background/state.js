@@ -28,6 +28,8 @@ export function persist() {
     reloadCount: d.reloadCount, // "刷新复活"次数（页面停摆时刷新页面上限）：重启不归零，避免无限刷新
     format: d.format,
     lastProgressAt: d.lastProgressAt, lastDoneAt: d.lastDoneAt,
+    lastActivityAt: d.lastActivityAt, // 最近一次"网络尝试"：SW 重启后停滞判定要靠它区分"真卡死/被节流拖着"
+    lastRetryAt: d.lastRetryAt,       // 进入 retrying 的时刻：alarm 用它判断退避定时器是否已丢
     lastPing: d.lastPing,
   }));
   chrome.storage.local.set({ vgp_downloads: list });
