@@ -87,7 +87,27 @@ window.VGP = window.VGP || {};
     } catch {}
   }
 
+  // ★ 清空本扩展在**当前站点**（origin）留下的全部 OPFS 数据（分片 + 断点元数据）。
+  //   为什么必须逐站清：OPFS 按 origin 隔离，扩展无法从自己那边删除别的站点的文件 ——
+  //   所以由 background 向每个相关页面发消息，让页面清自己的。
+  //   判据只认 `vgp_` 前缀（本扩展所有 OPFS 文件都带它）→ 绝不碰站点自身的数据。
+  async function clearAllVgp() {
+    const root = await navigator.storage.getDirectory();
+    const names = [];
+    for await (const [name] of root) if (name.startsWith(OPFS_PREFIX)) names.push(name);
+    let removed = 0, failed = 0, bytes = 0;
+    for (const name of names) {
+      try {
+        try { const fh = await root.getFileHandle(name); const f = await fh.getFile(); bytes += f.size || 0; } catch { /* ignore */ }
+        await root.removeEntry(name, { recursive: true });
+        removed++;
+      } catch { failed++; }
+    }
+    return { removed, failed, bytes };
+  }
+
   VGP.OPFS_PREFIX = OPFS_PREFIX;
+  VGP.clearAllVgp = clearAllVgp;
   VGP.opfsWrite = opfsWrite;
   VGP.opfsRead = opfsRead;
   VGP.opfsGetFile = opfsGetFile;

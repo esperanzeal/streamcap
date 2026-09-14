@@ -266,6 +266,25 @@ $('#btnClearFail').addEventListener('click', () => {
   targets.forEach(d => act({ type: 'DELETE_DOWNLOAD', downloadId: d.id }));
 });
 
+// ============ 清空所有缓存（OPFS + 任务记录 + 日志） ============
+// OPFS 按 origin 隔离：扩展不能从自己那边删站点文件，只能让每个相关页面清自己的
+// → 后台会在必要时短暂打开相关站点的后台标签页，清完立即关闭。
+$('#btnWipeAll').addEventListener('click', () => {
+  if (!confirm('确定清空本扩展产生的所有缓存？\n\n将删除：\n· 各站点里本扩展的分片与断点缓存（OPFS）\n· 全部任务记录（含进度 —— 删除后无法续传）\n· 全部日志\n\n必要时会短暂打开相关站点的后台标签页来清理其缓存，随后自动关闭。\n设置项会保留。此操作不可恢复。')) return;
+  const btn = $('#btnWipeAll');
+  btn.disabled = true;
+  const old = btn.textContent;
+  btn.textContent = '🧹 清理中…';
+  chrome.runtime.sendMessage({ type: 'CLEAR_ALL_CACHE' }, resp => {
+    btn.disabled = false;
+    btn.textContent = old;
+    if (!resp || resp.ok !== true) { alert('清理失败：' + ((resp && resp.error) || '未知原因')); return; }
+    const mb = ((resp.bytes || 0) / 1024 / 1024).toFixed(1);
+    alert(`清理完成\n\n· 清理页面：${resp.tabs} 个\n· 补清历史站点：${resp.opened} 个\n· 删除 OPFS 缓存项：${resp.removed}（约 ${mb} MB）\n· 失败：${resp.failed}\n\n页面即将刷新。`);
+    location.reload();
+  });
+});
+
 // ============ Manager 长连接（带指数退避重连） ============
 let reconnectDelay = 500;
 function connectManager() {

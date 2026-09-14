@@ -117,6 +117,17 @@ window.VGP = window.VGP || {};
       probeSize(msg.url).then(sendResponse);
       return true; // 异步响应（同步 return true 才保持通道）
     }
+    // ★ 清空缓存（manager 的「🧹 清空所有缓存」）：删除本扩展在**当前站点**的全部 OPFS 数据。
+    //   OPFS 按 origin 隔离 → background 逐个页面发这条消息，每个页面只能清自己这个 origin。
+    if (msg.type === 'CLEAR_VGP_CACHE') {
+      Promise.resolve(VGP.clearAllVgp ? VGP.clearAllVgp() : { removed: 0, failed: 0, bytes: 0 })
+        .then(r => {
+          log('warn', `[清理] 已删除本站在 OPFS 中的扩展缓存 ${r.removed} 项（${(r.bytes / 1024 / 1024).toFixed(1)}MB）`);
+          sendResponse(Object.assign({ ok: true }, r));
+        })
+        .catch(e => sendResponse({ ok: false, error: String((e && e.message) || e) }));
+      return true;
+    }
     // 清理孤儿分片：删除不属于任何活跃任务的分片（扩展启动/定时清理时兜底）
     if (msg.type === 'CLEANUP_OPFS') {
       cleanupOrphans(msg.activeDownloadIds).then(removed => sendResponse({ ok: true, removed }));

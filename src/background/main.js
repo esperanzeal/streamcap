@@ -344,6 +344,67 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true;
   }
 
+  // ★★ 清空本扩展产生的**所有**数据：各站点 OPFS（分片 + 断点元数据）+ 任务列表 + 日志 + session 映射。
+  //   关键约束：OPFS 按 origin 隔离，扩展无法从自己那边删除别的站点的文件 —— 只能逐个页面清：
+  //     ① 已打开的所有标签页 → 让各自的 content 清自己那个 origin
+  //     ② 任务/嗅探记录里出现过、但当前没打开的 origin → 临时开后台页去清，清完立即关（最多 6 个）
+  //   判据只认 content 侧的 `vgp_` 前缀 → 不碰站点自身数据；设置 vgp_settings 不在清理范围。
+  if (msg.type === 'CLEAR_ALL_CACHE') {
+    (async () => {
+      const report = { tabs: 0, removed: 0, bytes: 0, opened: 0, failed: 0 };
+      const askTab = async (tabId) => {
+        try {
+          const r = await chrome.tabs.sendMessage(tabId, { type: 'CLEAR_VGP_CACHE' });
+          if (r && r.ok) { report.tabs++; report.removed += r.removed || 0; report.bytes += r.bytes || 0; }
+          else report.failed++;
+        } catch { report.failed++; } // 无 content 的页面（chrome:// 等）→ 跳过
+      };
+
+      // ① 已打开的标签页
+      const tabs = await chrome.tabs.query({});
+      for (const t of tabs) if (t.id !== undefined) await askTab(t.id);
+
+      // ② 记录里出现过、当前没打开的 origin —— 补清（否则它们的分片会永远留着）
+      const want = new Set();
+      const addOrigin = (u) => { try { const o = new URL(u || ''); if (o.protocol === 'http:' || o.protocol === 'https:') want.add(o.origin); } catch { /* ignore */ } };
+      for (const d of Object.values(state.downloads)) { addOrigin(d.pageUrl); addOrigin(d.referer); addOrigin(d.url); }
+      for (const s of Object.values(state.sniffStore)) addOrigin(s && s.pageUrl);
+      const openOrigins = new Set();
+      for (const t of tabs) { try { openOrigins.add(new URL(t.url).origin); } catch { /* ignore */ } }
+
+      const MAX_OPEN = 6; // 上限：不为了清理开一大堆页面
+      let openedN = 0;
+      for (const origin of want) {
+        if (openedN >= MAX_OPEN) break;
+        if (openOrigins.has(origin)) continue; // ① 里已清过
+        openedN++;
+        let tab = null;
+        try {
+          tab = await chrome.tabs.create({ url: origin, active: false });
+          let ready = false;
+          for (let i = 0; i < 16; i++) { // 等 content 就绪，最多 8s
+            await new Promise(r => setTimeout(r, 500));
+            try { const p = await chrome.tabs.sendMessage(tab.id, { type: 'PING' }); if (p && p.ok) { ready = true; break; } } catch { /* retry */ }
+          }
+          if (ready) { await askTab(tab.id); report.opened++; } else report.failed++;
+        } catch { report.failed++; }
+        finally { if (tab && tab.id !== undefined) { try { await chrome.tabs.remove(tab.id); } catch { /* ignore */ } } }
+      }
+
+      // ③ 任务列表 + 日志 + session 映射 + 内存状态
+      state.downloads = {}; state.readyQueue = []; state.running = {}; state.tabActive = {}; state.tabPool = {};
+      try { await chrome.storage.local.remove('vgp_downloads'); } catch { /* ignore */ }
+      try { await chrome.storage.session.remove(['blob_map', 'sw_marker', 'vgp_log_prune_at']); } catch { /* ignore */ }
+      // ★ 必须等 clearAllLogs 真正完成再写这条日志：两者都是异步的（get→remove 与 get→push→set），
+      //   不等的话新写的这一条会被 remove 抹掉 —— 表现就是「清完缓存后日志里看不到清理记录」。
+      await new Promise((res) => clearAllLogs(() => res()));
+      log('warn', `[清理] 已清空扩展缓存：OPFS ${report.removed} 项（${(report.bytes / 1024 / 1024).toFixed(1)}MB）/ 涉及页面 ${report.tabs} 个，补清历史站点 ${report.opened} 个，失败 ${report.failed}`);
+      broadcast({ type: 'CACHE_CLEARED' });
+      sendResponse(Object.assign({ ok: true }, report));
+    })();
+    return true;
+  }
+
   // content script 请求：用 chrome.downloads 触发 blob 下载
   // 不立即标完成——等 chrome.downloads.onChanged 的 complete/interrupted 信号
   if (msg.type === 'DOWNLOAD_BLOB') {
