@@ -45,12 +45,27 @@ window.VGP = window.VGP || {};
   }
 
   // 断点续传元数据
+  // ★ meta 只是"进度快照"，不是关键数据 —— 它损坏时必须降级为"没有进度"，绝不能让整个任务失败。
+  //   真机现象：`下载失败: Unexpected end of JSON input` —— 旧的 loadMeta 直接 JSON.parse，
+  //   遇到空/截断内容就抛错，冒泡到 startDownload 的 catch → 任务被标失败。
+  //   损坏来源：写入过程中页面被 reload / 进程被杀，或（修复前）同一页面两个 content 实例
+  //   同时写同一个 meta 文件相互交错。修好重复注入后概率大降，但读取端必须容错。
+  //   返回 null 是安全的：三个调用点都是 `if (!meta || meta.totalSegments !== total) { 新建 }`，
+  //   而且分片文件还在，重新下载时会重新识别并跳过已落盘的部分。
   async function saveMeta(downloadId, meta) {
     await opfsWrite(`meta_${downloadId}.json`, JSON.stringify(meta));
   }
   async function loadMeta(downloadId) {
     const buf = await opfsRead(`meta_${downloadId}.json`);
-    return buf ? JSON.parse(new TextDecoder().decode(buf)) : null;
+    if (!buf || !buf.byteLength) return null;
+    try {
+      return JSON.parse(new TextDecoder().decode(buf));
+    } catch (e) {
+      // 损坏：丢掉它，按"无进度"继续（不要把任务搞失败）
+      try { await opfsDelete(`meta_${downloadId}.json`); } catch { /* ignore */ }
+      try { VGP.log('warn', `[#${downloadId}] 断点续传元数据损坏（${(e && e.message) || e}），已丢弃并按无进度继续`); } catch { /* ignore */ }
+      return null;
+    }
   }
   async function deleteMeta(downloadId) {
     await opfsDelete(`meta_${downloadId}.json`);
