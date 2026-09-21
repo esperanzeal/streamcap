@@ -94,46 +94,75 @@ async function tryAutoAdopt(d, deadReason) {
 // 与"死宿主"的区别：这里页面还活着（PING 通、心跳新鲜），只是没在跑。
 // 有界：同一任务最多刷新 MAX_RELOAD 次；有真实进展时 main.js 会把 reloadCount 清零。
 const MAX_RELOAD = 3;
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+function originOf(u) { try { return new URL(u).origin; } catch { return ''; } }
+// 等 content 重新就绪（每 500ms 探一次 PING，共 tries 次）
+async function waitContent(tabId, tries) {
+  for (let i = 0; i < tries; i++) {
+    await sleep(500);
+    if (await pingContent(tabId)) return true;
+  }
+  return false;
+}
 async function reloadTaskTab(d, reason) {
-  if (d.status === 'exporting') return; // 导出中的 blob 随页面销毁会丢 → 绝不刷新
+  if (d.status === 'exporting') return; // 导出中的 blob 随页面销毁会丢 → 绝不重载
   const tabId = d.tabId;
   const n = (d.reloadCount || 0) + 1;
   if (n > MAX_RELOAD) {
-    failTaskQuick(d, `${reason}，已刷新页面 ${MAX_RELOAD} 次仍无进展`);
+    failTaskQuick(d, `${reason}，已重新加载页面 ${MAX_RELOAD} 次仍无进展`);
     return;
   }
   d.reloadCount = n;
-  // 让位：刷新期间不占并发槽（页面随即被销毁，content 循环自然消失）
+  // 让位：重载期间不占并发槽（页面随即被销毁，content 循环自然消失）
   if (state.tabActive[tabId] === d.id) state.tabActive[tabId] = null;
   d.status = 'queued'; // 回队列；done/pct 保留 → 续传（不是从头下）
-  d.error = `${reason}，正在刷新页面重新续传（${n}/${MAX_RELOAD}）`;
+  d.error = `${reason}，正在重新加载页面续传（${n}/${MAX_RELOAD}）`;
   persist();
   broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
   maybeDispatch(); // 空出的并发槽先让给其他任务
-  log('warn', `[节流] ${taskLabel(d.id)} ${reason} → 刷新 tab${tabId} 重新续传（${n}/${MAX_RELOAD}）`);
+  log('warn', `[节流] ${taskLabel(d.id)} ${reason} → 重新加载 tab${tabId} 续传（${n}/${MAX_RELOAD}）`);
+
+  // ★★ 用 tabs.update({url}) 做**一次全新的 GET 导航**，而不是 tabs.reload()。
+  //   真机现象：reload 的语义是"重新执行当前文档的加载" —— 若该文档由 POST 表单产生
+  //   （有些站点"点播放"其实是提交表单），Chrome 会先弹「确认重新提交表单」；用户点继续后
+  //   服务器对该 URL 返回 405（只接受 GET，或那次 POST 依赖一次性 token）→ 页面变错误页
+  //   → content 不再注入 → 等就绪 20s 超时 → 任务被标失败。
+  //   用户手动按 F5 不弹框，说明那一刻页面已是 GET 文档 —— 这恰好证明"强制 GET"是安全的：
+  //   显式导航与手动刷新等效，且对 GET/POST 两种文档状态都不会再触发表单重提。
+  const navUrl = /^https?:/i.test(d.pageUrl || '') ? d.pageUrl : '';
   let ready = false;
   try {
-    await chrome.tabs.reload(tabId);
-    // 等 content 重新注入（≤20s，与 findHostForTask 打开新页后的就绪轮询同规格）
-    for (let i = 0; i < 40; i++) {
-      await new Promise(r => setTimeout(r, 500));
-      if (await pingContent(tabId)) { ready = true; break; }
-    }
+    if (navUrl) await chrome.tabs.update(tabId, { url: navUrl });
+    else await chrome.tabs.reload(tabId); // 没有可用的来源页 URL 时退回旧行为
+    ready = await waitContent(tabId, 40); // ≤20s，与 acquireTabFor 打开新页后的就绪轮询同规格
   } catch (e) {
-    // ★ 兜底：刷新/轮询期间抛错（tab 恰在此刻被关闭、SW 时间片被打断）不能让任务停在中间态
+    // ★ 兜底：导航/轮询期间抛错（tab 恰在此刻被关闭、SW 时间片被打断）不能让任务停在中间态
     //   ——状态 queued 却不在队列 = 不占槽、不调度、无日志（真机反馈的"完全没反应"）。
     //   放回队列，下一轮 alarm 会重新尝试。
-    log('warn', `[节流] ${taskLabel(d.id)} 刷新页面出错：${e && e.message} → 放回队列稍后重试`);
+    log('warn', `[节流] ${taskLabel(d.id)} 重载页面出错：${e && e.message} → 放回队列稍后重试`);
     queueTask(d.id);
     maybeDispatch();
     return;
   }
+  // ★ 方案 B 兜底：原页面救不回来（405 / 错误页 / 只接受 POST）→ 把承载页导航到**站点根**。
+  //   下载只要求"同一个 origin 的页面"（OPFS 按 origin 隔离、Referer 是 origin 级，任务用的
+  //   是已保存的绝对 URL、不依赖页面状态），不需要正好是那个视频页 —— 站点首页足够承载。
+  if (!ready && navUrl) {
+    const org = originOf(navUrl);
+    if (org) {
+      log('warn', `[节流] ${taskLabel(d.id)} 原页面加载不出来 → 改用站点根 ${org}/ 作承载页（下载只需同源页面）`);
+      try {
+        await chrome.tabs.update(tabId, { url: org + '/' });
+        ready = await waitContent(tabId, 40);
+      } catch { /* ignore */ }
+    }
+  }
   if (!ready) {
-    failTaskQuick(d, `${reason}，刷新后页面仍无响应`);
+    failTaskQuick(d, `${reason}，重载后页面仍无响应`);
     return;
   }
-  // 页面 URL 未变（同源）→ 放回该 tab 队首优先续传。
-  // 签名过期不在这里处理：页面刷新后 content 会重新嗅探写入 sniffStore，
+  // 页面同源即可承载（URL 可能已变成站点根）→ 放回队首优先续传。
+  // 签名过期不在这里处理：页面加载后 content 会重新嗅探写入 sniffStore，
   // 下载流程也会重新拉取清单 → 新签名自然生效。
   queueTaskFront(d.id);
   maybeDispatch();
