@@ -577,15 +577,17 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       if (typeof msg.done === 'number' && msg.done > (d.done || 0)) d.done = msg.done;
       if (typeof msg.total === 'number' && msg.total > 0) d.total = msg.total;
 
-      // 用户操作或调度器中止的任务（已取消/已暂停/已放回队列）：保留状态，不自动重试、不覆盖
-      // 终态（completed/exporting/failed）也直接忽略迟到 ERROR：content 单循环只在结束时上报一次，
-      // 但用户双击重试等操作可能造成 background 状态与 content 循环不同步，防止终态被回退重下
-      if (msg.reason === 'manual_cancel' || (msg.error || '').includes('已取消') ||
+      // ★ 只忽略"我们自己主动中断"的信号，依据是**任务状态已经被改过**（paused/cancelled/queued/
+      //   终态），或调用方明确带了 reason（调度器发起的 abort，状态在发之前就改好了）。
+      //   ⚠️ 以前这里还有 `error.includes('已取消')` 和 `reason && downloading` 两条，它们会造成"假活"：
+      //   content 侧 errText 的**默认值**就是"已取消"，当调用方没记录 reason 时（外部中断、
+      //   页面销毁、循环自己结束）它照样是"已取消" —— 那就把"循环已经结束"这个事实当噪声丢掉了，
+      //   任务留在 downloading 却没有任何循环在跑，只能干等 4 分钟兜底。
+      //   真机现象：「提示已取消，却还要等 4 分钟；手动刷新一下就动一点」。
+      //   删掉这两条后，这类信号会正常走下面的重试/重派逻辑，立刻恢复。
+      if (msg.reason === 'manual_cancel' ||
           d.status === 'paused' || d.status === 'cancelled' || d.status === 'queued' ||
-          d.status === 'completed' || d.status === 'exporting' || d.status === 'failed' ||
-          // 迟到的停滞确认（reason 存在 = abort 类）：任务已离开停摆态（SW 重启重派/downloading 或手动恢复），
-          // 忽略避免白走一次 retrying 往返
-          (msg.reason && d.status === 'downloading')) {
+          d.status === 'completed' || d.status === 'exporting' || d.status === 'failed') {
         persist();
         broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
         return;
@@ -626,33 +628,19 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           // 退避期间用户可能已暂停/取消/重新调度该任务：只有仍处于 retrying
           // （未被用户干预）才自动重派，避免双派发
           if (d.status !== 'retrying') return;
-          // ★ 退避期间宿主 tab 已死（页面被关）：不直接 fail——自动接管：找已开启的
-          //   活同源宿主等待续传（无人值守不开新页）；找不到才 failed。
-          //   计数保留（resetCounters=false）→ 自动重试上限持续累计，有界不无限。
-          chrome.tabs.get(d.tabId, async t => {
+          // ★ 宿主页已关：不再"人工找同源宿主，找不到就判死"。
+          //   直接把任务交还调度 —— pump 里的 acquireTabFor 会自动复用同源页或**新建一个**，
+          //   所以"那一刻没开着同源页"不再是绝路（旧实现 openNewTab=false，找不到直接 failed）。
+          //   死掉的 tabId 不用清理：acquireTabFor 会先试它、拿不到 tab 就继续走 ②③。
+          chrome.tabs.get(d.tabId, t => {
             if (chrome.runtime.lastError || !t) {
-              const hostId = await findHostForTask(d, { origId: d.tabId, openNewTab: false });
-              if (hostId !== null) {
-                migrateTaskToTab(d, hostId, false);
-                persist();
-                broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
-                log('warn', `[重试] ${taskLabel(d.id)} 宿主页面已关闭，迁移到 tab${hostId} 等待续传（计数保留）`);
-                maybeDispatch();
-                return;
-              }
-              d.status = 'failed';
-              d.error = '页面已关闭且无同源可用页面，放弃自动重试（分片保留，可手动重试自动续传）';
-              persist();
-              broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
-              log('warn', `[重试] ${taskLabel(d.id)} 宿主页面已关闭且无同源页面，放弃自动重试`);
-              maybeDispatch();
-              return;
+              log('warn', `[重试] ${taskLabel(d.id)} 宿主页面已关闭 → 交还调度，自动重新建立承载页`);
             }
             d.status = 'queued';
             d.error = null;
             persist();
             broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
-            // 放回原 tab 队列（保留 createdAt → FIFO 原位置），由 maybeDispatch 统一调度
+            // 回就绪队列（保留 createdAt → FIFO 原位置），由 maybeDispatch 统一调度
             queueTask(d.id);
             maybeDispatch();
           });
@@ -760,7 +748,7 @@ chrome.storage.local.get('vgp_downloads', data => {
     (async () => {
       const pingers = Object.values(state.downloads)
         .filter(d => d.status === 'downloading')
-        .map(d => pingDeadTask(d, '页面已无响应，可点继续续传'));
+        .map(d => pingDeadTask(d, '页面已无响应'));
       await Promise.allSettled(pingers);
     })();
 

@@ -3,7 +3,6 @@ import { state, persist, broadcast, taskLabel } from './state.js';
 import { maybeDispatch } from './scheduler.js';
 import { queueTask, queueTaskFront, onTaskSettled, isQueued } from './pool.js';
 import { log } from './log.js';
-import { findHostForTask, migrateTaskToTab } from './host.js';
 
 const HOST_GRACE_MS = 90000; // 宿主/content 心跳宽限（原为 60s/120s 两套，已统一）
 const DONE_TIMEOUT = 90000;    // 90s 内既无分片增长、也无任何请求活动 → 判停摆
@@ -47,44 +46,24 @@ function failTaskQuick(d, reason) {
   log('warn', `[停滞] ${taskLabel(d.id)} ${reason}，标为失败不再重试`);
 }
 
-// 死宿主自动接管（停滞/超时共用，自动路径）：
-// 宿主 tab 已死 → 先立即让位（释放并发槽，找宿主可能要逐个 PING/探测耗时数秒，
-// 不能让停滞任务继续占槽拖累其他任务）→ 再找**已开启**的活同源宿主
-// （openNewTab=false，无人值守不开新页）；有 → 迁移等待续传（resetCounters=false
-// 保留停滞计数 → 反复停滞最终 failed，有界）；无 → failed 丢 fail 队列。
-async function tryAutoAdopt(d, deadReason) {
-  // ① 立即让位：释放并发槽 + 中间态（不入任何队列，宿主确定后再 migrate 入队）
-  if (state.tabActive[d.tabId] === d.id) state.tabActive[d.tabId] = null;
+// ★ 宿主页死亡 / 内容脚本无响应 → 不再"人工找同源页 + 迁移"，直接**交还调度**。
+//   旧实现要逐个 PING/探测找活同源宿主，找不到就 failTaskQuick（判死）—— 那是"没有承载页兜底"
+//   时代的产物：当时任务一旦失去承载页就彻底跑不了，所以必须查清"还有没有别的页面能接"。
+//   现在 pool.acquireTabFor 会自动做这件事，而且更完整：
+//     ① 任务来源页 → ② 已打开的同源页 → ③ 都没有就**新建一个**
+//   所以这里只需：释放并发槽 + 状态回 queued → 剩下的交给 pump。
+//   顺带的好处：不再依赖 host.js 的选宿主启发式（行为更可预测），也不会因为"那一刻没开着同源页"
+//   就把任务判死（旧实现 openNewTab=false，找不到就 failed）。
+function tryAutoAdopt(d, deadReason) {
   d.status = 'queued';
-  d.error = `${deadReason}，正在寻找同源标签页接管...`;
+  d.error = `${deadReason} → 交还调度，自动重新建立承载页续传`;
+  onTaskSettled(d); // 释放并发槽 + 归还承载页（内部 pump 一次）
+  queueTask(d.id);  // 入就绪队列：下一次 pump 会 acquireTabFor 复用/新建同源承载页
   persist();
   broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
-  maybeDispatch(); // 空出的并发槽立刻让给其他任务
-
-  // ② 慢慢找宿主（探测不阻塞调度）。★ 整段兜底：内部 await 抛错（tab 恰在此刻关闭、
-  //   探测异常）会把任务永久丢在"状态 queued 却不在 readyQueue"的中间态 ——
-  //   既不占槽也不会被停滞判定看到（那里只看 downloading），真机表现就是完全静默地卡住。
-  //   出错时放回队列，下一轮 alarm 会重新尝试，而不是把它留成幽灵任务。
-  let hostId = null;
-  try {
-    hostId = await findHostForTask(d, { origId: d.tabId, openNewTab: false });
-  } catch (e) {
-    log('warn', `[停滞] ${taskLabel(d.id)} 寻找接管页面时出错：${e && e.message} → 放回队列稍后重试`);
-    queueTask(d.id);
-    maybeDispatch();
-    return false;
-  }
-  if (hostId !== null) {
-    migrateTaskToTab(d, hostId, false); // 保留计数：换宿主尝试有界
-    d.error = `${deadReason}，已迁移到同源标签页等待续传`;
-    persist();
-    broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
-    log('warn', `[停滞] ${taskLabel(d.id)} ${deadReason}，迁移到 tab${hostId} 等待续传（计数保留）`);
-    maybeDispatch();
-    return true;
-  }
-  failTaskQuick(d, `${deadReason}，且无同源可用页面`);
-  return false;
+  log('warn', `[停滞] ${taskLabel(d.id)} ${deadReason} → 交还调度，自动重新建立承载页（不再人工找宿主）`);
+  maybeDispatch();
+  return true;
 }
 
 // 页面停摆/被回收 → 刷新该 tab 并重新注入任务（用户拍板：降速异常就刷新重新加载）。
@@ -114,7 +93,7 @@ async function reloadTaskTab(d, reason) {
   let ready = false;
   try {
     await chrome.tabs.reload(tabId);
-    // 等 content 重新注入（≤20s，与 findHostForTask 打开新页后的就绪轮询同规格）
+    // 等 content 重新注入（≤20s，与 acquireTabFor 打开新页后的就绪轮询同规格）
     for (let i = 0; i < 40; i++) {
       await new Promise(r => setTimeout(r, 500));
       if (await pingContent(tabId)) { ready = true; break; }
@@ -271,7 +250,7 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
     // ② 页面真死（tab 已关闭 / PING 不通且心跳也停）→ 自动接管：找已开启的活同源宿主
     //    等待续传（无人值守不开新页）；找不到才 failed（用户拍板）
     if (await hostTabDead(d)) {
-      await tryAutoAdopt(d, '页面已关闭或无响应');
+      tryAutoAdopt(d, '页面已关闭或无响应');
       continue;
     }
     //③ 页面活着但"停摆"：PING 通、心跳新鲜，可是分片长时间不涨。
@@ -282,27 +261,14 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
     await reloadTaskTab(d, stallReason);
   }
   if (stalled.length > 0) maybeDispatch();
-
-  // 心跳兜底：SW 刚被唤醒时，检查 downloading 任务是否还活着。
-  // ★ 放在无进度停摆判定**之后**：pingDeadTask 会先把无响应任务标 paused 并清 tabActive，
-  //   若先跑心跳，停摆检测会在 `if (state.tabActive[d.tabId] !== d.id) continue;` 处跳过，
-  //   把本可"刷新复活"的任务提前吞掉（v5 防呆修复）。
-  // 若 content 已死（页面被冻结/关闭），标为可续传暂停并让出并发槽。
-  const pingers = Object.values(state.downloads)
-    .filter(d => d.status === 'downloading')
-    .map(d => pingDeadTask(d, '页面无响应（后台冻结/关闭），可点继续续传'));
-  Promise.allSettled(pingers).then(() => {
-    maybeDispatch(); // 队列里若有 queued 任务，趁机派发
-  });
 });
 
-// 心跳探测：downloading 任务若 content script 已死（页面导航/刷新/冻结后无感知），
-// 会永远卡 downloading 且占着并发槽。ping 无响应 → 标为可续传暂停。
-// 带 tabActive 归属校验：ping 超时窗口内用户可能"暂停→继续"换过任务，
-// 只有当前仍由本任务占用并发槽时才标记暂停，避免误伤刚恢复的任务。
+// ★ content 无响应时**不再标 paused 让用户手动点**（那是"tab 死了就没救"时代的做法）。
+//   现在只要把任务交还调度就够了：归还并发槽 + 状态回 queued → pump 会自动找/建同源承载页
+//   重新注入（acquireTabFor 的 ①②③）。这条也是 SW 重启后恢复逻辑使用的入口。
+// 带归属校验：ping 超时窗口内用户可能"暂停→继续"换过任务，只有仍由本任务占用槽时才动。
 // 并行探测 + 每任务超时：冻结的 tab 若消息不返回，不能卡住后续任务的探测。
-// 导出给 main.js 恢复逻辑使用（SW 重启后对 downloading 任务逐个 ping）。
-export function pingDeadTask(d, pauseReason) {
+export function pingDeadTask(d, reason) {
   const withTimeout = (p, ms) => new Promise((resolve, reject) => {
     const t = setTimeout(() => reject(new Error('ping timeout')), ms);
     p.then(v => { clearTimeout(t); resolve(v); }, e => { clearTimeout(t); reject(e); });
@@ -310,18 +276,17 @@ export function pingDeadTask(d, pauseReason) {
   return withTimeout(chrome.tabs.sendMessage(d.tabId, { type: 'PING' }), 2000)
     .catch(() => {
       const cur = state.downloads[d.id];
+      if (!cur) return;
       // 最近 HOST_GRACE_MS(90s) 内收到过 content 心跳 → content 还活着，只是 PING 消息延迟/后台节流，不误伤
-      if (cur && cur.lastPing && Date.now() - cur.lastPing < HOST_GRACE_MS) return;
-      if (cur && cur.status === 'downloading' && state.tabActive[cur.tabId] === cur.id) {
-        cur.status = 'paused';
-        cur.error = pauseReason;
-        state.tabActive[cur.tabId] = null;
-        // 通知 content 停止下载（与 pauseDownload 对齐，防循环继续写 OPFS）
-        chrome.tabs.sendMessage(cur.tabId, { type: 'CANCEL_DOWNLOAD', downloadId: cur.id, reason: 'heartbeat' }).catch(() => {});
-        persist();
-        broadcast({ type: 'DOWNLOAD_UPDATE', download: cur });
-        log('warn', `[心跳] ${taskLabel(cur.id)} content 无响应，标为可续传暂停`);
-        maybeDispatch();
-      }
+      if (cur.lastPing && Date.now() - cur.lastPing < HOST_GRACE_MS) return;
+      if (cur.status !== 'downloading' && cur.status !== 'retrying') return;
+      log('warn', `[心跳] ${taskLabel(cur.id)} content 无响应（${reason}）→ 交还调度，自动重新驱动`);
+      cur.status = 'queued';
+      cur.error = null;
+      onTaskSettled(cur); // 释放并发槽 + 归还承载页（内部会 pump 一次）
+      queueTask(cur.id);  // 交还调度：下一轮 acquireTabFor 会复用/新建同源承载页
+      persist();
+      broadcast({ type: 'DOWNLOAD_UPDATE', download: cur });
+      maybeDispatch();
     });
 }

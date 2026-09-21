@@ -1,7 +1,7 @@
 // sniffing.js — StreamCap 嗅探（webRequest + video 扫描兜底 + tab 事件 + 右键菜单）
 import { state, persist, broadcast, taskLabel } from './state.js';
 import { maybeDispatch } from './scheduler.js';
-import { queueTask } from './pool.js';
+import { queueTask, onTaskSettled } from './pool.js';
 import { log } from './log.js';
 import { detectFormat } from './formats.js';
 
@@ -167,10 +167,21 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   delete state.sniffStore[tabId];
   const active = state.tabActive[tabId];
   if (active && state.downloads[active]) {
-    state.downloads[active].status = 'failed';
-    state.downloads[active].error = '页面已关闭';
-    persist(); // 立即落盘：否则 SW 空闲重启后恢复逻辑会把它当 downloading 重建，假活占槽
-    broadcast({ type: 'DOWNLOAD_UPDATE', download: state.downloads[active] });
+    const d = state.downloads[active];
+    // ★ 承载页被关 ≠ 任务失败。旧逻辑直接判 failed('页面已关闭')，同属"没有承载页兜底"时代：
+    //   那时页面没了任务就真的跑不完，只能判死。现在交还调度就够了 —— acquireTabFor 会复用
+    //   其它同源页、或**新建一个**（也是用户明确要的行为：找不到宿主就自动开新页）。
+    //   exporting 特殊：blob 随页面销毁而失效 → 回队列后重新合并导出（分片已保留）。
+    if (d.status === 'downloading' || d.status === 'retrying' || d.status === 'exporting') {
+      const wasExporting = d.status === 'exporting';
+      d.status = 'queued';
+      d.error = wasExporting ? '页面关闭打断了导出，正在自动重新合并导出（分片已保留）' : null;
+      onTaskSettled(d); // 释放并发槽 + 归还承载页（内部 pump 一次）
+      queueTask(d.id);  // 交还调度：pump 会 acquireTabFor 复用/新建同源承载页
+      log('warn', `[页面] ${taskLabel(d.id)} 承载页被关闭 → 交还调度，自动复用/新建同源承载页`);
+      persist();
+      broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
+    }
   }
   // v5：queued 任务不再绑定某个 tab（tab 只是承载页）→ tab 关闭不需要把它们标失败，
   //     调度器下一轮 pump 会给它们复用/新建承载页。
@@ -203,27 +214,17 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
   const active = state.tabActive[tabId];
   if (!active || !state.downloads[active]) return;
   const d = state.downloads[active];
-  // ★ 导出中（exporting）：页面导航/刷新会让 blob 失效 → Chrome 下载项 NETWORK_FAILED，
-  //   文件不会落盘（真机日志：两个任务"合并完成"却没落盘就是这个）。旧逻辑只处理
-  //   downloading/retrying，**漏了 exporting** → 任务一直保持 exporting 直到下载项失败。
-  //   这里打标记，等页面加载完（上面 complete 分支）再重新驱动。
-  if (d.status === 'exporting') {
+  // ★ 页面导航/刷新 → 一律"打标记 + 等页面就绪后自动重新驱动"，不再标 paused 等用户点"继续"。
+  //   旧行为是"tab 死了任务就没救"时代的产物：那时刷新后没法自己找承载页，只能停下来等人。
+  //   现在 acquireTabFor 会自动找/建同源承载页 → 页面就绪后重派即可，用户不需要干预。
+  //   导出中的任务尤其必须这样：页面销毁会让 blob 失效 → Chrome 下载项 NETWORK_FAILED、文件不落盘
+  //   （真机日志：两个任务"合并完成"却没落盘）。
+  if (d.status === 'downloading' || d.status === 'retrying' || d.status === 'exporting') {
     d.restartOnNav = true;
     state.tabActive[tabId] = null;
     persist();
     broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
-    log('warn', `[页面导航] ${taskLabel(active)} 导出期间页面被刷新/跳转（blob 将失效）→ 待页面就绪后重新合并导出`);
+    log('warn', `[页面导航] ${taskLabel(active)} 页面被刷新/跳转（当时 ${d.status}）→ 待页面就绪后自动重新驱动`);
     return;
-  }
-  if (d.status === 'downloading' || d.status === 'retrying') {
-    d.status = 'paused';
-    d.error = '页面刷新/跳转，可点继续续传';
-    state.tabActive[tabId] = null;
-    // 通知 content 停止下载：否则循环可能继续写 OPFS，且点"继续"时新旧循环会共用同一控制器
-    chrome.tabs.sendMessage(tabId, { type: 'CANCEL_DOWNLOAD', downloadId: active, reason: 'navigation' }).catch(() => {});
-    persist();
-    broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
-    log('warn', `[页面导航] ${taskLabel(active)} 因页面刷新/跳转暂停（分片已保留）`);
-    maybeDispatch();
   }
 });
