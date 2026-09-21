@@ -139,6 +139,16 @@ async function closeTabIfIdle(tabId) {
 
 // ============ 消息路由 ============
 
+// ★ 中断类文案（content 侧 reportDownloadError 在 AbortError 时给出的默认文案）。
+//   "已取消" 是**默认值** —— 调用方没记录 reason 时（外部打断、AbortSignal 异常）它也这么报，
+//   所以既不能当成"用户取消"忽略掉（会造成假活），也不能当成"下载失败"（会烧光重试上限）。
+const INTERRUPT_TEXTS = new Set([
+  '已取消', '已暂停', '已暂停(无进度)', '已暂停(页面无响应)', '已暂停(页面刷新)',
+]);
+// 中断重试上限（远大于 MAX_RETRY=3）：中断不是失败，只是这一轮循环被打断。
+// 每轮都会换一块承载页，这个上限只是防"同一问题无限兜圈"的保险丝。
+const MAX_INTERRUPTS = 12;
+
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   // 嗅探查询（popup 打开/刷新时补齐 mp4 直链的文件大小）
   if (msg.type === 'GET_M3U8S') {
@@ -533,7 +543,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       d.speed = msg.speed || '';
       d.lastProgressAt = Date.now();
       d.lastActivityAt = Date.now(); // 带 done 的上报同样是活动证据（与 lastDoneAt 分开记，语义不同）
-      if (progressed) { d.lastDoneAt = Date.now(); d.reloadCount = 0; } // 有真实进展 → 重置"刷新复活"计数
+      // 有真实进展 → 重置"刷新复活"与"中断重试"计数（任务确实在推进，之前的打断翻篇）
+      if (progressed) { d.lastDoneAt = Date.now(); d.reloadCount = 0; d.interruptRetries = 0; }
       broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
     }
     return;
@@ -590,6 +601,39 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           d.status === 'completed' || d.status === 'exporting' || d.status === 'failed') {
         persist();
         broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
+        return;
+      }
+
+      // ★★ 中断类信号：content 的下载循环被"外部"打断，**不是"这个任务下不动"**。
+      //   判据：带了 reason（我们主动中断的），或文案是"已取消/已暂停*"且没有 reason
+      //   （外部打断，content 侧没记下来源 —— 只可能是 AbortSignal 那边出的问题）。
+      //   ⚠️ 这类信号**绝不能计入 consecutiveFails**：它不是下载失败，而是这一轮的循环被打断，
+      //   计进去会白白烧掉重试上限（真机：每轮 20s 被中断一次，3 轮就进失败队列）。
+      //   处理方式：不计失败，但**必须换一块承载页**再试 —— 既避开"那一页有问题"，
+      //   也避免在同一页上无限循环；上限用独立的 interruptRetries（比 3 宽得多）。
+      if (!msg.permanent && (INTERRUPT_TEXTS.has(msg.error || '') || !!msg.reason)) {
+        const n = (d.interruptRetries || 0) + 1;
+        if (n > MAX_INTERRUPTS) {
+          d.status = 'failed';
+          d.error = `${msg.error || '任务被反复打断'}（已换承载页重试 ${MAX_INTERRUPTS} 次仍未成功）`;
+          onTaskSettled(d);
+          persist();
+          broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
+          log('warn', `[重试] ${taskLabel(d.id)} 反复被打断 ${n} 次，转入失败队列`);
+          maybeDispatch();
+          return;
+        }
+        d.interruptRetries = n;
+        d.status = 'queued';
+        d.error = null;
+        // ★ 归还承载页 → 下一轮 acquireTabFor 会复用**别的**同源页或新建一个。
+        //   同一页上反复被打断时必须换页，否则只是把同一个坑重踩一遍。
+        onTaskSettled(d);
+        queueTask(d.id);
+        persist();
+        broadcast({ type: 'DOWNLOAD_UPDATE', download: d });
+        log('warn', `[重试] ${taskLabel(d.id)} 下载循环被打断（${msg.reason || msg.error}）→ 换承载页续传（${n}/${MAX_INTERRUPTS}，不计失败）`);
+        maybeDispatch();
         return;
       }
 
