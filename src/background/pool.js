@@ -233,7 +233,11 @@ async function startTaskInTab(d, tabId) {
   //   了这个任务。不检查的话下面会把已暂停的任务强行改回 downloading 并启动下载 ——
   //   真机现象就是"全部暂停"后总有一个任务继续跑，必须手动再点一次。
   if (!state.downloads[d.id] || d.status !== "queued") {
-    if (tabId !== null && tabId !== undefined) releaseSlot(d, tabId);
+    if (tabId !== null && tabId !== undefined) {
+      delete state.running[d.id];
+      if (state.tabActive[tabId] === d.id) state.tabActive[tabId] = null;
+      releaseTab(tabId);
+    }
     return;
   }
   state.tabActive[tabId] = d.id;   // 同步占位（第一个 await 之前）
@@ -249,7 +253,9 @@ async function startTaskInTab(d, tabId) {
   try {
     await chrome.tabs.get(tabId);
   } catch {
-    releaseSlot(d, tabId);
+    delete state.running[d.id];
+    state.tabActive[tabId] = null;
+    releaseTab(tabId);
     d.status = 'failed';
     d.error = '页面已关闭，无法下载';
     persist();
@@ -309,7 +315,9 @@ async function startTaskInTab(d, tabId) {
       }
       await chrome.tabs.sendMessage(tabId, payload);
     } catch (err2) {
-      releaseSlot(d, tabId);
+      delete state.running[d.id];
+      state.tabActive[tabId] = null;
+      releaseTab(tabId);
       d.status = 'failed';
       d.error = '注入失败: ' + err2.message;
       persist();
@@ -320,20 +328,11 @@ async function startTaskInTab(d, tabId) {
 
 // 任务结束（完成/失败/取消/暂停）统一收尾：释放槽 + 归还 tab + 继续调度
 
-// 释放并发槽 + 归还承载页（**不触发调度**）。
-// ★ 所有"任务结束 / 让位"路径的统一底座：以前这三行样板散落在 7 个文件 20 多处，
-//   漏掉任何一处，槽位就会假满 → 后续任务永远派发不出去（真机实测：8 个任务跑完整个队列卡死）。
-//   reap()/pump() 内部也复用它 —— 它们不能调 onTaskSettled，那会触发 pump 重入。
-export function releaseSlot(d, tabId = d.tabId) {
-  if (!d) return;
-  delete state.running[d.id];
-  if (state.tabActive[tabId] === d.id) state.tabActive[tabId] = null;
-  releaseTab(tabId);
-}
-
 export function onTaskSettled(d) {
   if (!d) return;
-  releaseSlot(d);
+  delete state.running[d.id];
+  if (state.tabActive[d.tabId] === d.id) state.tabActive[d.tabId] = null;
+  releaseTab(d.tabId);
   pump();
 }
 
@@ -350,7 +349,9 @@ function reap() {
     const d = state.downloads[id];
     const alive = d && (d.status === "downloading" || d.status === "retrying" || d.status === "exporting");
     if (alive) continue;
-    releaseSlot(d, Number(tabId));
+    delete state.running[id];
+    if (state.tabActive[tabId] === id) state.tabActive[tabId] = null;
+    releaseTab(Number(tabId));
   }
 }
 
@@ -389,7 +390,9 @@ export function pump() {
         }
         // ★ await 期间任务可能已被暂停/取消（"全部暂停"就是这种情况）→ 归还承载页，不派发
         if (d.status !== "queued") {
-          releaseSlot(d, tabId);
+          delete state.running[d.id];
+          if (state.tabActive[tabId] === d.id) state.tabActive[tabId] = null;
+          releaseTab(tabId);
           continue;
         }
         startTaskInTab(d, tabId);

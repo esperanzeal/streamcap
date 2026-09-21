@@ -25,12 +25,6 @@ window.VGP = window.VGP || {};
         if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
         return resp;
       } catch (err) {
-        // ★ 诊断（只在首次尝试打，避免刷屏）：AbortError 的真实来源 ——
-        //   downloader 侧"已取消"那个文案是**默认值**，单看日志分不出是"外部把主 signal
-        //   abort 了"还是"20s 超时被当成 AbortError"。两者修法完全不同，必须有硬证据。
-        if (attempt === 1 && (err.name === 'AbortError' || err.name === 'TimeoutError')) {
-          VGP.log('warn', `[诊断] fetch ${err.name} msg=${err.message} 主signal.aborted=${!!(signal && signal.aborted)} url=${String(url).substring(0, 90)}`);
-        }
         if (err.name === 'AbortError' && signal?.aborted) throw err; // 用户取消，直接抛
         if (err.name === 'AbortError') {
           // 超时（signal 未取消）：包装成普通错误按失败重试，不能被误判为用户取消

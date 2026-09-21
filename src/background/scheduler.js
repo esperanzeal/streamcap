@@ -10,7 +10,7 @@
 import { state, persist, broadcast, taskLabel } from './state.js';
 import { log } from './log.js';
 import { detectFormat } from './formats.js';
-import { queueTask, queueTaskFront, unqueueTask, pump, onTaskSettled, releaseSlot, slotsFree } from './pool.js';
+import { queueTask, queueTaskFront, unqueueTask, pump, onTaskSettled, slotsFree, releaseTab } from './pool.js';
 
 /**
  * 弱指纹：origin + pathname + resolution（忽略 query —— 签名 URL 的时效参数每次不同）。
@@ -146,8 +146,8 @@ export async function prioritizeDownload(downloadId) {
     const v = state.downloads[victim.id];
     if (!v) return;
     // 先归还承载页：不管 victim 之后是否继续跑，这一页都不该被它继续占着（否则页与槽双泄漏）
-    // （running 在让位那一刻就已释放，这里重复删无副作用）
-    releaseSlot(v);
+    if (state.tabActive[v.tabId] === v.id) state.tabActive[v.tabId] = null;
+    releaseTab(v.tabId);
     if (v.status !== 'queued') return; // 期间被删除/取消/手动干预
     queueTaskFront(v.id);
     pump();
